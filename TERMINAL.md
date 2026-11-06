@@ -33,9 +33,12 @@ On PowerShell, set `$env:PYTHONPATH='src'` before launching the module.
   issue `listen` to see durable room-local events. No SSH/GMCP protocol yet.
 - Access is capped to eight simultaneous local connections; oversized input
   is rejected; Telnet option negotiation is refused and stripped.
-- `main` still contains only the original speculative README. This transport
-  stacks on the first playable engine Draft PR #1. It must be integrated and
-  retested with the separately proposed HTTP bridge/browser console.
+- This adapter is included in the integrated candidate alongside the Python
+  engine, HTTP gateway, and browser source. Their tests were run together in
+  one checkout; no public internet service or real-browser compatibility is
+  qualified by that result. Telnet currently uses the engine's basic command
+  path rather than the CLI/HTTP crafting router, so `gather`, `craft` and
+  `build` are not yet offered through Telnet.
 
 Run socket-level tests with `python -m unittest discover -s tests -v`.
 

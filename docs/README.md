@@ -16,10 +16,11 @@ JavaScript framework, CDN, or paid API is required.
 - A public Pages URL is a **public interface**, even if the backing world
   requires private login. It must contain no proprietary worldpack content.
 
-## Compatible REALM gateway contract (v1 preview)
+## Integrated REALM gateway contract (local v1 prototype)
 
-The browser is designed for the independent gateway branch; until the gateway
-is connected and tested, the live display is **not qualified**.
+The browser controller and Python gateway are integrated in this source tree.
+Their loopback HTTP interaction is covered by an executed Node-to-Python test;
+this does **not** qualify remote hosting or real-browser rendering.
 
 | Method | Route | Contract |
 | --- | --- | --- |
@@ -65,18 +66,20 @@ using the **same local SQLite file**:
 PYTHONPATH=src python -m realm --db data/demo.sqlite3 --player Explorer
 ```
 
-That is **not Telnet**. Telnet, SSH-backed terminal sessions, and GMCP support
-are future server-side adapters that should share the same validated command
-engine as the browser client. Plain Telnet transmits data without encryption;
-do not put authentication tokens through it on an untrusted network.
+That local Python command is **not Telnet**. A separate loopback-only Telnet
+adapter exists under `realm.telnet` (see [`TERMINAL.md`](../TERMINAL.md));
+its local access token is not a durable player account. SSH-backed terminal
+sessions and GMCP remain future work. Plain Telnet transmits credentials
+without encryption; never expose this adapter to untrusted networks.
 
 ## Separate worlds
 
-REALM is the generic engine. A private Driftspace worldpack can be loaded by a
-private host when a governed worldpack interface exists. The public browser
-client need not ship the worldpack, unpublished canon, or author-only secrets.
+REALM is the generic engine. A versioned worldpack importer exists (see
+[`WORLDPACKS.md`](../WORLDPACKS.md)). Any private Driftspace pack must remain
+on an authorized private host; it has not been imported or published here.
+The public browser client must not ship unpublished canon or author-only secrets.
 
-## Optional live map (not yet a gateway v1 route)
+## Optional live map (integrated gateway v1 route)
 
 The map panel never generates terrain and does not imply that a host supports
 maps. It attempts an optional authenticated `GET /api/v1/map?player=...` route.
@@ -85,7 +88,7 @@ retries after commands and periodically so entering mapped territory can show
 terrain. A 501 marks map support unavailable for the session. Room commands
 and the activity feed continue normally; failures never display a fabricated map.
 
-Proposed response contract, to align with the server's geography module:
+Current response shape, subject to v1 prototype compatibility changes:
 
 ```json
 {
@@ -125,7 +128,7 @@ node --check docs/map.js
 node --check docs/app.js
 ```
 
-These are JavaScript unit/syntax checks, not a real-browser end-to-end host test.
+These are JavaScript unit/syntax checks, not a real-browser rendering test.
 
 ### Browser-to-gateway mock tests
 
@@ -134,20 +137,18 @@ checks browser events, authentication header plumbing, authorized map requests,
 missing-map recovery after travel, local token DOM clearing, and denial of
 cleartext non-loopback endpoints. These tests exercise the actual `docs/app.js`
 source inside a controlled simulated DOM and HTTP fetch; they are **not** a
-Chromium/Firefox run and do not prove compatibility with a live REALM server.
+Chromium/Firefox run.
 
 ### Live Python gateway protocol test
 
-When the Python gateway/geography integration has been assembled in this same
-checkout, `node --test tests/browser/test-client.cjs` also starts an ephemeral,
+`node --test tests/browser/test-client.cjs` also starts an ephemeral,
 **loopback-only** Python REALM server against a temporary SQLite database. It
 builds one explicitly authored **generic** 3×2 map, then drives the actual
 browser controller's join, map, movement, disconnect, and wrong-token paths
 through real HTTP requests. The subprocess is terminated and temporary data
-is removed after the test. If gateway source is not present on a browser-only
-stacked branch, this specific integration case is explicitly **skipped**.
+is removed after the test.
 
-Executed separately against REALM map-gateway Draft PR #12 (`41b064209...`):
+Executed against the integrated REALM candidate:
 **13/13 Node tests passed** (including live Python gateway). This is stronger
 than independent mocks but **still not a Chromium/Firefox rendering test**, nor
 production authentication, remote HTTPS qualification, deployment or publication.
