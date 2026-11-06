@@ -20,8 +20,17 @@ def main() -> None:
     geo.add_place("atrium", "Test atrium", "room", "test-town", x=0, y=0)
     geo.add_place("corridor", "Test corridor", "room", "test-town", x=2, y=0)
     geo.set_map("test-town", [".^.", "..~"])
-    server = GatewayServer(gateway, token, ("http://127.0.0.1:8000",), port=0)
-    print(f"READY {server.server_port}", flush=True)
+    if hasattr(gateway, "credentials"):
+        # Auth v2 binds the bearer to the player; never reuse a shared world key.
+        player_token = gateway.credentials.provision("Explorer")
+        other_token = gateway.credentials.provision("Other")
+        server = GatewayServer(gateway, ("http://127.0.0.1:8000",), port=0)
+        mode = "player"
+    else:
+        # Explicit legacy compatibility for the separately-developed geo branch.
+        player_token, other_token, mode = token, "none", "legacy"
+        server = GatewayServer(gateway, token, ("http://127.0.0.1:8000",), port=0)
+    print(f"READY {server.server_port} {player_token} {other_token} {mode}", flush=True)
     server.serve_forever(poll_interval=0.05)
 
 
