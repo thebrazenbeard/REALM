@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import re
 import sqlite3
+from contextlib import closing
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -51,7 +52,7 @@ class Engine:
         return conn
 
     def _initialize(self) -> None:
-        with self._connect() as db:
+        with closing(self._connect()) as db, db:
             db.executescript(
                 """
                 CREATE TABLE IF NOT EXISTS rooms (
@@ -119,7 +120,9 @@ class Engine:
     def join(self, name: str) -> str:
         if not _PLAYER_RE.fullmatch(name):
             raise ValueError("Player name must start with a letter, use only letters, digits, '_' or '-', and be <=24 characters")
-        with self._connect() as db:
+        with closing(self._connect()) as db, db:
+            # Serialize first-time joins so two clients cannot race on one name.
+            db.execute("BEGIN IMMEDIATE")
             player = db.execute("SELECT id,room_id FROM players WHERE id=?", (name,)).fetchone()
             if player is None:
                 db.execute("INSERT INTO players VALUES (?,?,?)", (name, "atrium", self._now()))
@@ -162,7 +165,7 @@ class Engine:
             raise ValueError("Action IDs must be nonempty strings up to 128 characters")
         if verb in {"quit", "exit"}:
             return "Goodbye. Your position is saved."
-        with self._connect() as db:
+        with closing(self._connect()) as db, db:
             # Serialize competing actions such as two players taking one object.
             db.execute("BEGIN IMMEDIATE")
             player = db.execute("SELECT id,room_id FROM players WHERE id=?", (name,)).fetchone()
