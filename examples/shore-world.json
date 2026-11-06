@@ -1,0 +1,28 @@
+{
+  "schema": "realm.worldpack.v1",
+  "world_id": "shore-example",
+  "name": "The Unclaimed Shore",
+  "start_room": "shore",
+  "rooms": [
+    {
+      "id": "shore",
+      "name": "The Shore",
+      "description": "Low grasses give way to pebbles beside still water. This is a generic, noncanonical example.",
+      "exits": {"north": "grove"}
+    },
+    {
+      "id": "grove",
+      "name": "The Grove",
+      "description": "Wind moves through a cluster of trees. A path returns south toward the water.",
+      "exits": {"south": "shore"}
+    }
+  ],
+  "items": [
+    {
+      "id": "stone_one",
+      "name": "Smooth stone",
+      "description": "A palm-sized stone, useful only as a portable test object for now.",
+      "room": "shore"
+    }
+  ]
+}
