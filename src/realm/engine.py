@@ -139,6 +139,28 @@ class Engine:
 
     def _initialize(self) -> None:
         with closing(self._connect()) as db, db:
+            # CREATE TABLE IF NOT EXISTS is useful on a *new* database but can
+            # silently hide missing core tables on a bound world. Inspect the
+            # existing authority marker before running any idempotent DDL.
+            # Extra extension tables are allowed; changed/missing core table
+            # and index definitions are not an implicit migration.
+            has_world_metadata_table = db.execute(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master "
+                "WHERE type='table' AND name='world_meta')"
+            ).fetchone()[0]
+            if has_world_metadata_table and db.execute(
+                "SELECT EXISTS(SELECT 1 FROM world_meta)"
+            ).fetchone()[0]:
+                existing_schema = _schema_snapshot(db)
+                changed_core = [
+                    name for name, definition in _pristine_schema().items()
+                    if existing_schema.get(name) != definition
+                ]
+                if changed_core:
+                    raise ValueError(
+                        "Bound world integrity failure: missing or modified core SQLite "
+                        "schema objects: " + ", ".join(sorted(changed_core))
+                    )
             db.executescript(_CORE_SCHEMA_SQL)
             # executescript commits implicitly; lock the first-run seed phase
             # so concurrent clients cannot both initialize the demo rooms.
