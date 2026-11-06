@@ -92,6 +92,10 @@ class Engine:
                     response TEXT NOT NULL,
                     PRIMARY KEY(actor, action_id)
                 );
+                CREATE TABLE IF NOT EXISTS world_meta (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL
+                );
                 CREATE INDEX IF NOT EXISTS idx_events_room_id ON events(room_id, id);
                 """
             )
@@ -122,9 +126,11 @@ class Engine:
         with self._connect() as db:
             player = db.execute("SELECT id,room_id FROM players WHERE id=?", (name,)).fetchone()
             if player is None:
-                db.execute("INSERT INTO players VALUES (?,?,?)", (name, "atrium", self._now()))
-                self._event(db, name, "atrium", "join", {})
-                return f"Welcome, {name}.\n{self._look(db, 'atrium', name)}"
+                configured = db.execute("SELECT value FROM world_meta WHERE key='start_room'").fetchone()
+                start_room = configured[0] if configured is not None else "atrium"
+                db.execute("INSERT INTO players VALUES (?,?,?)", (name, start_room, self._now()))
+                self._event(db, name, start_room, "join", {})
+                return f"Welcome, {name}.\n{self._look(db, start_room, name)}"
             return f"Welcome back, {player['id']}.\n{self._look(db, player['room_id'], player['id'])}"
 
     def _look(self, db: sqlite3.Connection, room_id: str, name: str) -> str:
