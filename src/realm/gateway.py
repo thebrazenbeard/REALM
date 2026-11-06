@@ -17,6 +17,7 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
 from .engine import Engine
+from .router import CommandRouter
 
 
 MAX_BODY_BYTES = 4096
@@ -33,6 +34,7 @@ class Gateway:
 
     def __init__(self, db_path: str | Path, *, world_id: str = "demo"):
         self.engine = Engine(db_path)
+        self.router = CommandRouter(self.engine)
         self.world_id = world_id
 
     def _read(self) -> sqlite3.Connection:
@@ -60,7 +62,7 @@ class Gateway:
             raise ValueError("Player and command must be strings")
         if len(command) > 512:
             raise ValueError("Command is too long")
-        text = self.engine.act(player, command, action_id=action_id)
+        text = self.router.act(player, command, action_id=action_id)
         return {"ok": True, "text": text, "cursor": self.cursor()}
 
     def room(self, player: str) -> dict:
@@ -97,6 +99,11 @@ class Gateway:
                     content = f"{row['actor']} took {payload.get('item','an item')}."
                 elif kind == "drop":
                     content = f"{row['actor']} dropped {payload.get('item','an item')}."
+                elif kind == "gather":
+                    content = f"{row['actor']} gathered {payload.get('material','resources')} x{payload.get('amount',0)}."
+                elif kind in {"craft", "build"}:
+                    past = "crafted" if kind == "craft" else "built"
+                    content = f"{row['actor']} {past} {payload.get('output','something')}."
                 else:
                     content = f"{row['actor']} acted."
                 events.append(
@@ -243,6 +250,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--db", type=Path, default=Path("realm.sqlite3"))
     parser.add_argument("--world-id", default="demo")
     parser.add_argument("--port", type=int, default=8768)
+    parser.add_argument("--demo-crafting", action="store_true", help="Install optional noncanonical gathering and recipe fixtures")
     parser.add_argument(
         "--allow-origin", action="append", default=[], metavar="ORIGIN",
         help="Exact browser origin permitted by CORS, e.g. http://127.0.0.1:8000",
@@ -250,6 +258,8 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     token = os.environ.get("REALM_GATEWAY_TOKEN") or secrets.token_urlsafe(32)
     gateway = Gateway(args.db, world_id=args.world_id)
+    if args.demo_crafting:
+        gateway.router.seed_demo_crafting()
     server = GatewayServer(gateway, token, tuple(args.allow_origin), args.port)
     print(f"REALM gateway listening on http://127.0.0.1:{server.server_port}", flush=True)
     print("This is a local prototype, not an internet-facing authenticated game server.", flush=True)
