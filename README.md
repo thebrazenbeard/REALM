@@ -1,157 +1,59 @@
-```markdown
-# REALM Engine
-> **R**untime **E**ngine for **A**utonomous **L**anguage **M**atrix
+# REALM — a small playable MUD foundation
 
-REALM is an open-source, local-first engine designed to run persistent, multi-user text-based virtual worlds powered by autonomous AI agents. 
+This is an original **terminal + SQLite prototype** of a reusable, standalone text-world engine. It is deliberately independent of any one fictional setting. The previous README was a speculative concept document, not an implemented feature list or binding requirements.
 
-Unlike traditional MUDs that rely on rigid verb parsers and pre-scripted NPC dialog trees, a **REALM** host runs dynamic background agent loops. Non-player characters possess persistent memory, personal drives, and systemic relationship graphs, allowing history to unfold organically whether players are actively logged in or away.
+Patrick's intended separation: **REALM** is the engine; **Driftspace** is a distinct private world Patrick can host as a REALM instance. Driftspace content, lore ownership, and player game-state remain separate from REALM's public source. This first vertical slice implements the generic shared-state core, **not yet** a configurable Driftspace worldpack or server.
 
----
+## What exists now
 
-## 🌟 Key Features
+The current prototype supports:
 
-* **Multi-Instance Support:** Spin up, run, and bridge multiple isolated REALMs on a single host machine with independent state databases, rule systems, and agent pools.
-* **Autonomous Agent Runtimes:** NPCs operate on continuous event loops driven by intrinsic goals rather than static reaction triggers.
-* **Local-First Architecture:** Complete offline privacy. Connect to local LLM inference engines (e.g., Ollama, vLLM) or route to cloud APIs via standardized adapters.
-* **Emergent World State:** Event-driven history logs ensure actions carry lasting consequences across room states, faction alignments, and environmental physics.
-* **Zero-Friction Client Connection:** Play via standard WebSocket, SSH terminal sessions, or modern web interfaces.
+- Separate persistent worlds: each SQLite file is a world, seeded with three deliberately **noncanonical demo rooms**.
+- Player names and persistent positions across restarts. Presence is their **last saved location**, not proof they are currently online.
+- Room descriptions and exits; movement; item take/drop/inventory (with transaction-level contention); player presence and shared room history.
+- Durable player speech, readable by others with `listen`/`history`.
+- Append-only application event records for joins, movement and speech.
+- API-level optional action IDs for replay-safe mutation retries; duplicate IDs for different commands are rejected.
+- One terminal client per player, using the same database path, with stdlib-only runtime dependencies.
 
----
+**Not implemented:** network clients, authentication, AI/NPC loops, autonomous offline ticks, inter-world portals, combat, a canonical Wreckforge map, a moderation layer, or distributed state. Do not interpret the prototype as a secure internet-facing server. Local player names are display identifiers, **not authenticated identities**.
 
-## 🏗️ Architecture & Core Concepts
+There is no live push/notification yet: another player sees your speech by issuing `listen` or returning to `look`. The first goal is reliable shared **state**, not pretending this is already a polished MUD server.
 
-Every local deployment consists of the core **REALM Daemon**, which manages background event loops, state persistence, and inter-process communication:
+## Play locally (Python 3.11+)
 
-
-```
-
-```
-                  +-----------------------------------+
-                  |      Host Machine (Local Daemon)  |
-                  |                                   |
-                  |  +----------+       +----------+  |
-                  |  | REALM 01 |       | REALM 02 |  |
-                  |  | (Cyber)  |       | (Fantasy)|  |
-                  |  +----+-----+       +----+-----+  |
-                  +-------|------------------|--------+
-                          |                  |
-       +------------------+                  +------------------+
-       |                                                        |
-[Local LLM / API]                                        [SQLite / Postgres]
-
-```
-
-(Agent Reasoning & Logic)                                 (State, Logs & Memory)
-
-```
-
-* **The Matrix (State Layer):** An immutable log of world facts, item locations, room topology, and historical ticks.
-* **Agent Drivers:** Isolated worker runtime processes that sample the world matrix, update NPC context windows, and emit structured action intents.
-* **Bridge Protocol:** Allows player characters to travel between distinct local REALM instances via configured gateway portals.
-
----
-
-## 🚀 Quick Start
-
-### Prerequisites
-* Python 3.11+ or Rust Toolchain
-* Local LLM runner (e.g., [Ollama](https://ollama.ai)) or an API key for external inference.
-
-### Installation & Initialization
-
-1. **Clone the repository:**
-   ```bash
-   git clone [https://github.com/your-username/realm-engine.git](https://github.com/your-username/realm-engine.git)
-   cd realm-engine
-
-```
-
-2. **Initialize the local host daemon:**
-```bash
-realm host init
-
-```
-
-
-3. **Create your first REALM instance:**
-```bash
-realm create cyberpunk-slums --template sci-fi-base --port 7777
-
-```
-
-
-4. **Create a second isolated REALM instance:**
-```bash
-realm create high-fantasy-citadel --template fantasy-base --port 7778
-
-```
-
-
-5. **Start the host engine:**
-```bash
-realm host start --all
-
-```
-
-
-
----
-
-## 🎮 Managing Local Instances
-
-Use the CLI to control your locally hosted worlds:
+No installation or API key required:
 
 ```bash
-# List all active REALM instances running on your machine
-realm list
-
-# Tail agent activity and world ticks for a specific instance
-realm logs cyberpunk-slums --follow
-
-# Inspect active NPCs and their current internal state/drives
-realm agents inspect high-fantasy-citadel --npc "Guard_01"
-
-# Stop a specific instance without affecting others
-realm stop cyberpunk-slums
-
+PYTHONPATH=src python -m realm --db data/demo.sqlite3 --player Patrick
 ```
 
----
+In a second terminal, join the same world:
 
-## 🛠️ Configuration Example (`realm.config.toml`)
-
-Each instance operates under its own isolated configuration:
-
-```toml
-[realm]
-id = "cyberpunk-slums"
-name = "Neo-Veridia Sector 4"
-max_players = 32
-
-[inference]
-provider = "ollama"
-model = "llama3:8b"
-base_url = "http://localhost:11434"
-
-[agents]
-tick_rate_seconds = 5
-max_active_agents = 20
-memory_retention_mode = "vector_graph"
-
+```bash
+PYTHONPATH=src python -m realm --db data/demo.sqlite3 --player Vera
 ```
 
----
+Try `look`, `north`, `east`, `take token`, `inventory`, `drop token`, `say Hello`, `listen`, `who`, `help`, and `quit`. The next time you join, your position is saved.
 
-## 🤝 Contributing
+One-off smoke command:
 
-Contributions are welcome! Please check out [CONTRIBUTING.md](CONTRIBUTING.md) for details on submitting pull requests, writing custom agent drivers, and developing world templates.
-
-## 📄 License
-
-This project is licensed under the my License - see the [LICENSE](https://www.google.com/search?q=LICENSE) file for details.
-
+```bash
+PYTHONPATH=src python -m realm --db data/demo.sqlite3 --player Patrick --once look
 ```
 
-<FollowUp label="Want to draft the CLI command structure or JSON event schema for agent ticks?" query="Draft a specification for the JSON event schema used by REALM agent ticks and state updates."/>
+Run tests without third-party packages:
 
+```bash
+python -m unittest discover -s tests -v
 ```
+
+On Windows PowerShell use `$env:PYTHONPATH = 'src'` before running `python -m realm`.
+
+## Architecture boundary
+
+The first slice is deterministic. Language models are optional future **action proposers**, not authorities over world state. In an eventual agent loop, every proposed action should pass a server-side world validator before being committed and broadcast. The SQLite ledger and room/exit graph remain authoritative for the prototype.
+
+The Wreckforge source repository is proprietary, and its canonical authority is separate. No Wreckforge/Driftspace book text, character, place, or plot belongs in the public REALM engine. Any future Driftspace worldpack should stay private and require explicit, authorized import, with gameplay events separated from novel canon.
+
+This repository currently has **no license file**; until the owner chooses one, don't presume public redistribution or derivative-use rights just because the repository is visible on GitHub.
