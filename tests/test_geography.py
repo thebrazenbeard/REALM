@@ -1,6 +1,7 @@
 """Stdlib-only deterministic tests for REALM geography/navigation."""
 
 import sqlite3
+from contextlib import closing
 import sys
 import tempfile
 import unittest
@@ -112,15 +113,15 @@ class GeographyTests(unittest.TestCase):
         self.assertEqual("moon", Geography(self.path).arrive("wanderer", now=150, action_id="land-1")["planet"])
         self.assertEqual("moon", Geography(self.path).arrive("wanderer", now=160, action_id="land-1")["planet"])
         self.assertEqual("docked", Geography(self.path).ship_status("wanderer")["state"])
-        with sqlite3.connect(self.path) as db:
+        with closing(sqlite3.connect(self.path)) as db, db:
             kinds = [row[0] for row in db.execute("SELECT kind FROM geo_ship_events ORDER BY id")]
         self.assertEqual(["depart", "arrive"], kinds)
 
     def test_database_coexists_with_core_engine_tables(self):
-        with sqlite3.connect(self.path) as db:
+        with closing(sqlite3.connect(self.path)) as db, db:
             db.execute("CREATE TABLE IF NOT EXISTS rooms(id TEXT PRIMARY KEY, name TEXT)")
             db.execute("INSERT INTO rooms VALUES('shore', 'Shoreline')")
-        with sqlite3.connect(self.path) as db:
+        with closing(sqlite3.connect(self.path)) as db, db:
             self.assertEqual("Shoreline", db.execute("SELECT name FROM rooms WHERE id='shore'").fetchone()[0])
         with self.geo._connect() as db:
             self.assertEqual("room", self.geo._place(db, "shore")["kind"])

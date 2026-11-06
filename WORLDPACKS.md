@@ -27,8 +27,15 @@ and run the commands using `python` rather than the shell `PYTHONPATH=src` prefi
 `new` refuses to replace an existing file; invalid or conflicting edits leave
 the original declaration unchanged. Edits are designed for a **single offline
 author**; concurrent file editing, live player building, and migrations are
-not yet supported. Importing after players have entered a world cannot silently
-replace their state. Start a fresh database for a changed worldpack.
+not yet supported. **Run builder edits one at a time against each JSON file.**
+The builder validates and atomically replaces a complete file, but its
+read-modify-write sequence does not acquire an interprocess lock. Two
+simultaneous `room`, `exit`, or `item` commands can both report success while
+the last writer silently overwrites the other's edit. A multi-author frontend
+must serialize those operations with a host-owned lock or queue before calling
+the CLI; atomic replacement alone does not prevent lost updates. Importing
+after players have entered a world cannot silently replace their state. Start
+a fresh database for a changed worldpack.
 
 The flagship showcase is deliberately separate from `src/realm` under
 `worlds/flagship/`; it is one optional content pack, not a dependency of the

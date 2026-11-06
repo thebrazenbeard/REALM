@@ -35,7 +35,7 @@ generic worldpack importer exists; a canonical Driftspace worldpack does not.
 
 The current integration candidate supports:
 
-- Separate persistent worlds: each SQLite file is a world, seeded with three deliberately **noncanonical demo rooms**.
+- Separate persistent worlds: each SQLite file is a world, seeded with three deliberately **noncanonical demo rooms**. The loopback gateway persists its `world_id` binding and rejects an attempt to relabel an existing database (see `docs/GATEWAY_PROTOCOL.md` for legacy adoption).
 - Player names and persistent positions across restarts. Presence is their **last saved location**, not proof they are currently online.
 - Room descriptions and exits; movement; item take/drop/inventory (with transaction-level contention); player presence and shared room history.
 - Durable player speech, readable by others with `listen`/`history`.
@@ -64,6 +64,10 @@ automatic simulation ticks, inter-world portals, combat, moderation,
 distributed state, or the canonical Driftspace setting. Local CLI/Telnet names
 are not durable authenticated account identities. **Do not expose these
 development servers to the public internet.**
+
+The model-free [`ResidentController`](docs/RESIDENT_PROPOSALS.md) now gives a
+host one validation boundary for future NPC **action proposals**, but does
+not generate actions or provide resident drives, memories, or autonomous ticks.
 
 The browser uses HTTP polling, not push notifications. Presence still means
 saved room position, not reliable online/offline status.

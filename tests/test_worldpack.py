@@ -1,6 +1,7 @@
 """Worldpack importer: safety, durability, and gameplay smoke tests."""
 
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import closing
 from pathlib import Path
 import json
 import sqlite3
@@ -11,6 +12,8 @@ import unittest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from realm import Engine
+from realm.gateway import Gateway
+from realm.auth import CredentialStore
 from realm.worldpack import WorldpackError, import_worldpack, read_worldpack, validate_worldpack
 
 
@@ -66,6 +69,26 @@ class WorldpackTests(unittest.TestCase):
         self.assertEqual(first["sha256"], again["sha256"])
         self.assertIn("Small stone", Engine(self.db).act("Patrick", "inventory"))
 
+    def test_pristine_gateway_matching_world_id_can_import(self):
+        self.save()
+        Gateway(self.db, world_id="sample")
+        imported = import_worldpack(self.db, self.file)
+        self.assertFalse(imported["unchanged"])
+        self.assertIn("Quiet Shore", Gateway(self.db, world_id="sample").join("Patrick")["text"])
+
+    def test_pristine_gateway_mismatched_world_id_cannot_import(self):
+        self.save()
+        Gateway(self.db, world_id="other")
+        with self.assertRaisesRegex(WorldpackError, "another world_id"):
+            import_worldpack(self.db, self.file)
+        self.assertIn("DEMO WORLD", Gateway(self.db, world_id="other").join("Patrick")["text"])
+
+    def test_preprovisioned_legacy_credentials_cannot_cross_into_import(self):
+        self.save()
+        CredentialStore(Engine(self.db)).provision("Alice")
+        with self.assertRaisesRegex(WorldpackError, "credentials"):
+            import_worldpack(self.db, self.file)
+
     def test_different_import_never_replaces_live_world(self):
         self.save()
         import_worldpack(self.db, self.file)
@@ -85,7 +108,7 @@ class WorldpackTests(unittest.TestCase):
 
     def test_external_changes_to_unplayed_demo_prevent_import(self):
         Engine(self.db)
-        with sqlite3.connect(self.db) as db:
+        with closing(sqlite3.connect(self.db)) as db, db:
             db.execute("UPDATE rooms SET description='altered' WHERE id='atrium'")
         self.save()
         with self.assertRaisesRegex(WorldpackError, "differs"):
