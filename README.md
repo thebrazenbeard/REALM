@@ -68,6 +68,10 @@ development servers to the public internet.**
 The model-free [`ResidentController`](docs/RESIDENT_PROPOSALS.md) now gives a
 host one validation boundary for future NPC **action proposals**, but does
 not generate actions or provide resident drives, memories, or autonomous ticks.
+An opt-in, model-neutral [two-resident conversation runner](docs/NPC_CONVERSATIONS.md)
+now permits a trusted local host to register two fresh NPC identities and
+commit bounded, alternating `say` turns with restart-stable receipts. Deterministic
+providers are tested; actual model inference and continuous autonomy are not.
 Small local NPC-model options, including Patrick's Hugging Face `character` and
 `npc` searches, are tracked as **research candidates** in
 [`docs/NPC_MODEL_CANDIDATES.md`](docs/NPC_MODEL_CANDIDATES.md) and the offline

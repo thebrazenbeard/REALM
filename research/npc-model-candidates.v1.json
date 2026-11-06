@@ -1,12 +1,12 @@
 {
   "schema": "realm.npc-model-candidates.v1",
   "review_date_utc": "2026-11-06",
-  "registry_status": "research_only",
+  "registry_status": "source_research_plus_two_bounded_local_host_checks",
   "weights_in_repository": false,
-  "weights_status_scope": "this_research_workflow_only",
+  "weights_status_scope": "per_candidate_as_observed_on_Lappy_2026-11-06",
   "priority_semantics": "research_triage_order_not_measured_quality",
-  "model_card_revision_pinning": "not_performed",
-  "model_artifact_sha256_verification": "not_performed",
+  "model_card_revision_pinning": "performed_for_two_host_tested_candidates_only",
+  "model_artifact_sha256_verification": "performed_for_two_host_tested_candidates_only",
   "discovery_queries": [
     "https://huggingface.co/models?pipeline_tag=text-generation&num_parameters=min:0,max:1B&sort=likes&search=character",
     "https://huggingface.co/models?pipeline_tag=text-generation&num_parameters=min:0,max:1B&sort=downloads&search=npc"
@@ -27,8 +27,19 @@
         "A speech renderer may embellish or contradict supplied facts and must not act as world authority."
       ],
       "rights_status": "training_source_review_required",
-      "weights_status": "not_downloaded",
-      "host_benchmark_status": "not_run",
+      "weights_status": "downloaded_outside_git_on_Lappy_sha256_verified",
+      "host_benchmark_status": "one_bounded_cpu_inference_observed_not_integrated_or_qualified",
+      "local_host_experiment": {
+        "date": "2026-11-06",
+        "source_revision": "c50dd33ef5331b69ce024789f4cfff2a5416f9da",
+        "artifact_file": "npc-voice-soup06.Q5_K_M.gguf",
+        "artifact_bytes": 444415232,
+        "artifact_sha256": "1854a099349767b6e66cd940ae81e76dd139d2a32f8adb79778e7a66fbf84d75",
+        "host": "Lappy",
+        "runtime": "llama-cli b11026-b49650adb CPU-only two threads",
+        "observed": "Default raw prompt generated only thinking in an 80-token test; --reasoning off generated a short dialogue line in a separate test. Neither proves accuracy or integration.",
+        "status": "artifact_verified_and_single_inference_observed"
+      },
       "qualified_for_real_players": false
     },
     {
@@ -46,8 +57,19 @@
         "Card speed claims have not been reproduced on Lappy or VN1."
       ],
       "rights_status": "training_source_review_required",
-      "weights_status": "not_downloaded",
-      "host_benchmark_status": "not_run",
+      "weights_status": "downloaded_outside_git_on_Lappy_sha256_verified",
+      "host_benchmark_status": "one_bounded_cpu_inference_observed_not_integrated_or_qualified",
+      "local_host_experiment": {
+        "date": "2026-11-06",
+        "source_revision": "bfa42cffea8a98f50f9951452088caf76b76f4e6",
+        "artifact_file": "stealth-rifle-Q4_K_M.gguf",
+        "artifact_bytes": 397807424,
+        "artifact_sha256": "2f33d93535cac345df47cd02928a74175fe437b8f3ec20cfdfe4822322e6ca32",
+        "host": "Lappy",
+        "runtime": "llama-cli b11026-b49650adb CPU-only two threads",
+        "observed": "One short ChatML scene generated text locally in approximately seven seconds; it inferred that a crossing was probably open without supporting world evidence.",
+        "status": "artifact_verified_and_single_inference_observed"
+      },
       "qualified_for_real_players": false
     },
     {

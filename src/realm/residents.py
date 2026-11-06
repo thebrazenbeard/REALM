@@ -80,9 +80,15 @@ class ResidentController:
             raise ValueError("Resident speech must contain 1–280 characters")
         return parsed
 
-    def commit(self, proposal: Mapping[str, object], *, action_id: str) -> str:
+    def commit(
+        self, proposal: Mapping[str, object], *, action_id: str,
+        expected_room: str | None = None, required_roommate: str | None = None,
+    ) -> str:
         """PROPOSE → host VALIDATE → Engine COMMIT with host-owned receipt ID."""
         if not isinstance(action_id, str) or not 1 <= len(action_id) <= 128:
             raise ValueError("Host action ID must contain 1–128 characters")
         accepted = self.validate(proposal)
-        return self._engine.act(self._resident, accepted.command, action_id=action_id)
+        return self._engine.act(
+            self._resident, accepted.command, action_id=action_id,
+            expected_room=expected_room, required_roommate=required_roommate,
+        )
