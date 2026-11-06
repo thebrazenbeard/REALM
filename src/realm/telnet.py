@@ -93,7 +93,30 @@ class LocalTelnetServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
         self.token = token
         self._slots = threading.BoundedSemaphore(MAX_CONNECTIONS)
         self._join_lock = threading.Lock()
+        self._active_names: set[str] = set()
         super().__init__(("127.0.0.1", port), LocalTelnetHandler)
+
+    def join_exclusive(self, name: str) -> str | None:
+        """Reserve one *live local socket session* per casefolded player name.
+
+        This is not durable identity/ownership: someone with the shared local
+        access token can still claim the name after its socket disconnects.
+        """
+        key = name.casefold()
+        with self._join_lock:
+            if key in self._active_names:
+                return None
+            greeting = self.engine.join(name)
+            self._active_names.add(key)
+            return greeting
+
+    def release_name(self, name: str) -> None:
+        with self._join_lock:
+            self._active_names.discard(name.casefold())
+
+    def is_name_active(self, name: str) -> bool:
+        with self._join_lock:
+            return name.casefold() in self._active_names
 
     def verify_request(self, request: socket.socket, client_address: tuple) -> bool:
         if client_address[0] != "127.0.0.1":
@@ -163,6 +186,7 @@ class LocalTelnetHandler(socketserver.BaseRequestHandler):
             self._pending.extend(body)
 
     def handle(self) -> None:
+        self._claimed_name: str | None = None
         try:
             self._run()
         except (ConnectionResetError, BrokenPipeError, TimeoutError, OSError):
@@ -172,6 +196,9 @@ class LocalTelnetHandler(socketserver.BaseRequestHandler):
                 self._send(f"\nInput rejected: {error}\n")
             except OSError:
                 pass
+        finally:
+            if self._claimed_name is not None:
+                self.server.release_name(self._claimed_name)
 
     def _run(self) -> None:
         self._send("REALM — local terminal prototype\nToken: ")
@@ -184,13 +211,14 @@ class LocalTelnetHandler(socketserver.BaseRequestHandler):
         if name is None:
             return
         try:
-            # PR #1 lacks its own first-join serialization (PR #2 adds it);
-            # protect simultaneous new joins through this terminal listener.
-            with self.server._join_lock:
-                greeting = self.server.engine.join(name)
+            greeting = self.server.join_exclusive(name)
         except ValueError as error:
             self._send(f"Invalid player name: {error}\n")
             return
+        if greeting is None:
+            self._send("That player name is already connected to this local server.\n")
+            return
+        self._claimed_name = name
         self._send(f"\n{greeting}\nREALM> ")
         while True:
             command = self._line()

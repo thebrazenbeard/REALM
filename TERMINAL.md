@@ -24,8 +24,11 @@ On PowerShell, set `$env:PYTHONPATH='src'` before launching the module.
 - **Telnet is plaintext**, including the connection token. Do not expose this
   port via tunnels, port forwarding, reverse proxies, or public interfaces.
 - The token gates local server access, **not player identity**. Anyone who
-  knows it can choose an existing player's name. There is no account password,
-  permission system, transport encryption, or moderation yet.
+  knows it can choose an existing player's name *after that player disconnects*.
+  An active local socket now exclusively reserves its case-insensitive name;
+  that reservation is released on `quit`, EOF, timeout, or socket error. This
+  is **not** durable account ownership or authenticated player identity. There
+  is no account password, permission system, encryption, or moderation yet.
 - No automatic live push of other players' actions in this initial adapter;
   issue `listen` to see durable room-local events. No SSH/GMCP protocol yet.
 - Access is capped to eight simultaneous local connections; oversized input
