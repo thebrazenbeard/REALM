@@ -1,4 +1,4 @@
-"""Loopback-only, bearer-protected HTTP bridge for the local REALM prototype.
+"""Loopback-only, player-bound bearer HTTP bridge for the REALM prototype.
 
 The v1 wire format is provisional. This is NOT a public multiplayer/auth
 service, not an HTTPS endpoint, and not a replacement for Telnet/GMCP support.
@@ -7,15 +7,13 @@ service, not an HTTPS endpoint, and not a replacement for Telnet/GMCP support.
 from __future__ import annotations
 
 import argparse
-import hmac
 import json
-import os
-import secrets
 import sqlite3
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
+from .auth import CredentialStore
 from .engine import Engine
 
 
@@ -26,13 +24,14 @@ MAX_FEED_EVENTS = 100
 class Gateway:
     """Boundary between untrusted HTTP requests and deterministic engine actions.
 
-    A single gateway token protects the entire local instance. It does NOT
-    authenticate individual players; never expose this prototype to the public
-    internet or use it as an identity system.
+    Remote player access requires a host-provisioned credential bound to a
+    specific name. Local Engine methods are still host-trusted administrative
+    APIs; this is not public account registration or session management.
     """
 
     def __init__(self, db_path: str | Path, *, world_id: str = "demo"):
         self.engine = Engine(db_path)
+        self.credentials = CredentialStore(self.engine)
         self.world_id = world_id
 
     def _read(self) -> sqlite3.Connection:
@@ -93,6 +92,8 @@ class Gateway:
                     content = f"{row['actor']} entered the world."
                 elif kind == "move":
                     content = f"{row['actor']} arrived."
+                elif kind == "leave":
+                    content = f"{row['actor']} departed."
                 elif kind == "take":
                     content = f"{row['actor']} took {payload.get('item','an item')}."
                 elif kind == "drop":
@@ -111,10 +112,10 @@ class Gateway:
 class GatewayServer(ThreadingHTTPServer):
     daemon_threads = True
 
-    def __init__(self, gateway: Gateway, token: str, allowed_origins: tuple[str, ...], port: int = 8768):
-        # Intentionally no 0.0.0.0 bind option in this initial gateway.
+    def __init__(self, gateway: Gateway, allowed_origins: tuple[str, ...], port: int = 8768):
+        # No process-wide token or 0.0.0.0 bind option: gameplay uses
+        # independent per-player credentials provisioned by the host.
         self.gateway = gateway
-        self.token = token
         self.allowed_origins = frozenset(allowed_origins)
         super().__init__(("127.0.0.1", port), GatewayHandler)
 
@@ -154,23 +155,31 @@ class GatewayHandler(BaseHTTPRequestHandler):
         self._headers(status, len(data))
         self.wfile.write(data)
 
-    def _authorized(self) -> bool:
+    def _principal(self) -> str | None:
         auth = self.headers.get("Authorization", "")
         scheme, separator, presented = auth.partition(" ")
-        return (
-            separator == " "
-            and scheme.casefold() == "bearer"
-            and hmac.compare_digest(presented, self.server.token)
-        )
+        if separator != " " or scheme.casefold() != "bearer":
+            return None
+        return self.server.gateway.credentials.authenticate(presented)
 
-    def _gate(self, *, public_health: bool = False) -> bool:
+    def _gate(self, *, public_health: bool = False) -> str | None:
         if not self._origin_ok():
             self._send(403, {"ok": False, "error": "Origin not allowed"})
-            return False
-        if not public_health and not self._authorized():
-            self._send(401, {"ok": False, "error": "Bearer token required"})
-            return False
-        return True
+            return None
+        if public_health:
+            return ""  # distinguished from no principal (None)
+        principal = self._principal()
+        if principal is None:
+            self._send(401, {"ok": False, "error": "Valid player bearer token required"})
+        return principal
+
+    def _player_matches(self, claimed: object, principal: str) -> bool:
+        # A caller's player name is merely a backwards-compatible assertion.
+        # The verified token, never JSON/query parameters, supplies the actor.
+        if claimed is None or (isinstance(claimed, str) and claimed.casefold() == principal.casefold()):
+            return True
+        self._send(403, {"ok": False, "error": "Player does not match token"})
+        return False
 
     def do_OPTIONS(self) -> None:  # noqa: N802
         if not self._origin() or not self._origin_ok():
@@ -185,20 +194,24 @@ class GatewayHandler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:  # noqa: N802
         path, params = self._params()
         if path == "/api/v1/health":
-            if self._gate(public_health=True):
+            if self._gate(public_health=True) is not None:
                 self._send(200, {"ok": True, "world_id": self.server.gateway.world_id})
             return
-        if not self._gate():
+        principal = self._gate()
+        if principal is None:
             return
         try:
             if path == "/api/v1/feed":
-                player = params.get("player", [""])[0]
+                if not self._player_matches(params.get("player", [None])[0], principal):
+                    return
                 raw_after = params.get("after", ["0"])[0]
                 if not raw_after.isdecimal():
                     raise ValueError("Cursor must be a nonnegative integer")
-                result = self.server.gateway.feed(player, int(raw_after))
+                result = self.server.gateway.feed(principal, int(raw_after))
             elif path == "/api/v1/room":
-                result = self.server.gateway.room(params.get("player", [""])[0])
+                if not self._player_matches(params.get("player", [None])[0], principal):
+                    return
+                result = self.server.gateway.room(principal)
             else:
                 self._send(404, {"ok": False, "error": "Unknown endpoint"})
                 return
@@ -209,7 +222,8 @@ class GatewayHandler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:  # noqa: N802
         path, _ = self._params()
-        if not self._gate():
+        principal = self._gate()
+        if principal is None:
             return
         if path not in {"/api/v1/join", "/api/v1/command"}:
             self._send(404, {"ok": False, "error": "Unknown endpoint"})
@@ -226,11 +240,13 @@ class GatewayHandler(BaseHTTPRequestHandler):
             obj = json.loads(content)
             if not isinstance(obj, dict):
                 raise ValueError("Expected a JSON object")
+            if not self._player_matches(obj.get("player"), principal):
+                return
             if path == "/api/v1/join":
-                result = self.server.gateway.join(obj.get("player"))
+                result = self.server.gateway.join(principal)
             else:
                 result = self.server.gateway.command(
-                    obj.get("player"), obj.get("command"), obj.get("action_id")
+                    principal, obj.get("command"), obj.get("action_id")
                 )
         except (ValueError, json.JSONDecodeError) as error:
             self._send(400, {"ok": False, "error": str(error)})
@@ -247,13 +263,24 @@ def main(argv: list[str] | None = None) -> int:
         "--allow-origin", action="append", default=[], metavar="ORIGIN",
         help="Exact browser origin permitted by CORS, e.g. http://127.0.0.1:8000",
     )
+    operator = parser.add_mutually_exclusive_group()
+    operator.add_argument("--provision-player", metavar="PLAYER", help="Provision a player token locally, then exit")
+    operator.add_argument("--rotate-player", metavar="PLAYER", help="Rotate a player token locally, then exit")
+    operator.add_argument("--revoke-player", metavar="PLAYER", help="Revoke a player token locally, then exit")
     args = parser.parse_args(argv)
-    token = os.environ.get("REALM_GATEWAY_TOKEN") or secrets.token_urlsafe(32)
     gateway = Gateway(args.db, world_id=args.world_id)
-    server = GatewayServer(gateway, token, tuple(args.allow_origin), args.port)
+    if args.provision_player:
+        print(f"New token for {args.provision_player}: {gateway.credentials.provision(args.provision_player)}")
+        return 0
+    if args.rotate_player:
+        print(f"Rotated token for {args.rotate_player}: {gateway.credentials.rotate(args.rotate_player)}")
+        return 0
+    if args.revoke_player:
+        print("Revoked" if gateway.credentials.revoke(args.revoke_player) else "Not provisioned")
+        return 0
+    server = GatewayServer(gateway, tuple(args.allow_origin), args.port)
     print(f"REALM gateway listening on http://127.0.0.1:{server.server_port}", flush=True)
-    print("This is a local prototype, not an internet-facing authenticated game server.", flush=True)
-    print(f"Bearer token for this process: {token}", flush=True)
+    print("Private-host player credentials required. Not an internet-facing game server.", flush=True)
     try:
         server.serve_forever(poll_interval=0.2)
     except KeyboardInterrupt:

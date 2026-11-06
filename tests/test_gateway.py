@@ -1,6 +1,7 @@
 """Loopback gateway integration/security tests using only Python stdlib."""
 
 import json
+import sqlite3
 import sys
 import tempfile
 import threading
@@ -20,8 +21,12 @@ class GatewayTests(unittest.TestCase):
         self.addCleanup(self.tmp.cleanup)
         self.db = Path(self.tmp.name) / "world.sqlite3"
         self.gateway = Gateway(self.db, world_id="sandbox")
+        self.player_tokens = {
+            name: self.gateway.credentials.provision(name)
+            for name in ("Patrick", "Vera")
+        }
         self.server = GatewayServer(
-            self.gateway, "unit-test-secret", ("http://127.0.0.1:8000",), port=0
+            self.gateway, ("http://127.0.0.1:8000",), port=0
         )
         self.thread = threading.Thread(
             target=self.server.serve_forever, kwargs={"poll_interval": 0.02}, daemon=True
@@ -35,13 +40,19 @@ class GatewayTests(unittest.TestCase):
         self.server.server_close()
         self.thread.join(timeout=2)
 
-    def send(self, path, obj=None, *, token=True, origin=None, method=None):
+    def send(self, path, obj=None, *, token=True, origin=None, method=None, token_player=None):
         data = json.dumps(obj).encode() if obj is not None else None
         headers = {}
         if obj is not None:
             headers["Content-Type"] = "application/json"
         if token:
-            headers["Authorization"] = "Bearer unit-test-secret"
+            requested = token_player
+            if requested is None and isinstance(obj, dict):
+                requested = obj.get("player")
+            if requested is None and "?" in path:
+                requested = parse.parse_qs(parse.urlsplit(path).query).get("player", [None])[0]
+            requested = requested if requested in self.player_tokens else "Patrick"
+            headers["Authorization"] = "Bearer " + self.player_tokens[requested]
         if origin:
             headers["Origin"] = origin
         req = request.Request(
@@ -111,13 +122,13 @@ class GatewayTests(unittest.TestCase):
         _, feed = self.send("/api/v1/feed?player=Patrick&after=0")
         self.assertFalse(any("Hidden corridor" in event["text"] for event in feed["events"]))
         status, _ = self.send("/api/v1/feed?player=NotJoined&after=0")
-        self.assertEqual(400, status)
+        self.assertEqual(403, status)
         status, _ = self.send("/api/v1/feed?player=Patrick&after=-1")
         self.assertEqual(400, status)
         status, _ = self.send("/api/v1/command", {"player": "Patrick", "command": "a" * 513})
         self.assertEqual(400, status)
         status, _ = self.send("/api/v1/join", {"player": "../admin"})
-        self.assertEqual(400, status)
+        self.assertEqual(403, status)
 
     def test_restart_reads_same_persisted_state(self):
         self.send("/api/v1/join", {"player": "Patrick"})
@@ -131,6 +142,65 @@ class GatewayTests(unittest.TestCase):
         self.assertEqual(2, len(results))
         self.assertEqual(1, sum("Welcome, Patrick." in item["text"] for item in results))
         self.assertEqual(1, sum("Welcome back, Patrick." in item["text"] for item in results))
+
+    def test_player_bound_token_denies_cross_player_commands(self):
+        self.send("/api/v1/join", {"player": "Patrick"})
+        self.send("/api/v1/join", {"player": "Vera"})
+        status, result = self.send(
+            "/api/v1/command",
+            {"player": "Vera", "command": "say Impersonated", "action_id": "wrong-actor"},
+            token_player="Patrick",
+        )
+        self.assertEqual(403, status)
+        self.assertFalse(result["ok"])
+        _, feed = self.send("/api/v1/feed?player=Vera&after=0", token_player="Vera")
+        self.assertFalse(any("Impersonated" in e["text"] for e in feed["events"]))
+
+    def test_player_bound_token_denies_cross_player_feed(self):
+        self.send("/api/v1/join", {"player": "Patrick"})
+        self.send("/api/v1/join", {"player": "Vera"})
+        self.send("/api/v1/command", {"player": "Vera", "command": "north"})
+        self.send("/api/v1/command", {"player": "Vera", "command": "say Private room"})
+        status, _ = self.send("/api/v1/feed?player=Vera&after=0", token_player="Patrick")
+        self.assertEqual(403, status)
+        _, private = self.send("/api/v1/feed?player=Vera&after=0", token_player="Vera")
+        self.assertTrue(any("Private room" in e["text"] for e in private["events"]))
+
+    def test_movement_notifies_old_and_new_room_audiences(self):
+        self.send("/api/v1/join", {"player": "Patrick"})
+        self.send("/api/v1/join", {"player": "Vera"})
+        _, initial = self.send("/api/v1/join", {"player": "Patrick"})
+        self.send("/api/v1/command", {"player": "Vera", "command": "north"})
+        _, old_room = self.send(f"/api/v1/feed?player=Patrick&after={initial['cursor']}")
+        self.assertTrue(any(e["actor"] == "Vera" and e["kind"] == "leave" for e in old_room["events"]))
+        _, new_room = self.send("/api/v1/feed?player=Vera&after=0")
+        self.assertTrue(any(e["actor"] == "Vera" and e["kind"] == "move" for e in new_room["events"]))
+
+    def test_credential_rotation_revoke_and_no_plaintext_storage(self):
+        first = self.player_tokens["Patrick"]
+        with sqlite3.connect(self.db) as connection:
+            stored = connection.execute("SELECT token_digest FROM player_credentials WHERE player_name='Patrick'").fetchone()[0]
+        self.assertNotEqual(first, stored)
+        self.assertNotIn(first, stored)
+        with self.assertRaises(ValueError):
+            self.gateway.credentials.provision("Patrick")
+        rotated = self.gateway.credentials.rotate("patrick")
+        self.assertIsNone(Gateway(self.db).credentials.authenticate(first))
+        self.assertEqual("Patrick", Gateway(self.db).credentials.authenticate(rotated))
+        self.assertTrue(self.gateway.credentials.revoke("PATRICK"))
+        self.assertIsNone(Gateway(self.db).credentials.authenticate(rotated))
+
+    def test_shared_process_secret_no_longer_authorizes_gameplay(self):
+        self.send("/api/v1/join", {"player": "Patrick"})
+        headers = {"Authorization": "Bearer unit-test-secret", "Content-Type": "application/json"}
+        req = request.Request(
+            self.base + "/api/v1/command",
+            data=json.dumps({"player": "Patrick", "command": "say forged"}).encode(),
+            headers=headers,
+        )
+        with self.assertRaises(error.HTTPError) as raised:
+            request.urlopen(req, timeout=3)
+        self.assertEqual(401, raised.exception.code)
 
 
 if __name__ == "__main__":

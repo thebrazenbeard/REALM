@@ -200,6 +200,9 @@ class Engine:
                 if dest is None:
                     return f"No exit leads {direction or 'that way'}."
                 db.execute("UPDATE players SET room_id=? WHERE id=?", (dest[0], actor))
+                # One transaction records both audiences: people left behind
+                # learn about departure; destination occupants see arrival.
+                self._event(db, actor, room_id, "leave", {"to": dest[0], "direction": direction})
                 self._event(db, actor, dest[0], "move", {"from": room_id, "direction": direction})
                 return self._look(db, dest[0], actor)
             if verb in {"inventory", "inv", "i"}:
@@ -260,6 +263,8 @@ class Engine:
                         items.append(f"{event['actor']} said: {details['text']}")
                     elif event["kind"] == "move":
                         items.append(f"{event['actor']} arrived from {details['from']}")
+                    elif event["kind"] == "leave":
+                        items.append(f"{event['actor']} departed toward {details['to']}")
                     elif event["kind"] == "join":
                         items.append(f"{event['actor']} entered the world")
                     elif event["kind"] in {"take", "drop"}:
