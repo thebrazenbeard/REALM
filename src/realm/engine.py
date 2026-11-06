@@ -144,6 +144,26 @@ class Engine:
             # so concurrent clients cannot both initialize the demo rooms.
             db.execute("BEGIN IMMEDIATE")
             if db.execute("SELECT COUNT(*) FROM rooms").fetchone()[0] == 0:
+                # An imported world can lose its rooms through external damage
+                # (or a local writer disabling foreign-key enforcement). Never
+                # disguise that loss by installing the generic demo under the
+                # *existing* world identity. Likewise, a previously used demo
+                # with surviving history/metadata is not a fresh database.
+                has_metadata = db.execute(
+                    "SELECT EXISTS(SELECT 1 FROM world_meta)"
+                ).fetchone()[0]
+                has_history = any(
+                    db.execute(f"SELECT EXISTS(SELECT 1 FROM {table})").fetchone()[0]
+                    for table in ("players", "events", "action_receipts", "items", "exits")
+                )
+                has_past_ids = db.execute(
+                    "SELECT EXISTS(SELECT 1 FROM sqlite_sequence)"
+                ).fetchone()[0]
+                if has_metadata or has_history or has_past_ids:
+                    raise ValueError(
+                        "World integrity failure: missing all rooms in a previously "
+                        "initialized or bound world; refusing automatic demo reseed"
+                    )
                 db.executemany("INSERT INTO rooms VALUES (?,?,?)", _SEED_ROOMS)
                 db.executemany("INSERT INTO exits VALUES (?,?,?)", _SEED_EXITS)
                 db.executemany(
