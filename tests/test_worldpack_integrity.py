@@ -6,7 +6,9 @@ external-tamper/corruption fixtures, not a claim of an ordinary crash exploit.
 
 from pathlib import Path
 import json
+import os
 import sqlite3
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -113,7 +115,7 @@ class BoundWorldIntegrityTests(unittest.TestCase):
         self._external_damage("DROP TABLE events")
         with self.assertRaisesRegex(ValueError, "core SQLite schema"):
             Engine(self.path)
-        with self.assertRaisesRegex(ValueError, "core SQLite schema"):
+        with self.assertRaisesRegex(WorldpackError, "core SQLite schema"):
             import_worldpack(self.path, self.pack_path)
         with sqlite3.connect(self.path) as db:
             self.assertIsNone(db.execute(
@@ -128,6 +130,22 @@ class BoundWorldIntegrityTests(unittest.TestCase):
             self.assertIsNone(db.execute(
                 "SELECT name FROM sqlite_master WHERE type='index' AND name='idx_events_room_id'"
             ).fetchone())
+
+    def test_worldpack_cli_reports_integrity_error_once_without_traceback(self):
+        self._external_damage("DROP TABLE events")
+        src = Path(__file__).resolve().parents[1] / "src"
+        completed = subprocess.run(
+            [sys.executable, "-m", "realm.worldpack", "--db", str(self.path),
+             "--file", str(self.pack_path)],
+            env={**os.environ, "PYTHONPATH": str(src)},
+            capture_output=True, text=True, timeout=10, check=False,
+        )
+        self.assertEqual(2, completed.returncode)
+        self.assertEqual("", completed.stdout)
+        self.assertEqual(1, len(completed.stderr.splitlines()))
+        self.assertIn("Worldpack integrity error:", completed.stderr)
+        self.assertIn("core SQLite schema", completed.stderr)
+        self.assertNotIn("Traceback", completed.stderr)
 
     def test_item_held_after_play_is_still_legitimate_unchanged_import(self):
         game = Engine(self.path)
