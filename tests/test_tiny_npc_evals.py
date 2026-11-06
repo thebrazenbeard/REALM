@@ -77,6 +77,12 @@ class TinyNPCEvalTests(unittest.TestCase):
         self.assertIn("rendered_prompt_sha256_missing_or_invalid", row["violations"])
         self.assertIn("source_head_missing_or_invalid", row["violations"])
 
+    def test_osc52_terminal_control_is_not_a_valid_character_line(self):
+        case = self.cases["stealth_steward_persona"]
+        row = scorer.assess(case, self.receipt(case, "\x1b]52;c;Zm9v\x07I will wait for the river."))
+        self.assertEqual("FAIL_LEXICAL", row["result"])
+        self.assertIn("nonprintable_or_terminal_control", row["violations"])
+
     def test_template_leak_narration_and_private_marker_controls(self):
         steward = self.cases["stealth_steward_persona"]
         narration = scorer.assess(steward, self.receipt(steward, "The traveler nodded."))
@@ -101,6 +107,9 @@ class TinyNPCEvalTests(unittest.TestCase):
             path.write_text("not json\n")
             with self.assertRaisesRegex(scorer.EvalInputError, "Invalid receipt"):
                 scorer.load_responses(path, known_ids=set(self.cases))
+            path.write_text(json.dumps({"case_id": ["not", "hashable"]}) + "\n")
+            with self.assertRaisesRegex(scorer.EvalInputError, "Unknown"):
+                scorer.load_responses(path, known_ids=set(self.cases))
 
     def test_missing_receipts_and_reported_latency_are_not_verified_runtime(self):
         case = self.cases["soup_price_preservation"]
@@ -120,12 +129,18 @@ class TinyNPCEvalTests(unittest.TestCase):
         row = scorer.assess(case, self.receipt(case, "That is certainly possible."))
         self.assertEqual("PASS_LEXICAL", row["result"])
         self.assertIn("grounded_reply", row["manual_review"])
+        for drift in ("I am a new vampire mayor.", "The traveler lowered his head in agreement."):
+            self.assertEqual("PASS_LEXICAL", scorer.assess(case, self.receipt(case, drift))["result"])
 
     def test_input_size_and_schema_guards(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "cases.json"
             path.write_text(json.dumps({"schema": "unknown", "cases": []}))
             with self.assertRaisesRegex(scorer.EvalInputError, "schema"):
+                scorer.load_cases(path)
+            malformed = {**self.corpus, "cases": [{**self.corpus["cases"][0], "id": 17}]}
+            path.write_text(json.dumps(malformed))
+            with self.assertRaisesRegex(scorer.EvalInputError, "case ID"):
                 scorer.load_cases(path)
             path.write_bytes(b"x" * (scorer.MAX_FILE_BYTES + 1))
             with self.assertRaisesRegex(scorer.EvalInputError, "1 MB"):

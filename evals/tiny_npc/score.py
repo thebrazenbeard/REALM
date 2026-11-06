@@ -44,7 +44,8 @@ def load_cases(path: Path) -> dict:
         raise EvalInputError("No cases")
     ids = set()
     for case in cases:
-        if not isinstance(case, dict) or not re.fullmatch(r"[a-z][a-z0-9_]{2,63}", case.get("id", "")):
+        if (not isinstance(case, dict) or not isinstance(case.get("id"), str)
+                or not re.fullmatch(r"[a-z][a-z0-9_]{2,63}", case["id"])):
             raise EvalInputError("Invalid case ID")
         if case["id"] in ids:
             raise EvalInputError("Duplicate case ID")
@@ -72,7 +73,8 @@ def load_responses(path: Path, *, known_ids: set[str]) -> dict[str, dict]:
             row = json.loads(line)
         except json.JSONDecodeError as exc:
             raise EvalInputError("Invalid receipt JSONL") from exc
-        if not isinstance(row, dict) or row.get("case_id") not in known_ids:
+        if (not isinstance(row, dict) or not isinstance(row.get("case_id"), str)
+                or row["case_id"] not in known_ids):
             raise EvalInputError("Unknown response case ID")
         case_id = row["case_id"]
         if case_id in out:
@@ -119,6 +121,8 @@ def assess(case: dict, receipt: dict, *, expected_sha256: str | None = None) -> 
     if not isinstance(text, str) or not text.strip() or len(text) > MAX_OUTPUT_CHARS:
         violations.append("speech_missing_or_overlong")
     else:
+        if not all(ch.isprintable() for ch in text):
+            violations.append("nonprintable_or_terminal_control")
         if "\r" in text or "\n" in text:
             violations.append("multiline_speech")
         if CONTROL.search(text):
