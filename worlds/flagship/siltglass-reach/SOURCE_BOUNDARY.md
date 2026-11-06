@@ -25,6 +25,15 @@ to republish its content. Accordingly:
 - The packed JSON is passive content. No model, script, hidden quest,
   public network endpoint, or host authorization is embedded.
 
+The optional `living_lore.v1.json` extension is likewise original writing
+and deliberately outside the engine's import schema. Its fictional residents,
+factions, barter tallies, atmospheric states and quest questions are prompts
+for player-authored activity, not imported characters, working AI agents,
+autonomous mechanics, real currencies, or rights claims over historical MUDs.
+No private Morax Marauders, All Good Things, Driftspace, White Wolf, Melmoth,
+Astaria, GodWars or Vampire Wars names, monster statistics, maps, item text,
+dialogue or rule systems were transcribed into it.
+
 This is a creation/provenance note, **not** a legal rights opinion or an
 independent originality certification. Before reusing any private campaign
 material more closely, obtain explicit rights and a separate editorial review.
