@@ -1,0 +1,165 @@
+{
+  "schema": "realm.siltglass-lore.v1",
+  "world_id": "siltglass-reach",
+  "status": "passive-reference-only",
+  "notice": "Original optional world design. REALM worldpack.v1 imports rooms, exits and portable items only; none of these NPCs, factions, prices, weather states or quests is scheduled or enforced by the engine.",
+  "npcs": [
+    {
+      "id": "nessa_pell",
+      "name": "Nessa Pell",
+      "actor_id": "NessaPell",
+      "home_room": "lantern_jetty",
+      "faction_id": "channel_guild",
+      "persona": "I keep ferry tallies at Lantern Jetty. I want passage to continue, but I will distinguish crossings I witnessed from rumors and challenge unsafe promises.",
+      "public_role": "Ferry steward who keeps passage tallies and knows which boats returned before dusk.",
+      "drive": "Keep the crossing open without lying to travelers about untested routes.",
+      "knowledge_limit": "Knows the ferry ledger and her own shifts, not the quarry or the cause of the fourth flood mark.",
+      "conversation_hook": "Ask why one crossing token bears two dates and who signed the cancelled journey."
+    },
+    {
+      "id": "daran_vell",
+      "name": "Daran Vell",
+      "actor_id": "DaranVell",
+      "home_room": "testimony_court",
+      "faction_id": "crossing_committee",
+      "persona": "I inspect contested routes from testimony court. My duty is to protect travelers without claiming that contradictory measurements are settled facts.",
+      "public_role": "Crossing inspector who asks residents to distinguish witnessed conditions from repeated rumors.",
+      "drive": "Delay unsafe passage until three independently compared observations agree.",
+      "knowledge_limit": "Can inspect published measurements and testimony but has never walked through the fault arch.",
+      "conversation_hook": "Present the chipped court seal and ask which reports it actually authenticates."
+    },
+    {
+      "id": "bran_sedge",
+      "name": "Bran Sedge",
+      "actor_id": "BranSedge",
+      "home_room": "net_yard",
+      "faction_id": "reedward_collective",
+      "persona": "I mend nets with the night crew. I know our knots and work tags, worry about missing wages, and ask for evidence before blaming the dock office.",
+      "public_role": "Net mender whose night crew repaired the channelside nets before the water changed.",
+      "drive": "Keep the repair crew fed without accepting a false account of missing cargo.",
+      "knowledge_limit": "Recognizes net knots and the crew's wood tags, not official weights or court decisions.",
+      "conversation_hook": "Compare a mender's net tag with the charred receipt and ask which date is certain."
+    },
+    {
+      "id": "eris_yarrow",
+      "name": "Eris Yarrow",
+      "actor_id": "ErisYarrow",
+      "home_room": "refuge_hall",
+      "faction_id": "crossing_committee",
+      "persona": "I keep the refuge hall ready. Blankets and water are finite; I weigh witnessed arrivals against unverified promises without treating a slip as a person.",
+      "public_role": "Refuge keeper tracking available blankets, water and uncertain promised arrivals.",
+      "drive": "Reserve enough supplies for people already present while honoring accountable promises.",
+      "knowledge_limit": "Knows the shelter chart and claim slips; cannot verify who is traveling toward town.",
+      "conversation_hook": "Ask whose washed-away name belongs on the numbered refuge claim slip."
+    },
+    {
+      "id": "talla_quen",
+      "name": "Talla Quen",
+      "actor_id": "TallaQuen",
+      "home_room": "archive_lobby",
+      "faction_id": "crossing_committee",
+      "persona": "I catalogue route charts and witness marks. A dated record is evidence of a claim, not proof of the event, and I preserve contradictions for scrutiny.",
+      "public_role": "Archive clerk who treats every chart as a dated claim rather than an omniscient map.",
+      "drive": "Preserve contradictory originals so future witnesses can check them without a forced verdict.",
+      "knowledge_limit": "Can compare catalogued charts and signatures, not personally confirm present weather or an unvisited room.",
+      "conversation_hook": "Ask why an apparently older chart is dated later than the others."
+    },
+    {
+      "id": "oren_silt",
+      "name": "Oren Silt",
+      "actor_id": "OrenSilt",
+      "home_room": "rangers_stand",
+      "faction_id": "reedward_collective",
+      "persona": "I survey water and wind along the stand and grove. I prefer repeatable measurements over a dramatic answer and will say plainly when I have not visited a place.",
+      "public_role": "Field surveyor who records wind, water and path measurements without naming their cause.",
+      "drive": "Find a repeatable survey method before recommending a route.",
+      "knowledge_limit": "Has direct readings only along the stand and grove; the weather leaf contains other people's disputed figures.",
+      "conversation_hook": "Compare the four weather readings with what another player has observed today."
+    }
+  ],
+  "factions": [
+    {
+      "id": "channel_guild",
+      "name": "Channel Guild",
+      "meeting_room": "cargo_ledger",
+      "stake": "Reliable trade and documented ferry passage.",
+      "fault_line": "Some members would accept a temporary closure; others fear losing the last river trade route.",
+      "player_choice": "Players may argue for open transit, restricted convoys or a voluntary pause; no faction reputation changes automatically."
+    },
+    {
+      "id": "crossing_committee",
+      "name": "Crossing Committee",
+      "meeting_room": "second_bell",
+      "stake": "Independent hazard reports, humane shelter and transparent warnings.",
+      "fault_line": "An inspector seeks evidence thresholds while the refuge keeper wants action before certainty.",
+      "player_choice": "Players may deliver testimony or challenge a notice; neither action awards membership or authority."
+    },
+    {
+      "id": "reedward_collective",
+      "name": "Reedward Collective",
+      "meeting_room": "net_yard",
+      "stake": "Repair workers, gathering routes and knowledge held outside the civic quarter.",
+      "fault_line": "The surveyors want to test the altered paths; the net crews need safer work immediately.",
+      "player_choice": "Players may share supplies or surveys in conversation, not through an automatic faction quest."
+    }
+  ],
+  "economy": {
+    "unit": "chalk_tallies",
+    "note": "Illustrative barter asking values, not REALM currency balances, transactions, prices enforced by code or a working market.",
+    "offers": [
+      {"item_id": "crossing_token", "room_id": "lantern_jetty", "asking_tallies": 3, "dispute": "May certify a past crossing instead of paying for a future one."},
+      {"item_id": "mended_net_tag", "room_id": "net_yard", "asking_tallies": 2, "dispute": "Is proof of labor, not title to a net or the crew's wages."},
+      {"item_id": "market_counter", "room_id": "market_crossing", "asking_tallies": 1, "dispute": "A counting chip means little without the missing grain records."},
+      {"item_id": "repair_bracket", "room_id": "coop_smithy", "asking_tallies": 5, "dispute": "Forge ownership is shared; nobody has authority to sell community tools."},
+      {"item_id": "pressed_lichen", "room_id": "lichen_grove", "asking_tallies": 2, "dispute": "The sample's safety and usefulness remain untested."}
+    ]
+  },
+  "weather": {
+    "note": "GM/world-author cues only. No live clock, RNG, hazard effects or automatic weather change exists in this JSON.",
+    "states": [
+      {"id": "crosswind", "rooms": ["wind_bridge", "rangers_stand", "thread_well"], "description": "A taut wind makes cables and survey cords sing at different pitches.", "uncertain_effect": "Travelers disagree whether the vibration predicts a rising flood."},
+      {"id": "silver_drizzle", "rooms": ["tidegate", "lantern_jetty", "market_crossing"], "description": "Fine rain beads on the fourth brass flood mark but leaves the older marks dull.", "uncertain_effect": "A fresh sheen could conceal a recent scratch or merely change its visibility."},
+      {"id": "siltfall", "rooms": ["quarantine_steps", "lichen_grove", "sick_orchard"], "description": "Pale grains settle slowly across leaves and the closed stair.", "uncertain_effect": "Nobody has verified whether the grains are airborne dust or washed river silt."},
+      {"id": "stillwater", "rooms": ["old_cistern", "old_spillway", "fault_arch"], "description": "An uncanny quiet leaves even minor surface ripples easy to notice.", "uncertain_effect": "The silence might make small clues audible without changing any route."
+      }
+    ]
+  },
+  "quest_seeds": [
+    {
+      "id": "missing_weight",
+      "title": "The Missing Weight",
+      "start_room": "cargo_ledger",
+      "clue_items": ["charred_receipt", "mended_net_tag", "market_counter"],
+      "question": "Why do the dock tally and scorched receipt disagree about the ferry's load?",
+      "player_paths": ["Compare accounts publicly at the Second Bell.", "Investigate the night crew's net tags before accusing anyone."],
+      "unresolved": "Neither path proves theft, deception or a supernatural cause."
+    },
+    {
+      "id": "route_trial",
+      "title": "A Route Worth Testing",
+      "start_room": "rangers_stand",
+      "clue_items": ["weather_log_leaf", "waymark_chalk", "hazard_flag", "saltglass_lens"],
+      "question": "Can two witnesses reproduce a safe route when their measurements differ?",
+      "player_paths": ["Agree on landmarks and repeat the walk together.", "Leave competing routes documented rather than declaring a winner."],
+      "unresolved": "The archway exit remains fixed; no trial changes traversal rules."
+    },
+    {
+      "id": "unstruck_bell",
+      "title": "The Unstruck Bell",
+      "start_room": "second_bell",
+      "clue_items": ["river_chime", "repair_bracket", "chipped_seal"],
+      "question": "Who can legitimately warn the town when the repair crew and committee disagree?",
+      "player_paths": ["Seek a joint announcement at both meeting places.", "Demand a separate inspection before any public warning."],
+      "unresolved": "The bell cannot ring through a scripted item-use command."
+    },
+    {
+      "id": "shelter_count",
+      "title": "A Shelter Count",
+      "start_room": "refuge_hall",
+      "clue_items": ["refuge_claim_slip", "crossing_token", "pressed_lichen"],
+      "question": "How should a refuge keeper count travelers who may never arrive?",
+      "player_paths": ["Reserve supplies for documented arrivals.", "Invite neighboring workers to share a provisional plan."],
+      "unresolved": "No food, health, resource or completion counter is implemented."
+    }
+  ]
+}
