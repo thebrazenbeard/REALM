@@ -80,9 +80,10 @@ client need not ship the worldpack, unpublished canon, or author-only secrets.
 
 The map panel never generates terrain and does not imply that a host supports
 maps. It attempts an optional authenticated `GET /api/v1/map?player=...` route.
-A 404/501 marks the route unsupported for this browser session; room commands
-and the activity feed continue normally. Transient failures show an unavailable
-state instead of stale or fabricated terrain.
+A 404 may mean the **current location** has no configured map; the client
+retries after commands and periodically so entering mapped territory can show
+terrain. A 501 marks map support unavailable for the session. Room commands
+and the activity feed continue normally; failures never display a fabricated map.
 
 Proposed response contract, to align with the server's geography module:
 
@@ -122,3 +123,12 @@ node --check docs/app.js
 ```
 
 These are JavaScript unit/syntax checks, not a real-browser end-to-end host test.
+
+### Browser-to-gateway mock tests
+
+`node --test tests/browser/test-client.cjs tests/browser/test-map.cjs`
+checks browser events, authentication header plumbing, authorized map requests,
+missing-map recovery after travel, local token DOM clearing, and denial of
+cleartext non-loopback endpoints. These tests exercise the actual `docs/app.js`
+source inside a controlled simulated DOM and HTTP fetch; they are **not** a
+Chromium/Firefox run and do not prove compatibility with a live REALM server.
