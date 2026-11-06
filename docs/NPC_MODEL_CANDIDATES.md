@@ -103,11 +103,14 @@ necessarily correct for every model; soup06 requires `--reasoning off` and its
 documented raw format. A production service, multi-NPC scheduling, substantive
 memory, cross-model benchmarks, and KoboldCPP interoperability remain untested.
 
-For the **ledger-connected duet**, use the separate non-interactive
-`llama-completion.exe` stdout protocol, not the interactive `llama-cli` banner,
-prompt echo, and performance footer. Both were observed locally on Lappy;
-only the former yields a bounded parseable speech channel. The adapter
-rejects untrusted model claims as world authority.
+For the **ledger-connected duet**, use an ephemeral loopback-only
+`llama-server.exe` `/completion` JSON protocol rather than trying to scrape
+interactive `llama-cli` banners, prompt echo and performance footers. The
+non-interactive `llama-completion.exe` gives cleaner stdout but may terminate
+at a token limit without an explicit content-finish signal. The local server
+exposes stop metadata; the demo rejects incomplete/overlong speech and always
+terminates the inference listener. Neither transport makes generated claims
+world authority.
 
 ## Reproducible selection gate
 

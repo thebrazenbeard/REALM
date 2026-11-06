@@ -16,6 +16,10 @@ import re
 import sqlite3
 import subprocess
 import sys
+import socket
+import time
+import urllib.error
+import urllib.request
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -55,6 +59,7 @@ _BANNED = re.compile(
 # *same-line*, space-prefixed sentinel and then optional terminal newlines.
 # A newline BEFORE the sentinel is NOT part of the observed boundary.
 _END_MARKER = re.compile(r"\A([^\r\n]*) \[end of text\][ \t]*(?:\r?\n)*\Z")
+_MAX_API_RESPONSE_BYTES = 16 * 1024
 
 
 def verify_artifact(path: Path, actor: str) -> str:
@@ -125,44 +130,155 @@ def parse_model_speech(output: str) -> str:
     return speech
 
 
-def local_provider(actor: str, model: Path, completion_exe: Path, *, timeout_s: int = 60):
-    """Call only an explicit host-owned executable with strict runtime bounds."""
+def parse_structured_speech(payload: object) -> str:
+    """Accept a bounded, actual llama-server stop, never a token-limit cutoff.
+
+    The local /completion endpoint separates model text from console banners
+    and exposes an explicit stop reason. Punctuation consumed by a *verified*
+    stop word is restored by the host; no other completion text is rewritten.
+    """
+    if not isinstance(payload, dict) or payload.get("stop") is not True:
+        raise ValueError("Local inference did not report a completed stop")
+    if payload.get("truncated") is not False or payload.get("has_new_line") is not False:
+        raise ValueError("Local inference was truncated or generated multiline text")
+    tokens = payload.get("tokens_predicted")
+    if type(tokens) is not int or not 1 <= tokens <= 96:
+        raise ValueError("Local inference token count is outside the bounded request")
+    content = payload.get("content")
+    if not isinstance(content, str) or len(content) > 4096:
+        raise ValueError("No bounded structured text was returned")
+    stop_type = payload.get("stop_type")
+    if stop_type == "word":
+        consumed = payload.get("stopping_word")
+        if consumed != ".":
+            raise ValueError("Unapproved model stop delimiter")
+        content = content.strip(" \t") + consumed
+    elif stop_type == "eos":
+        content = content.strip(" \t")
+    else:
+        raise ValueError("Local inference hit an unknown or token-limit stop")
+    if not content or len(content) > 280 or "\r" in content or "\n" in content:
+        raise ValueError("Structured NPC speech is empty, multiline, or too long")
+    if _BANNED.search(content) or not all(char.isprintable() for char in content):
+        raise ValueError("Structured NPC speech includes template, thinking, or control text")
+    if content[-1] not in ".!?":
+        raise ValueError("Model text does not finish a complete sentence")
+    return content
+
+
+def _loopback_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        return sock.getsockname()[1]
+
+
+def _request_json(opener, url: str, payload: dict | None, *, timeout_s: float) -> dict:
+    data = json.dumps(payload).encode("utf-8") if payload is not None else None
+    request = urllib.request.Request(
+        url, data=data, method="POST" if payload is not None else "GET",
+        headers={"Content-Type": "application/json", "Accept": "application/json"},
+    )
+    with opener.open(request, timeout=timeout_s) as response:
+        raw = response.read(_MAX_API_RESPONSE_BYTES + 1)
+        if len(raw) > _MAX_API_RESPONSE_BYTES:
+            raise ValueError("Local model API response exceeded size limit")
+        result = json.loads(raw.decode("utf-8"))
+    if not isinstance(result, dict):
+        raise ValueError("Local model API did not return a JSON object")
+    return result
+
+
+def _inference_with_server(
+    actor: str, model: Path, executable: Path, prompt: str, *, timeout_s: int = 60,
+) -> dict:
+    """One loopback-only local model server; always terminate even on failure."""
+    if executable.name.casefold() != "llama-server.exe" or not executable.is_file():
+        raise FileNotFoundError("Only the installed llama-server.exe is accepted")
+    port = _loopback_port()
+    base = f"http://127.0.0.1:{port}"
+    args = [
+        str(executable), "--offline", "--host", "127.0.0.1", "--port", str(port),
+        "--no-webui", "-m", str(model), "-t", "2", "-c", "512", "-ngl", "0",
+    ]
+    if actor == "CrossingInspector":
+        args += ["--reasoning", "off"]
+    # The child gets no stdin or console; its diagnostics never become speech.
+    proc = subprocess.Popen(
+        args, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL, shell=False,
+    )
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    try:
+        deadline = time.monotonic() + timeout_s
+        while True:
+            if proc.poll() is not None:
+                raise RuntimeError(f"{actor}: local model server exited before readiness")
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError(f"{actor}: local model server startup exceeded {timeout_s} seconds")
+            try:
+                health = _request_json(
+                    opener, base + "/health", None, timeout_s=min(1, remaining)
+                )
+                if health.get("status") == "ok":
+                    break
+            except (urllib.error.URLError, TimeoutError, OSError, ValueError, json.JSONDecodeError):
+                pass  # Boot may briefly return HTTP 503 / no TCP listener.
+            time.sleep(min(0.2, max(0, deadline - time.monotonic())))
+
+        # /completion accepts the model's exact raw template (especially
+        # soup06's TONE/FACT/OUT) and produces structured stop metadata.
+        request = {
+            "prompt": prompt,
+            "n_predict": 80,
+            "temperature": 0.2 if actor == "FerrySteward" else 0.7,
+            "top_p": 0.9,
+            "seed": 1337,
+            "stop": [".", "\n"],
+            "stream": False,
+        }
+        reply = _request_json(opener, base + "/completion", request,
+                              timeout_s=timeout_s)
+        if reply.get("model") != str(model):
+            raise ValueError(f"{actor}: local completion came from a different model path")
+        if proc.poll() is not None:
+            raise RuntimeError(f"{actor}: local model server terminated unexpectedly")
+        return reply
+    finally:
+        if proc.poll() is None:
+            try:
+                proc.terminate()
+            except ProcessLookupError:
+                pass  # Child exited between poll() and terminate().
+        try:
+            proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait(timeout=10)
+
+
+def local_provider(actor: str, model: Path, server_exe: Path, *, timeout_s: int = 60):
+    """Call one temporary local-only structured inference endpoint per turn."""
     if actor not in EXPECTED:
         raise ValueError("Unknown experiment actor")
-    if completion_exe.name.casefold() != "llama-completion.exe" or not completion_exe.is_file():
-        raise FileNotFoundError(f"Expected an installed llama-completion.exe: {completion_exe}")
+    if server_exe.name.casefold() != "llama-server.exe" or not server_exe.is_file():
+        raise FileNotFoundError(f"Expected an installed llama-server.exe: {server_exe}")
     if timeout_s < 5 or timeout_s > 120:
         raise ValueError("Model inference timeout must be 5–120 seconds")
 
     def propose(ctx: DialogueContext) -> dict[str, str]:
         if ctx.speaker != actor or ctx.room_id != "tidegate":
             raise ValueError("Model context is not the expected actor/room")
-        args = [
-            str(completion_exe), "--offline", "-m", str(model), "-t", "2",
-            "-c", "512", "-n", "40", "-ngl", "0", "--no-display-prompt",
-            "--no-conversation",
-        ]
-        if actor == "CrossingInspector":
-            args += [
-                "--reasoning", "off", "--temp", "0.7", "--top-p", "0.9",
-                "--repeat-penalty", "1.05",
-            ]
-        args.extend(["-p", _prompt(ctx)])
-        result = subprocess.run(
-            args, capture_output=True, text=True, encoding="utf-8",
-            errors="replace", timeout=timeout_s, check=False,
+        structured = _inference_with_server(
+            actor, model, server_exe, _prompt(ctx), timeout_s=timeout_s,
         )
-        if result.returncode != 0:
-            raise RuntimeError(f"{actor}: local llama-completion exited with code {result.returncode}")
-        if len(result.stdout) > 4096:
-            raise ValueError(f"{actor}: model output exceeds bounded stdout window")
-        return {"command": f"say {parse_model_speech(result.stdout)}"}
+        return {"command": f"say {parse_structured_speech(structured)}"}
 
     return propose
 
 
 def run_fresh_duet(
-    db_path: Path, completion_exe: Path, models: dict[str, Path], *,
+    db_path: Path, server_exe: Path, models: dict[str, Path], *,
     turns: int = 2, session_id: str = "local_duet_trial",
 ) -> dict:
     """Create exactly one new local world, run, then independently read SQLite."""
@@ -175,13 +291,13 @@ def run_fresh_duet(
     if set(models) != set(EXPECTED):
         raise ValueError("Exactly two host-selected model paths are required")
     digests = {actor: verify_artifact(models[actor], actor) for actor in EXPECTED}
-    if completion_exe.name.casefold() != "llama-completion.exe" or not completion_exe.is_file():
-        raise FileNotFoundError("Expected llama-completion.exe executable not present")
+    if server_exe.name.casefold() != "llama-server.exe" or not server_exe.is_file():
+        raise FileNotFoundError("Expected llama-server.exe executable not present")
     world = import_worldpack(db_path, FLAGSHIP)
     engine = Engine(db_path)
     register_npc_pair(engine, ROSTER, expected_world_id="siltglass-reach")
     providers = {
-        actor: local_provider(actor, models[actor], completion_exe)
+        actor: local_provider(actor, models[actor], server_exe)
         for actor in EXPECTED
     }
     turns_result = NPCDuetRunner(
@@ -235,8 +351,8 @@ def run_fresh_duet(
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--db", required=True, type=Path, help="NEW database path, outside Git")
-    parser.add_argument("--llama-completion", required=True, type=Path,
-                        help="Existing local llama-completion.exe (not interactive llama-cli.exe)")
+    parser.add_argument("--llama-server", required=True, type=Path,
+                        help="Existing local llama-server.exe; binds only a temporary localhost port")
     parser.add_argument("--stealth-model", required=True, type=Path)
     parser.add_argument("--soup-model", required=True, type=Path)
     parser.add_argument("--session", default="local_duet_trial")
@@ -244,7 +360,7 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     try:
         result = run_fresh_duet(
-            args.db, args.llama_completion,
+            args.db, args.llama_server,
             {"FerrySteward": args.stealth_model, "CrossingInspector": args.soup_model},
             turns=args.turns, session_id=args.session,
         )
