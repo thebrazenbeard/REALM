@@ -106,6 +106,29 @@ class BoundWorldIntegrityTests(unittest.TestCase):
         with self.assertRaisesRegex(WorldpackError, "item.*placement"):
             import_worldpack(self.path, self.pack_path)
 
+    def test_bound_world_missing_event_table_is_not_silently_recreated(self):
+        world = Engine(self.path)
+        world.join("Traveler")
+        world.act("Traveler", "say Preserve this history")
+        self._external_damage("DROP TABLE events")
+        with self.assertRaisesRegex(ValueError, "core SQLite schema"):
+            Engine(self.path)
+        with self.assertRaisesRegex(ValueError, "core SQLite schema"):
+            import_worldpack(self.path, self.pack_path)
+        with sqlite3.connect(self.path) as db:
+            self.assertIsNone(db.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='events'"
+            ).fetchone())
+
+    def test_bound_world_modified_core_index_is_not_silently_adopted(self):
+        self._external_damage("DROP INDEX idx_events_room_id")
+        with self.assertRaisesRegex(ValueError, "core SQLite schema"):
+            Engine(self.path)
+        with sqlite3.connect(self.path) as db:
+            self.assertIsNone(db.execute(
+                "SELECT name FROM sqlite_master WHERE type='index' AND name='idx_events_room_id'"
+            ).fetchone())
+
     def test_item_held_after_play_is_still_legitimate_unchanged_import(self):
         game = Engine(self.path)
         game.join("Traveler")
