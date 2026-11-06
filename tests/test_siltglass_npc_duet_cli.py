@@ -1,11 +1,13 @@
 """Model-free safety and persistence tests for the opt-in CPU GGUF CLI."""
 
 import json
+import io
 import sqlite3
 import sys
 import tempfile
 import unittest
 from contextlib import closing
+from email.message import Message
 from pathlib import Path
 from unittest.mock import patch
 
@@ -83,6 +85,9 @@ class SiltglassModelAdapterTests(unittest.TestCase):
             {"content": "<think>invented</think>"},
             {"content": "llama_print_timings: fake"},
             {"content": "a" * 281},
+            {"content": ""}, {"content": "   "},
+            {"content": "."}, {"content": "!?"},
+            {"content": "   ...   "}, {"content": "text already ended!"},
         ):
             with self.subTest(edits=edits), self.assertRaises(ValueError):
                 demo.parse_structured_speech({**self._structured("We should inspect the marks"), **edits})
@@ -164,6 +169,35 @@ class SiltglassModelAdapterTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "different model path"):
                 demo._inference_with_server("FerrySteward", self.models["FerrySteward"], self.cli, "prompt")
         self.assertTrue(proc.stopped)
+
+    def test_local_api_redirect_is_rejected_before_external_request(self):
+        class FakeLocalHTTP(demo.urllib.request.HTTPHandler):
+            def http_open(self, request):
+                self.parent.local_hits += 1
+                headers = Message()
+                headers["Location"] = "https://example.com/steal"
+                response = demo.urllib.response.addinfourl(
+                    io.BytesIO(b""), headers,
+                    request.full_url, code=302,
+                )
+                response.msg = "Found"
+                return response
+
+        class BlockExternalHTTPS(demo.urllib.request.HTTPSHandler):
+            def https_open(self, request):
+                self.parent.external_hits += 1
+                raise AssertionError("Any WAN redirect would be a safety failure")
+
+        opener = demo.urllib.request.build_opener(
+            demo.urllib.request.ProxyHandler({}), demo._NoRedirect(),
+            FakeLocalHTTP(), BlockExternalHTTPS(),
+        )
+        opener.local_hits = 0
+        opener.external_hits = 0
+        with self.assertRaisesRegex(demo.LocalModelRedirectError, "Refusing redirect"):
+            opener.open("http://127.0.0.1:18363/health", timeout=1)
+        self.assertEqual(1, opener.local_hits)
+        self.assertEqual(0, opener.external_hits)
 
     def test_two_distinct_model_proposals_are_committed_and_reopened(self):
         utterances = ["The public slate asks us to report altered paths.",

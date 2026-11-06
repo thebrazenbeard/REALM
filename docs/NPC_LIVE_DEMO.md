@@ -19,7 +19,10 @@ The entry point `scripts/run_siltglass_npc_duet.py`:
    experiment enforces bounded readiness and generation timeouts, strictly
    parses the `/completion` JSON result, requires a completed stop rather
    than token-budget exhaustion, and always terminates and waits for the
-   model process—even after errors. No console output becomes NPC speech.
+   model process—even after errors. HTTP redirects and proxies are disabled
+   so loopback responses cannot send prompts to an external endpoint. The
+   JSON response must identify the exact selected local model path. No
+   console output becomes NPC speech.
    The Soup06 role uses `--reasoning off` and its raw TONE/FACT/OUT prompt.
    The API may consume a configured full-stop delimiter; the host restores
    only that verified `.` for one-line speech. At most four turns are allowed.

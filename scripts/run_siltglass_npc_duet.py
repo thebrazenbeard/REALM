@@ -62,6 +62,23 @@ _END_MARKER = re.compile(r"\A([^\r\n]*) \[end of text\][ \t]*(?:\r?\n)*\Z")
 _MAX_API_RESPONSE_BYTES = 16 * 1024
 
 
+class LocalModelRedirectError(ValueError):
+    """A loopback model API may never send this client to another URL."""
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        # ProxyHandler({}) alone is insufficient: urllib installs a default
+        # redirect handler which can follow a localhost 302 to the Internet.
+        raise LocalModelRedirectError("Refusing redirect from local model endpoint")
+
+
+def _local_opener():
+    return urllib.request.build_opener(
+        urllib.request.ProxyHandler({}), _NoRedirect(),
+    )
+
+
 def verify_artifact(path: Path, actor: str) -> str:
     """Require the exact reviewed GGUF bytes; no automated downloads."""
     filename, size, digest = EXPECTED[actor]
@@ -147,14 +164,19 @@ def parse_structured_speech(payload: object) -> str:
     content = payload.get("content")
     if not isinstance(content, str) or len(content) > 4096:
         raise ValueError("No bounded structured text was returned")
+    content = content.strip(" \t")
+    if not content or not any(ch.isalnum() for ch in content):
+        raise ValueError("Model did not generate substantive speech")
     stop_type = payload.get("stop_type")
     if stop_type == "word":
         consumed = payload.get("stopping_word")
         if consumed != ".":
             raise ValueError("Unapproved model stop delimiter")
-        content = content.strip(" \t") + consumed
+        if content[-1] in ".!?":
+            raise ValueError("Model output already ended with punctuation before stop")
+        content = content + consumed
     elif stop_type == "eos":
-        content = content.strip(" \t")
+        pass
     else:
         raise ValueError("Local inference hit an unknown or token-limit stop")
     if not content or len(content) > 280 or "\r" in content or "\n" in content:
@@ -207,7 +229,7 @@ def _inference_with_server(
         args, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL, shell=False,
     )
-    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    opener = _local_opener()
     try:
         deadline = time.monotonic() + timeout_s
         while True:
@@ -222,6 +244,8 @@ def _inference_with_server(
                 )
                 if health.get("status") == "ok":
                     break
+            except LocalModelRedirectError:
+                raise
             except (urllib.error.URLError, TimeoutError, OSError, ValueError, json.JSONDecodeError):
                 pass  # Boot may briefly return HTTP 503 / no TCP listener.
             time.sleep(min(0.2, max(0, deadline - time.monotonic())))
