@@ -40,6 +40,10 @@ disposable Siltglass Reach database.
    reset. Schema DDL can still occur before detection for an unmarked/legacy
    damaged database where current world binding is absent; forensic review
    is required before treating such a database as safe.
+6. A damaged bound-world `Engine` raises the typed `WorldIntegrityError`.
+   `import_worldpack` maps **only that specific startup error** to its public
+   `WorldpackError` while preserving the exception cause. The CLI exits 2
+   with one diagnostic line, never a Python traceback for this case.
 
 ## Source/test evidence and limitations
 
@@ -47,7 +51,8 @@ disposable Siltglass Reach database.
 Siltglass authored rooms; `tests/test_worldpack_integrity.py` tests partial
 room/exit/item/metadata drift, an orphaned FK after disabled checks, item
    CHECK-bypass corruption after `PRAGMA ignore_check_constraints=ON`, missing
-   core events table/index, no repair, and legitimate carried/dropped items.
+   core events table/index, a one-line CLI rejection, no repair, and legitimate
+   carried/dropped items.
    All changes to damaged databases occur
 inside disposable temporary test directories.
 
