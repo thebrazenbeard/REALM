@@ -24,6 +24,7 @@ _SPOOFED_HEADERS = frozenset({
 })
 _SCOPES = frozenset({"read", "write"})
 _WORLD_ID = re.compile(r"^[a-z][a-z0-9_-]{0,63}$")
+_HEADER_NAME = re.compile(r"^[A-Za-z0-9-]{1,64}$")
 
 
 def _is_https_origin(value: object) -> bool:
@@ -134,7 +135,9 @@ def evaluate_private_admission(
     clock, rate counters and request-size measurement are outside this oracle.
     Its success must never be cited as proof those dependencies actually exist.
     """
-    if not edge.tls_verified or not edge.adapter_authenticated:
+    # Strings such as "false" and the integer 1 are NOT edge proof. The only
+    # accepted values are actual bool True from a trusted host-side adapter.
+    if edge.tls_verified is not True or edge.adapter_authenticated is not True:
         raise AdmissionDenied("unverified-edge")
     if edge.host_id != policy.host_id or edge.https_origin != policy.https_origin:
         raise AdmissionDenied("wrong-host-identity")
@@ -151,7 +154,9 @@ def evaluate_private_admission(
                 and not isinstance(request.asserted_player, str))):
         raise AdmissionDenied("malformed-request")
     if (not isinstance(edge.client_supplied_headers, Mapping)
-            or any(not isinstance(key, str) or key.casefold() in _SPOOFED_HEADERS
+            or any(not isinstance(key, str)
+                   or not _HEADER_NAME.fullmatch(key)
+                   or key.casefold() in _SPOOFED_HEADERS
                    or key.casefold().startswith(("x-forwarded-", "x-tailscale-", "x-original-"))
                    for key in edge.client_supplied_headers)):
         raise AdmissionDenied("untrusted-forwarded-identity")
