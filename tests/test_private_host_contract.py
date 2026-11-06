@@ -69,6 +69,9 @@ class PrivateHostContractTests(unittest.TestCase):
     def test_transport_and_host_identity_require_trusted_edge_evidence(self):
         self.denial(expected="unverified-edge", edge=replace(self.edge, tls_verified=False))
         self.denial(expected="unverified-edge", edge=replace(self.edge, adapter_authenticated=False))
+        self.denial(expected="unverified-edge", edge=replace(self.edge, tls_verified="false"))
+        self.denial(expected="unverified-edge", edge=replace(self.edge, adapter_authenticated="false"))
+        self.denial(expected="unverified-edge", edge=replace(self.edge, tls_verified=1))
         self.denial(expected="wrong-host-identity", edge=replace(self.edge, host_id="attacker"))
         self.denial(expected="wrong-host-identity", edge=replace(self.edge, https_origin="https://wrong.example.test"))
 
@@ -80,7 +83,7 @@ class PrivateHostContractTests(unittest.TestCase):
         self.assertEqual("Oak", self.admit(request=replace(self.request, asserted_player=None)).player)
 
     def test_forwarded_identity_and_origin_spoofing_fail_closed(self):
-        for header in ("X-Forwarded-For", "X-Forwarded-Port", "Forwarded", "X-Real-IP", "X-Tailscale-User-Login", "X-Original-Host"):
+        for header in ("X-Forwarded-For", "X-Forwarded-Port", "Forwarded", "X-Real-IP", "X-Tailscale-User-Login", "X-Original-Host", "X_Tailscale_User_Login", "X_Forwarded_For", " X-Forwarded-For "):
             with self.subTest(header=header):
                 self.denial(expected="untrusted-forwarded-identity", edge=replace(
                     self.edge, client_supplied_headers={header: "admin@evil.invalid"},
