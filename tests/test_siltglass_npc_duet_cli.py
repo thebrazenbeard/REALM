@@ -1,6 +1,7 @@
 """Model-free safety and persistence tests for the opt-in CPU GGUF CLI."""
 
 import json
+import hashlib
 import io
 import sqlite3
 import sys
@@ -24,6 +25,7 @@ class SiltglassModelAdapterTests(unittest.TestCase):
         self.work = Path(self.temp.name)
         self.cli = self.work / "llama-server.exe"
         self.cli.write_bytes(b"fake test executable")
+        self.exe_sha = hashlib.sha256(self.cli.read_bytes()).hexdigest()
         self.models = {
             "FerrySteward": self.work / "stealth-rifle-Q4_K_M.gguf",
             "CrossingInspector": self.work / "npc-voice-soup06.Q5_K_M.gguf",
@@ -77,6 +79,62 @@ class SiltglassModelAdapterTests(unittest.TestCase):
         self.assertIn("The river will rise tomorrow", prompt)
         self.assertIn("TONE:measured", prompt)
 
+    def test_exact_runtime_sha_is_required_even_for_right_basename(self):
+        self.assertEqual(self.cli.resolve(), demo.verify_executable(self.cli, self.exe_sha))
+        with self.assertRaisesRegex(ValueError, "Exact trusted"):
+            demo.verify_executable(self.cli, "")
+        with self.assertRaisesRegex(ValueError, "SHA-256 mismatch"):
+            demo.verify_executable(self.cli, "0" * 64)
+        with self.assertRaisesRegex(ValueError, "absolute"):
+            demo.verify_executable(Path("llama-server.exe"), self.exe_sha)
+        renamed = self.work / "arbitrary-driver.exe"
+        renamed.write_bytes(self.cli.read_bytes())
+        with self.assertRaisesRegex(ValueError, "reviewed llama-server"):
+            demo.verify_executable(renamed, self.exe_sha)
+
+    def test_wrong_runtime_digest_denies_new_world_without_any_model_process(self):
+        destination = self.work / "not_created.sqlite3"
+        with patch.object(demo.subprocess, "Popen") as launch:
+            with self.assertRaisesRegex(ValueError, "SHA-256 mismatch"):
+                demo.run_fresh_duet(
+                    destination, self.cli, self.models,
+                    server_exe_sha256="0" * 64,
+                )
+            launch.assert_not_called()
+        self.assertFalse(destination.exists(), "Runtime distrust must not create a world")
+
+    def test_swapped_executable_after_provider_binding_is_denied_before_popen(self):
+        from realm.conversations import DialogueContext
+        provider = demo.local_provider(
+            "FerrySteward", self.models["FerrySteward"], self.cli,
+            expected_runtime_sha256=self.exe_sha,
+        )
+        self.cli.write_bytes(b"different executable swapped in place")
+        context = DialogueContext(
+            "FerrySteward", "CrossingInspector", "A cautious steward", "tidegate",
+            "The Tidegate", "A public slate.", None, 0, "attempt",
+        )
+        with patch.object(demo.subprocess, "Popen") as launch:
+            with self.assertRaisesRegex(ValueError, "SHA-256 mismatch"):
+                provider(context)
+            launch.assert_not_called()
+
+    def test_symlinked_executable_or_model_path_is_rejected(self):
+        exe_link = self.work / "nested" / "llama-server.exe"
+        exe_link.parent.mkdir()
+        model_target = self.work / "real.gguf"
+        model_target.write_bytes(b"fixture only")
+        model_link = self.work / "stealth-rifle-Q4_K_M.gguf"
+        try:
+            exe_link.symlink_to(self.cli)
+            model_link.symlink_to(model_target)
+        except (OSError, NotImplementedError) as exc:
+            self.skipTest(f"Host cannot create symlink: {exc}")
+        with self.assertRaisesRegex(ValueError, "symlink or junction"):
+            demo.verify_executable(exe_link, self.exe_sha)
+        with self.assertRaisesRegex(ValueError, "symlink or junction"):
+            demo.verify_artifact(model_link, "FerrySteward")
+
     def test_structured_completion_rejects_false_stops_and_template_injection(self):
         for edits in (
             {"stop": False}, {"stop_type": "limit"}, {"stopping_word": "\n"},
@@ -111,13 +169,17 @@ class SiltglassModelAdapterTests(unittest.TestCase):
             def wait(self, timeout):
                 return 0
         process = FakeProcess()
-        with patch.object(demo.subprocess, "Popen", return_value=process) as launch, \
+        with patch.object(demo, "verify_artifact", return_value="a" * 64), \
+             patch.object(demo.subprocess, "Popen", return_value=process) as launch, \
              patch.object(demo, "_loopback_port", return_value=18361), \
              patch.object(demo, "_request_json", side_effect=[
                  {"status": "ok"},
                  self._structured("I need the ledger before deciding", model=str(self.models["CrossingInspector"])),
              ]) as request:
-            result = demo.local_provider("CrossingInspector", self.models["CrossingInspector"], self.cli)(context)
+            result = demo.local_provider(
+                "CrossingInspector", self.models["CrossingInspector"], self.cli,
+                expected_runtime_sha256=self.exe_sha,
+            )(context)
         self.assertEqual({"command": "say I need the ledger before deciding."}, result)
         self.assertTrue(process.stopped)
         args = launch.call_args.args[0]
@@ -144,11 +206,15 @@ class SiltglassModelAdapterTests(unittest.TestCase):
             def wait(self, timeout):
                 return 0
         proc = FakeProcess()
-        with patch.object(demo.subprocess, "Popen", return_value=proc), \
+        with patch.object(demo, "verify_artifact", return_value="a" * 64), \
+             patch.object(demo.subprocess, "Popen", return_value=proc), \
              patch.object(demo, "_loopback_port", return_value=18362), \
              patch.object(demo, "_request_json", side_effect=[{"status": "ok"}, RuntimeError("bad JSON")]):
             with self.assertRaisesRegex(RuntimeError, "bad JSON"):
-                demo._inference_with_server("FerrySteward", self.models["FerrySteward"], self.cli, "prompt")
+                demo._inference_with_server(
+                    "FerrySteward", self.models["FerrySteward"], self.cli, "prompt",
+                    expected_runtime_sha256=self.exe_sha,
+                )
         self.assertTrue(proc.stopped)
 
     def test_temporary_server_rejects_foreign_model_reply_and_stops(self):
@@ -161,13 +227,17 @@ class SiltglassModelAdapterTests(unittest.TestCase):
             def wait(self, timeout):
                 return 0
         proc = FakeProcess()
-        with patch.object(demo.subprocess, "Popen", return_value=proc), \
+        with patch.object(demo, "verify_artifact", return_value="a" * 64), \
+             patch.object(demo.subprocess, "Popen", return_value=proc), \
              patch.object(demo, "_loopback_port", return_value=18363), \
              patch.object(demo, "_request_json", side_effect=[
                  {"status": "ok"}, self._structured("The slate asks for reports", model="D:\\OTHER\\wrong.gguf"),
              ]):
             with self.assertRaisesRegex(ValueError, "different model path"):
-                demo._inference_with_server("FerrySteward", self.models["FerrySteward"], self.cli, "prompt")
+                demo._inference_with_server(
+                    "FerrySteward", self.models["FerrySteward"], self.cli, "prompt",
+                    expected_runtime_sha256=self.exe_sha,
+                )
         self.assertTrue(proc.stopped)
 
     def test_local_api_redirect_is_rejected_before_external_request(self):
@@ -208,7 +278,9 @@ class SiltglassModelAdapterTests(unittest.TestCase):
                  for s, name in zip(utterances, self.models)
              ]) as launch:
             db_path = self.work / "brand_new.sqlite3"
-            result = demo.run_fresh_duet(db_path, self.cli, self.models, turns=2)
+            result = demo.run_fresh_duet(
+                db_path, self.cli, self.models, server_exe_sha256=self.exe_sha, turns=2,
+            )
         self.assertEqual(2, launch.call_count)
         self.assertEqual("verified_local_duet_receipts", result["status"])
         self.assertEqual("siltglass-reach", result["world_id"])
@@ -223,7 +295,9 @@ class SiltglassModelAdapterTests(unittest.TestCase):
         self.assertEqual("CrossingInspector", events[1][0])
         self.assertEqual(utterances[1], json.loads(events[1][1])["text"])
         with self.assertRaises(FileExistsError):
-            demo.run_fresh_duet(db_path, self.cli, self.models, turns=2)
+            demo.run_fresh_duet(
+                db_path, self.cli, self.models, server_exe_sha256=self.exe_sha, turns=2,
+            )
 
     def test_invalid_model_output_leaves_no_false_success_receipt(self):
         db_path = self.work / "failure_after_one.sqlite3"
@@ -233,7 +307,9 @@ class SiltglassModelAdapterTests(unittest.TestCase):
                  self._structured("<think>Maybe the river is magic</think>", model=str(self.models["CrossingInspector"])),
              ]):
             with self.assertRaisesRegex(ValueError, "thinking"):
-                demo.run_fresh_duet(db_path, self.cli, self.models, turns=2)
+                demo.run_fresh_duet(
+                    db_path, self.cli, self.models, server_exe_sha256=self.exe_sha, turns=2,
+                )
         with closing(sqlite3.connect(db_path)) as db:
             event_count = db.execute("SELECT COUNT(*) FROM events WHERE kind='say'").fetchone()[0]
             receipt_count = db.execute("SELECT COUNT(*) FROM action_receipts").fetchone()[0]

@@ -60,6 +60,7 @@ _BANNED = re.compile(
 # A newline BEFORE the sentinel is NOT part of the observed boundary.
 _END_MARKER = re.compile(r"\A([^\r\n]*) \[end of text\][ \t]*(?:\r?\n)*\Z")
 _MAX_API_RESPONSE_BYTES = 16 * 1024
+_SHA256_HEX = re.compile(r"^[0-9a-fA-F]{64}$")
 
 
 class LocalModelRedirectError(ValueError):
@@ -82,17 +83,71 @@ def _local_opener():
 def verify_artifact(path: Path, actor: str) -> str:
     """Require the exact reviewed GGUF bytes; no automated downloads."""
     filename, size, digest = EXPECTED[actor]
+    path = _strict_local_path(path, label="GGUF model")
     if path.name != filename or not path.is_file() or path.stat().st_size != size:
         raise ValueError(f"{actor}: missing or unexpected model name/size")
     if path.resolve().is_relative_to(ROOT):
         raise ValueError("Model files must remain outside the published Git working tree")
+    before = _file_identity(path)
     h = hashlib.sha256()
     with path.open("rb") as source:
         for block in iter(lambda: source.read(1024 * 1024), b""):
             h.update(block)
     if h.hexdigest() != digest:
         raise ValueError(f"{actor}: GGUF SHA-256 verification failed")
+    if _strict_local_path(path, label="GGUF model") != path or _file_identity(path) != before:
+        raise ValueError(f"{actor}: GGUF model changed while being verified")
     return digest
+
+
+def _strict_local_path(path: Path, *, label: str) -> Path:
+    """Reject symbolic/junction indirections before resolving local binaries.
+
+    This is an advisory filesystem guard, **not** an OS-level anti-TOCTOU
+    execute-by-handle guarantee. The operator must control the parent tree.
+    """
+    if not isinstance(path, Path) or not path.is_absolute():
+        raise ValueError(f"{label} path must be explicit and absolute")
+    for element in (path, *path.parents):
+        if element.is_symlink() or (hasattr(element, "is_junction") and element.is_junction()):
+            raise ValueError(f"{label} path contains a symlink or junction")
+    try:
+        canonical = path.resolve(strict=True)
+    except (OSError, RuntimeError) as exc:
+        raise ValueError(f"{label} path cannot be resolved") from exc
+    if not canonical.is_file():
+        raise ValueError(f"{label} must be a regular file")
+    return canonical
+
+
+def _file_identity(path: Path) -> tuple[int, int, int, int]:
+    info = path.stat()
+    return (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns)
+
+
+def verify_executable(path: Path, expected_sha256: str) -> Path:
+    """Bind the *actual* llama-server file bytes before any process creation.
+
+    The digest comes from a trusted host/operator decision, never the model,
+    repository code, a downloaded manifest or executable's own stdout.
+    Reverified immediately before each Popen; an OS-level path replacement
+    between verification and process creation remains a documented risk.
+    """
+    if not isinstance(expected_sha256, str) or not _SHA256_HEX.fullmatch(expected_sha256):
+        raise ValueError("Exact trusted llama-server SHA-256 is required")
+    canonical = _strict_local_path(path, label="llama-server executable")
+    if canonical.name.casefold() != "llama-server.exe":
+        raise ValueError("Only the explicitly reviewed llama-server.exe executable is accepted")
+    before = _file_identity(canonical)
+    h = hashlib.sha256()
+    with canonical.open("rb") as source:
+        for block in iter(lambda: source.read(1024 * 1024), b""):
+            h.update(block)
+    if h.hexdigest() != expected_sha256.lower():
+        raise ValueError("llama-server executable SHA-256 mismatch")
+    if _strict_local_path(path, label="llama-server executable") != canonical or _file_identity(canonical) != before:
+        raise ValueError("llama-server executable changed while being verified")
+    return canonical
 
 
 def _prompt(ctx: DialogueContext) -> str:
@@ -211,11 +266,14 @@ def _request_json(opener, url: str, payload: dict | None, *, timeout_s: float) -
 
 
 def _inference_with_server(
-    actor: str, model: Path, executable: Path, prompt: str, *, timeout_s: int = 60,
+    actor: str, model: Path, executable: Path, prompt: str, *,
+    expected_runtime_sha256: str, timeout_s: int = 60,
 ) -> dict:
     """One loopback-only local model server; always terminate even on failure."""
-    if executable.name.casefold() != "llama-server.exe" or not executable.is_file():
-        raise FileNotFoundError("Only the installed llama-server.exe is accepted")
+    # Rehash both executable and reviewed model immediately before launch;
+    # `local_provider` can also be called without `run_fresh_duet`.
+    executable = verify_executable(executable, expected_runtime_sha256)
+    verify_artifact(model, actor)
     port = _loopback_port()
     base = f"http://127.0.0.1:{port}"
     args = [
@@ -281,12 +339,12 @@ def _inference_with_server(
             proc.wait(timeout=10)
 
 
-def local_provider(actor: str, model: Path, server_exe: Path, *, timeout_s: int = 60):
+def local_provider(actor: str, model: Path, server_exe: Path, *,
+                   expected_runtime_sha256: str, timeout_s: int = 60):
     """Call one temporary local-only structured inference endpoint per turn."""
     if actor not in EXPECTED:
         raise ValueError("Unknown experiment actor")
-    if server_exe.name.casefold() != "llama-server.exe" or not server_exe.is_file():
-        raise FileNotFoundError(f"Expected an installed llama-server.exe: {server_exe}")
+    verified_exe = verify_executable(server_exe, expected_runtime_sha256)
     if timeout_s < 5 or timeout_s > 120:
         raise ValueError("Model inference timeout must be 5–120 seconds")
 
@@ -294,7 +352,8 @@ def local_provider(actor: str, model: Path, server_exe: Path, *, timeout_s: int 
         if ctx.speaker != actor or ctx.room_id != "tidegate":
             raise ValueError("Model context is not the expected actor/room")
         structured = _inference_with_server(
-            actor, model, server_exe, _prompt(ctx), timeout_s=timeout_s,
+            actor, model, verified_exe, _prompt(ctx),
+            expected_runtime_sha256=expected_runtime_sha256, timeout_s=timeout_s,
         )
         return {"command": f"say {parse_structured_speech(structured)}"}
 
@@ -303,7 +362,7 @@ def local_provider(actor: str, model: Path, server_exe: Path, *, timeout_s: int 
 
 def run_fresh_duet(
     db_path: Path, server_exe: Path, models: dict[str, Path], *,
-    turns: int = 2, session_id: str = "local_duet_trial",
+    server_exe_sha256: str, turns: int = 2, session_id: str = "local_duet_trial",
 ) -> dict:
     """Create exactly one new local world, run, then independently read SQLite."""
     if db_path.exists():
@@ -314,14 +373,14 @@ def run_fresh_duet(
         raise ValueError("This live demonstration allows 1–4 total turns")
     if set(models) != set(EXPECTED):
         raise ValueError("Exactly two host-selected model paths are required")
+    verified_exe = verify_executable(server_exe, server_exe_sha256)
     digests = {actor: verify_artifact(models[actor], actor) for actor in EXPECTED}
-    if server_exe.name.casefold() != "llama-server.exe" or not server_exe.is_file():
-        raise FileNotFoundError("Expected llama-server.exe executable not present")
     world = import_worldpack(db_path, FLAGSHIP)
     engine = Engine(db_path)
     register_npc_pair(engine, ROSTER, expected_world_id="siltglass-reach")
     providers = {
-        actor: local_provider(actor, models[actor], server_exe)
+        actor: local_provider(actor, models[actor], verified_exe,
+                              expected_runtime_sha256=server_exe_sha256)
         for actor in EXPECTED
     }
     turns_result = NPCDuetRunner(
@@ -363,6 +422,7 @@ def run_fresh_duet(
         "status": "verified_local_duet_receipts",
         "worldpack_sha256": world["sha256"], "world_id": world_id,
         "database": str(db_path), "model_sha256": digests,
+        "llama_server_sha256": server_exe_sha256.lower(),
         "turns": [{"speaker": row["actor"], "room": row["room_id"],
                    "speech": json.loads(row["payload_json"])["text"]} for row in rows],
         "durable_event_count": len(rows), "durable_receipt_count": len(receipts),
@@ -377,6 +437,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--db", required=True, type=Path, help="NEW database path, outside Git")
     parser.add_argument("--llama-server", required=True, type=Path,
                         help="Existing local llama-server.exe; binds only a temporary localhost port")
+    parser.add_argument("--llama-server-sha256", required=True,
+                        help="64-hex SHA-256 of the reviewed host-installed llama-server.exe")
     parser.add_argument("--stealth-model", required=True, type=Path)
     parser.add_argument("--soup-model", required=True, type=Path)
     parser.add_argument("--session", default="local_duet_trial")
@@ -386,6 +448,7 @@ def main(argv: list[str] | None = None) -> int:
         result = run_fresh_duet(
             args.db, args.llama_server,
             {"FerrySteward": args.stealth_model, "CrossingInspector": args.soup_model},
+            server_exe_sha256=args.llama_server_sha256,
             turns=args.turns, session_id=args.session,
         )
     except (OSError, ValueError, RuntimeError, subprocess.SubprocessError, AssertionError) as exc:
