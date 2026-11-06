@@ -68,6 +68,8 @@ CREATE TABLE IF NOT EXISTS simulation_intents (
     action_id TEXT NOT NULL,
     expected_room TEXT NOT NULL REFERENCES rooms(id),
     required_listener TEXT REFERENCES players(id),
+    expected_actor_position_event_id INTEGER CHECK(expected_actor_position_event_id>0),
+    expected_listener_position_event_id INTEGER CHECK(expected_listener_position_event_id>0),
     drive_revision INTEGER NOT NULL CHECK(drive_revision>=0),
     command TEXT NOT NULL,
     proposal_sha256 TEXT NOT NULL,
@@ -112,6 +114,7 @@ class NPCProposalSnapshot:
     curiosity: int
     duty: int
     drive_revision: int
+    position_event_id: int
     world_instance_id: str
     next_tick_seq: int
 
@@ -124,11 +127,14 @@ class HostProposedAction:
     proposal: Mapping[str, object]
     action_id: str
     required_listener: str | None = None
+    required_listener_position_event_id: int | None = None
 
 
 def _digest_proposal(*, instance_id: str, tick_seq: int, actor: str,
                      expected_room: str, drive_revision: int, command: str,
-                     required_listener: str | None = None) -> str:
+                     required_listener: str | None = None,
+                     actor_position_event_id: int | None = None,
+                     listener_position_event_id: int | None = None) -> str:
     payload = {
         "instance_id": instance_id,
         "tick_seq": tick_seq,
@@ -140,6 +146,10 @@ def _digest_proposal(*, instance_id: str, tick_seq: int, actor: str,
     }
     if required_listener is not None:
         payload["required_listener"] = required_listener
+    if actor_position_event_id is not None:
+        payload["actor_position_event_id"] = actor_position_event_id
+    if listener_position_event_id is not None:
+        payload["listener_position_event_id"] = listener_position_event_id
     canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
@@ -319,7 +329,9 @@ class SimulationClock:
             control = self._control(db)
             row = db.execute(
                 "SELECT p.id,p.room_id,r.name AS room_name,r.description AS room_description,"
-                "n.persona,d.curiosity,d.duty,d.revision "
+                "n.persona,d.curiosity,d.duty,d.revision,"
+                "(SELECT MAX(e.id) FROM events e WHERE e.actor=p.id "
+                "AND e.kind IN ('join','move')) AS position_event_id "
                 "FROM simulation_drives d JOIN players p ON p.id=d.actor "
                 "JOIN npc_actor_registry n ON n.actor=p.id "
                 "JOIN rooms r ON r.id=p.room_id WHERE p.id=? COLLATE NOCASE",
@@ -327,10 +339,13 @@ class SimulationClock:
             ).fetchone()
             if row is None or row["id"] != actor:
                 raise ValueError("Actor is not an exact host-registered simulation NPC")
+            if type(row["position_event_id"]) is not int or row["position_event_id"] <= 0:
+                raise SimulationIntegrityError("NPC has no source event establishing its position")
             return NPCProposalSnapshot(
                 actor=row["id"], persona=row["persona"], room_id=row["room_id"],
                 room_name=row["room_name"], room_description=row["room_description"],
                 curiosity=row["curiosity"], duty=row["duty"], drive_revision=row["revision"],
+                position_event_id=row["position_event_id"],
                 world_instance_id=control["instance_id"],
                 next_tick_seq=control["planned_through"] + 1,
             )
@@ -376,12 +391,14 @@ class SimulationClock:
             # Check the full proposed batch under one writer lock BEFORE any
             # tick/intent row is created; a stale or forged model output cannot
             # leave a partially planned simulation tick.
-            checked: dict[str, tuple[str, str, str | None]] = {}
+            checked: dict[str, tuple[str, str, str | None, int | None, int | None]] = {}
             for row in residents:
                 if host_actions is None:
                     command = _CURIOSITY_SPEECH if row["curiosity"] >= row["duty"] else _DUTY_SPEECH
                     action_id = f"sim:{control['instance_id']}:{tick}:{row['actor']}"
                     listener = None
+                    actor_position_id = None
+                    listener_position_id = None
                 else:
                     action = authorized[row["actor"]]
                     snap = action.snapshot
@@ -391,6 +408,14 @@ class SimulationClock:
                             or snap.world_instance_id != control["instance_id"]
                             or snap.next_tick_seq != tick):
                         raise ValueError("Model proposal snapshot became stale before host planning")
+                    actor_position_id = db.execute(
+                        "SELECT MAX(id) FROM events WHERE actor=? AND kind IN ('join','move')",
+                        (row["actor"],),
+                    ).fetchone()[0]
+                    if type(snap.position_event_id) is not int or (
+                        snap.position_event_id <= 0 or snap.position_event_id != actor_position_id
+                    ):
+                        raise ValueError("Model proposal actor position became stale before host planning")
                     # Provider never supplies `action_id`, `actor`, `listener`,
                     # `world_id` or privileges: they are host action fields.
                     command = ResidentController(
@@ -398,6 +423,7 @@ class SimulationClock:
                     ).validate(action.proposal).command
                     action_id = action.action_id
                     listener = action.required_listener
+                    listener_position_id = action.required_listener_position_event_id
                     if not isinstance(action_id, str) or not 1 <= len(action_id) <= 128:
                         raise ValueError("Host action IDs must be 1–128 characters")
                     if listener is not None:
@@ -412,29 +438,46 @@ class SimulationClock:
                         ).fetchone()
                         if peer is None or peer["id"] != listener or peer["room_id"] != row["room_id"]:
                             raise ValueError("Required listener moved or is not registered with this room")
+                        latest = db.execute(
+                            "SELECT MAX(id) FROM events WHERE actor=? AND kind IN ('join','move')",
+                            (listener,),
+                        ).fetchone()[0]
+                        if type(listener_position_id) is not int or (
+                            listener_position_id <= 0 or listener_position_id != latest
+                        ):
+                            raise ValueError("Model proposal listener position became stale before host planning")
+                    elif listener_position_id is not None:
+                        raise ValueError("Listener position witness cannot exist without a listener")
                     if db.execute(
                         "SELECT 1 FROM action_receipts WHERE actor=? AND action_id=?",
                         (row["actor"], action_id),
                     ).fetchone():
                         raise SimulationIntegrityError("Host action ID is already committed elsewhere")
-                checked[row["actor"]] = (command, action_id, listener)
+                checked[row["actor"]] = (
+                    command, action_id, listener, actor_position_id, listener_position_id,
+                )
             status = "proposed" if residents else "terminal"
             db.execute(
                 "INSERT INTO simulation_ticks(tick_seq,ruleset_version,resident_count,status) VALUES (?,?,?,?)",
                 (tick, RULESET_VERSION, len(residents), status),
             )
             for row in residents:
-                command, action_id, listener = checked[row["actor"]]
+                command, action_id, listener, actor_position_id, listener_position_id = checked[row["actor"]]
                 digest = _digest_proposal(
                     instance_id=control["instance_id"], tick_seq=tick, actor=row["actor"],
                     expected_room=row["room_id"], drive_revision=row["revision"],
                     command=command, required_listener=listener,
+                    actor_position_event_id=actor_position_id,
+                    listener_position_event_id=listener_position_id,
                 )
                 db.execute(
                     "INSERT INTO simulation_intents "
-                    "(tick_seq,actor,action_id,expected_room,required_listener,drive_revision,command,proposal_sha256,status) "
-                    "VALUES (?,?,?,?,?,?,?,?,'proposed')",
-                    (tick, row["actor"], action_id, row["room_id"], listener, row["revision"], command, digest),
+                    "(tick_seq,actor,action_id,expected_room,required_listener,"
+                    "expected_actor_position_event_id,expected_listener_position_event_id,"
+                    "drive_revision,command,proposal_sha256,status) "
+                    "VALUES (?,?,?,?,?,?,?,?,?,?,'proposed')",
+                    (tick, row["actor"], action_id, row["room_id"], listener,
+                     actor_position_id, listener_position_id, row["revision"], command, digest),
                 )
             db.execute(
                 "UPDATE simulation_control SET planned_through=?,finalized_through=? WHERE singleton=1",
@@ -532,6 +575,8 @@ class SimulationClock:
                     instance_id=control["instance_id"], tick_seq=tick, actor=row["actor"],
                     expected_room=row["expected_room"], drive_revision=row["drive_revision"],
                     command=row["command"], required_listener=row["required_listener"],
+                    actor_position_event_id=row["expected_actor_position_event_id"],
+                    listener_position_event_id=row["expected_listener_position_event_id"],
                 )
                 if digest != row["proposal_sha256"]:
                     raise SimulationIntegrityError("Persisted proposal checksum does not match")
@@ -550,6 +595,12 @@ class SimulationClock:
                 valid = (player is not None and player["id"] == row["actor"]
                          and player["room_id"] == row["expected_room"]
                          and drives is not None and drives["revision"] == row["drive_revision"])
+                if valid and row["expected_actor_position_event_id"] is not None:
+                    latest = db.execute(
+                        "SELECT MAX(id) FROM events WHERE actor=? AND kind IN ('join','move')",
+                        (row["actor"],),
+                    ).fetchone()[0]
+                    valid = latest == row["expected_actor_position_event_id"]
                 if valid and row["required_listener"] is not None:
                     peer = db.execute(
                         "SELECT p.id,p.room_id FROM players p "
@@ -559,8 +610,14 @@ class SimulationClock:
                     ).fetchone()
                     valid = (peer is not None and peer["id"] == row["required_listener"]
                              and peer["room_id"] == row["expected_room"])
+                    if valid and row["expected_listener_position_event_id"] is not None:
+                        latest = db.execute(
+                            "SELECT MAX(id) FROM events WHERE actor=? AND kind IN ('join','move')",
+                            (row["required_listener"],),
+                        ).fetchone()[0]
+                        valid = latest == row["expected_listener_position_event_id"]
                 if not valid:
-                    response, status = "Stale room, listener or drive revision; proposal rejected.", "rejected"
+                    response, status = "Stale position, listener or drive revision; proposal rejected.", "rejected"
                 else:
                     preexisting = db.execute(
                         "SELECT 1 FROM action_receipts WHERE actor=? AND action_id=?",

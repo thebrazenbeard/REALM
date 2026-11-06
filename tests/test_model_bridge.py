@@ -124,6 +124,64 @@ class ModelBridgeTests(unittest.TestCase):
         self.assertEqual(1, self._count("events", "WHERE kind='say'"))
         self.assertEqual(2, self._count("actor_memory_grants"))
 
+    def test_fresh_host_lease_epoch_recovers_crash_after_plan_exactly_once(self):
+        calls = []
+
+        def first_provider(ctx):
+            calls.append(ctx.speaker)
+            return {"command": "say The ferry marker is at the old ford."}
+
+        bridge = self._bridge({"Moss": first_provider,
+                               "Ember": lambda _: self.fail("unexpected second actor")})
+        original_epoch = self.clock._lease_epoch
+        with patch.object(self.clock, "apply_pending_tick", side_effect=RuntimeError("host crashed")):
+            with self.assertRaisesRegex(RuntimeError, "host crashed"):
+                bridge.run(session_id="fresh_restart", turns=1)
+        self.assertEqual(["Moss"], calls)
+        self.assertEqual(1, self._count("simulation_intents", "WHERE status='proposed'"))
+        self.assertEqual(0, self._count("events", "WHERE kind='say'"))
+        self.assertEqual(0, self._count("action_receipts"))
+        self.assertEqual(0, self._count("actor_memory_grants"))
+
+        # The original host is gone. Advance only the test database lease
+        # past expiry before a genuinely new Engine/Clock owner takes over.
+        with closing(sqlite3.connect(self.path)) as db, db:
+            db.execute("UPDATE simulation_control SET lease_expires_unix=0")
+        new_engine = Engine(self.path)
+        new_clock = SimulationClock(new_engine, expected_world_id="shore-example")
+        new_epoch = new_clock.acquire_lease(ttl_seconds=30)
+        self.assertGreater(new_epoch, original_epoch)
+        new_memory = ActorMemory(new_engine, world_id="shore-example")
+
+        def forbidden(_):
+            self.fail("Persisted pending command must not rerun model inference")
+
+        restarted = ModelNeutralDuetBridge(
+            new_clock, actor_a="Moss", actor_b="Ember",
+            providers={"Moss": forbidden, "Ember": forbidden}, memory=new_memory,
+        )
+        receipt = restarted.run(session_id="fresh_restart", turns=1)
+        self.assertEqual(1, len(receipt))
+        self.assertEqual("committed", receipt[0].status)
+        self.assertTrue(receipt[0].replayed)
+        # Replayed a second time and reopened once more: all three reads
+        # resolve the same durable action ID and one event/receipt/grant set.
+        twice = restarted.run(session_id="fresh_restart", turns=1)
+        reopened = ModelNeutralDuetBridge(
+            SimulationClock(Engine(self.path), expected_world_id="shore-example"),
+            actor_a="Moss", actor_b="Ember",
+            providers={"Moss": forbidden, "Ember": forbidden},
+            memory=ActorMemory(Engine(self.path), world_id="shore-example"),
+        ).run(session_id="fresh_restart", turns=1)
+        self.assertEqual([receipt[0].action_id] * 3,
+                         [receipt[0].action_id, twice[0].action_id, reopened[0].action_id])
+        self.assertTrue(twice[0].replayed and reopened[0].replayed)
+        self.assertEqual(1, self._count("events", "WHERE kind='say'"))
+        self.assertEqual(1, self._count("action_receipts"))
+        self.assertEqual(2, self._count("actor_memory_grants"))
+        self.assertEqual(1, self._count("simulation_intents", "WHERE status='committed'"))
+        self.assertEqual(["Moss"], calls)
+
     def test_model_spoofed_actor_or_item_command_never_creates_tick(self):
         for command in ({"command": "say private", "actor": "Ember"},
                         {"command": "take stone_one"},
@@ -174,11 +232,73 @@ class ModelBridgeTests(unittest.TestCase):
         self.assertEqual(0, self._count("simulation_intents"))
         self.assertEqual(0, self._count("events", "WHERE kind='say'"))
 
+    def test_listener_move_away_and_back_during_inference_is_stale(self):
+        def roundtrip(ctx):
+            self.assertEqual("shore", ctx.room_id)
+            self.assertIn("The Grove", self.engine.act("Ember", "north"))
+            self.assertIn("The Shore", self.engine.act("Ember", "south"))
+            return {"command": "say I have no evidence Ember stayed nearby."}
+
+        self.assertEqual("shore", self._query(
+            "SELECT room_id FROM players WHERE id='Ember'",
+        )[0][0])
+        with self.assertRaisesRegex(ValueError, "stale"):
+            self._bridge({"Moss": roundtrip,
+                          "Ember": lambda _: {"command": "say Unused."}}).run(
+                              session_id="move_back_during_inference", turns=1,
+                          )
+        self.assertEqual(0, self._count("events", "WHERE kind='say'"))
+        self.assertEqual(0, self._count("simulation_intents"))
+        self.assertEqual(0, self._count("action_receipts"))
+
+    def test_listener_move_away_and_back_after_plan_rejects_pending_tick(self):
+        snap = self.clock.snapshot_npc_actor("Moss")
+        self.clock.plan_next_tick(host_actions=(HostProposedAction(
+            snapshot=snap, proposal={"command": "say Was Ember here the whole time?"},
+            action_id="host-test-peer-roundtrip", required_listener="Ember",
+            required_listener_position_event_id=self.clock.snapshot_npc_actor("Ember").position_event_id,
+        ),))
+        self.assertIn("The Grove", self.engine.act("Ember", "north"))
+        self.assertIn("The Shore", self.engine.act("Ember", "south"))
+        completed = self.clock.apply_pending_tick()
+        self.assertEqual(["rejected"], [x.status for x in completed])
+        self.assertEqual(0, self._count("events", "WHERE kind='say'"))
+        self.assertEqual(0, self._count("action_receipts"))
+        self.assertEqual(0, self._count("actor_memory_grants"))
+
+    def test_speaker_move_away_and_back_after_plan_rejects_pending_tick(self):
+        snap = self.clock.snapshot_npc_actor("Moss")
+        self.clock.plan_next_tick(host_actions=(HostProposedAction(
+            snapshot=snap, proposal={"command": "say I was here the entire time."},
+            action_id="host-test-speaker-roundtrip", required_listener="Ember",
+            required_listener_position_event_id=self.clock.snapshot_npc_actor("Ember").position_event_id,
+        ),))
+        self.assertIn("The Grove", self.engine.act("Moss", "north"))
+        self.assertIn("The Shore", self.engine.act("Moss", "south"))
+        self.assertEqual(["rejected"], [x.status for x in self.clock.apply_pending_tick()])
+        self.assertEqual(0, self._count("events", "WHERE kind='say'"))
+        self.assertEqual(0, self._count("action_receipts"))
+
+    def test_unrelated_room_speech_during_inference_does_not_stale_positions(self):
+        def with_human_speech(_):
+            self.engine.join("Visitor")
+            self.engine.act("Visitor", "say I have unrelated observations.")
+            return {"command": "say A ferry crossing requires a ticket."}
+
+        result = self._bridge({
+            "Moss": with_human_speech, "Ember": lambda _: {"command": "say Unused."},
+        }).run(session_id="unrelated_event_not_position", turns=1)
+        self.assertEqual(["committed"], [t.status for t in result])
+        self.assertEqual(2, self._count("events", "WHERE kind='say'"))
+        self.assertEqual(1, self._count("action_receipts"))
+        self.assertEqual(2, self._count("actor_memory_grants"))
+
     def test_peer_move_after_durable_plan_is_rejected_inside_commit(self):
         snapshot = self.clock.snapshot_npc_actor("Moss")
         self.clock.plan_next_tick(host_actions=(HostProposedAction(
             snapshot=snapshot, proposal={"command": "say Are you listening?"},
             action_id="host-test-peer-departure", required_listener="Ember",
+            required_listener_position_event_id=self.clock.snapshot_npc_actor("Ember").position_event_id,
         ),))
         self.assertIn("The Grove", self.engine.act("Ember", "north"))
         out = self.clock.apply_pending_tick()
