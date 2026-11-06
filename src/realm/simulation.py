@@ -23,6 +23,7 @@ from contextlib import closing
 from dataclasses import dataclass
 from pathlib import Path
 
+from .actor_memory import ActorMemory
 from .engine import Engine, _PLAYER_RE
 from .residents import ResidentController
 
@@ -266,7 +267,9 @@ class SimulationClock:
                 "INSERT INTO players(id,room_id,created_at) VALUES (?,?,?)",
                 (name, room, self.engine._now()),
             )
-            self.engine._event(db, name, room, "join", {"host_simulation_npc": True})
+            # The shared PR23/PR28 public event-shape contract permits this
+            # exact marker. Do not introduce unreviewed join metadata.
+            self.engine._event(db, name, room, "join", {"resident": True})
             db.execute(
                 "INSERT INTO npc_actor_registry(actor,persona,created_at) VALUES (?,?,?)",
                 (name, persona, self.engine._now()),
@@ -322,6 +325,55 @@ class SimulationClock:
             if control["finalized_through"] == control["planned_through"]:
                 return None
             return control["finalized_through"] + 1
+
+    def _grant_speech_observations(self, db: sqlite3.Connection, *, actor: str,
+                                   room_id: str, event_id: int, command: str) -> None:
+        """One event, authorized co-room simulation NPCs, same write txn.
+
+        Memory remains opt-in: without ActorMemory tables there is no grant.
+        Half-installed memory schemas must fail closed and roll back speech.
+        Humans are never auto-granted from durable room membership, which
+        does not prove live presence or consent.
+        """
+        present = {row[0] for row in db.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' "
+            "AND name IN ('actor_memory_grants','actor_memory_summaries')"
+        )}
+        marker = db.execute(
+            "SELECT value FROM world_meta WHERE key='actor_memory_enabled'"
+        ).fetchone()
+        if not present:
+            if marker is not None:
+                raise SimulationIntegrityError("Actor memory was enabled but its schema is missing")
+            return
+        if marker is not None and marker[0] != "1":
+            raise SimulationIntegrityError("Actor memory opt-in marker is invalid")
+        if present != {"actor_memory_grants", "actor_memory_summaries"}:
+            raise SimulationIntegrityError("Actor memory schema is incomplete; denying speech without grants")
+        source = db.execute(
+            "SELECT actor,room_id,kind,payload_json FROM events WHERE id=?", (event_id,),
+        ).fetchone()
+        if (source is None or source["actor"] != actor or source["room_id"] != room_id
+                or source["kind"] != "say"):
+            raise SimulationIntegrityError("Speech event ID does not match the host action")
+        try:
+            text = json.loads(source["payload_json"])["text"]
+        except (ValueError, TypeError, KeyError) as exc:
+            raise SimulationIntegrityError("Speech event has malformed payload") from exc
+        if text != command.partition(" ")[2].strip():
+            raise SimulationIntegrityError("Speech source differs from accepted command")
+        observers = db.execute(
+            "SELECT p.id FROM simulation_drives d "
+            "JOIN npc_actor_registry n ON n.actor=d.actor "
+            "JOIN players p ON p.id=d.actor "
+            "WHERE p.room_id=? ORDER BY p.id COLLATE NOCASE", (room_id,),
+        ).fetchall()
+        if actor not in {observer["id"] for observer in observers}:
+            raise SimulationIntegrityError("Source actor lacks registered NPC observation principal")
+        for observer in observers:
+            ActorMemory._grant_new_speech_in_transaction(
+                db, world_id=self.expected_world_id, observer=observer["id"], event_id=event_id,
+            )
 
     def apply_pending_tick(self) -> list[TickOutcome]:
         """Atomically guard each effect, receipt, drive change and disposition."""
@@ -389,6 +441,15 @@ class SimulationClock:
                     )
                     if not response.startswith("You say: "):
                         raise SimulationIntegrityError("Deterministic speech did not commit")
+                    # SQLite last_insert_rowid() is connection-scoped. `say`
+                    # inserted exactly one event in this same write txn; bind
+                    # and verify it before any receipt/drive update. No room
+                    # history MAX lookup after another action is involved.
+                    event_id = int(db.execute("SELECT last_insert_rowid()").fetchone()[0])
+                    self._grant_speech_observations(
+                        db, actor=row["actor"], room_id=player["room_id"],
+                        event_id=event_id, command=accepted.command,
+                    )
                     db.execute(
                         "INSERT INTO action_receipts(actor,action_id,command,response) VALUES (?,?,?,?)",
                         (row["actor"], row["action_id"], accepted.command, response),
