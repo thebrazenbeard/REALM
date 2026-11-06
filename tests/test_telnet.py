@@ -12,6 +12,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from realm.engine import Engine
+from realm.conversations import NPCIdentity, register_npc_pair
 from realm.telnet import _TelnetFilter, LocalTelnetServer
 
 
@@ -140,6 +141,22 @@ class TerminalServerTests(unittest.TestCase):
         rejoined = self.login("aLiCe")
         rejoined.sendall(b"where\r\n")
         self.assertIn("The Atrium", self.receive_until(rejoined, b"REALM> "))
+
+    def test_telnet_token_holder_cannot_claim_registered_npc(self):
+        register_npc_pair(
+            self.engine,
+            (NPCIdentity("FerrySteward", "A ferry steward."),
+             NPCIdentity("CrossingInspector", "An inspector.")),
+        )
+        conn = self.connect()
+        self.receive_until(conn, b"Token: ")
+        conn.sendall(b"test-secret\r\n")
+        self.receive_until(conn, b"Name: ")
+        conn.sendall(b"ferrysteward\r\n")
+        denial = self.receive_until(conn, b"reserved")
+        self.assertIn("NPC identity is reserved", denial)
+        self.assertFalse(self.server.is_name_active("ferrysteward"))
+        self.assertEqual(b"", conn.recv(1024))
 
     def test_abrupt_disconnect_releases_name(self):
         player = self.login("Vince")

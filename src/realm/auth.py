@@ -51,6 +51,17 @@ class CredentialStore:
         token = self._new_token()
         with closing(self.engine._connect()) as db, db:
             db.execute("BEGIN IMMEDIATE")
+            # A host must not accidentally turn a reserved NPC into a bearer
+            # player. Registration and provisioning use the same writer lock,
+            # making either order fail closed if the other has already won.
+            registry = db.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='npc_actor_registry'"
+            ).fetchone()
+            if registry is not None and db.execute(
+                "SELECT 1 FROM npc_actor_registry WHERE actor=? COLLATE NOCASE",
+                (player_name,),
+            ).fetchone():
+                raise ValueError("NPC identity cannot receive a player credential")
             try:
                 db.execute(
                     "INSERT INTO player_credentials (player_name,token_digest,created_at) VALUES (?,?,?)",
