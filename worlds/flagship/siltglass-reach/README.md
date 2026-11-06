@@ -1,6 +1,6 @@
 # Siltglass Reach — original REALM showcase
 
-Siltglass Reach is a **24-room, eight-item, setting-neutral fantasy worldpack**
+Siltglass Reach is a **24-room, 14-item, original fantasy worldpack**
 for testing REALM's persistent multiplayer text-world engine. The harbor town
 depends on a crossing whose maps and measurements disagree. Two civic groups
 argue over whether to keep the route open. Players investigate by moving,
@@ -34,6 +34,19 @@ Try `look`, `east`, `south`, `go archway`, `take charred_receipt`,
 world state, and their saved locations survive restarts. The worldpack importer
 will not replace a played world with a different declaration.
 
+New portable clues make the setting more interactive with REALM's **actual**
+commands: walk east from the Tidegate to the jetty and `take crossing_token`;
+the net yard holds `mended_net_tag`; the market has `market_counter`; the
+Ranger's Stand holds `weather_log_leaf`; Refuge Hall holds
+`refuge_claim_slip`; Boundary Cairn holds `waymark_chalk`. These remain
+ordinary inventory items; the engine does not calculate tolls, trade value,
+weather, reputation or quest completion.
+
+**Already-imported databases retain their original worldpack hash.** Expanding
+this source file does not migrate or overwrite them: import the expanded pack
+into a fresh SQLite path for a new playthrough. Do not delete an existing world
+to force the new declaration into it.
+
 ## World layout
 
 The twenty-four rooms form a six-row, four-column conceptual arrangement.
@@ -55,7 +68,32 @@ Civic and Wild. A **fixed** special exit labeled `archway` links Old Spillway
 and Fault Arch in both directions; this is not a random or conditional portal.
 Every location is accessible from the Tidegate.
 
-## Story sparks — player-directed, not scripted quests
+## Living-world reference — deliberately separate from the engine
+
+[`living_lore.v1.json`](living_lore.v1.json) is an optional, original,
+**non-executable design companion**, not part of the `realm.worldpack.v1`
+import schema. It describes six potential resident voices (with proposed actor
+IDs and bounded persona seeds), three factions,
+five disputed barter offers, four atmospheric weather states and four
+player-directed quest seeds. Each NPC role has a starting room, limited
+knowledge and conflicting motivations. This gives a host or future, separately
+authorized neural-agent layer grounded material to work with without making
+the model an omniscient source of truth.
+
+| Layer | What players can do today | What this lore does *not* implement |
+| --- | --- | --- |
+| Geography | Traverse 24 persistent rooms and fixed exits | Procedural areas, conditional passage or weather hazards |
+| Clues | Examine, take and drop 14 named portable objects | Shops, currency, resource consumption, crafting or object-use effects |
+| Community | Join one SQLite world and speak in room history | Autonomous NPCs, faction membership, reputation or PvP rules |
+| Narrative | Compare conflicting evidence and make roleplayed choices | Quest state, scripted outcomes, factual adjudication or NPC memory |
+
+The `Channel Guild` is divided about safe trade, the `Crossing Committee`
+about when to act without certainty, and the `Reedward Collective` about
+surveying versus repairing damaged livelihoods. Their interests can collide
+without a pre-selected villain or automatic combat. The archetypes are
+original and **not registered in any live REALM database** by this file.
+
+### Story sparks — player-directed, not scripted quests
 
 1. **Two bells, one warning.** Two meeting places disagree about what the
    crossing means for trade and safety. Have players present a joint warning
@@ -73,6 +111,11 @@ The Channel Guild and Crossing Committee are **background civic viewpoints** in
 room descriptions, not programmed NPCs or authenticated institutional actors.
 An AI participant may eventually propose actions through a separately
 validated agent interface; none is included or running here.
+
+The lore companion is not a source of private witness grants. A public room
+chronicle, an NPC's remembered observation, a private message and a moderator
+audit log would need separate explicit policies. In-character testimony is
+**attributed speech**, not independently verified fact.
 
 ## Future human–neural co-creation hooks (design only)
 
@@ -93,6 +136,26 @@ These are **proposals for separate schema and engine work**. No NPCs, drive
 systems, model calls, autonomous ticks, or long-term agent memories are
 instantiated by this pack. Any future actions must go through host-side
 identity, capability, validation, and durable commit gates.
+
+## Research influences without importing third-party canon
+
+I used published, first-party MUD architecture descriptions as *design
+comparators*, not as source content or permission to copy another setting:
+
+- [Evennia Rooms and Exits](https://www.evennia.com/docs/latest/Components/Rooms.html)
+  separates room/exits as world objects; REALM's currently imported representation
+  is intentionally smaller: rooms, fixed directional exits, items.
+- [Ranvier Bundles](https://ranviermud.com/bundles/) separates game content and
+  behaviors; the separate passive Siltglass lore follows that architectural
+  *boundary* without importing Ranvier code or behaviors.
+- [Achaea's player-killing guidance](https://www.achaea.com/game-help?what=player-killing-pk-or-pvp)
+  illustrates why player conflict needs explicit policy. REALM has no combat
+  or PK rules here; faction disagreement is roleplay, never a hidden PK flag.
+
+Historical Melmoth, Astaria, GodWars, Vampire Wars and White Wolf references
+inform Patrick's desired *experience* (rich text exploration, building,
+social friction, persistent history) but are not content licenses, shared
+canon, or claims that a specific historical server feature is documented.
 
 ## Capability boundary
 
