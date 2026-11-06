@@ -172,10 +172,12 @@
       window.RealmMap.renderMap(document, mapElements, payload);
     } catch (error) {
       if (current !== session) return;
-      if (error.status === 404 || error.status === 501) session.mapUnsupported = true;
-      window.RealmMap.setUnavailable(mapElements, session.mapUnsupported
-        ? "This host does not provide a map route yet. Room descriptions and commands still work."
-        : "Host map update failed: " + error.message);
+      // A 404 may mean this particular room has no mapped space; retry after travel.
+      if (error.status === 501) session.mapUnsupported = true;
+      window.RealmMap.setUnavailable(mapElements, error.status === 404
+        ? "No map is available here. This host may not provide maps, or the location may be unmapped."
+        : session.mapUnsupported ? "This host does not support maps yet. Commands still work."
+          : "Host map update failed: " + error.message);
     } finally {
       session.mapPolling = false;
       session.mapUpdated = Date.now();
