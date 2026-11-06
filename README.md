@@ -72,6 +72,10 @@ An opt-in, model-neutral [two-resident conversation runner](docs/NPC_CONVERSATIO
 now permits a trusted local host to register two fresh NPC identities and
 commit bounded, alternating `say` turns with restart-stable receipts. Deterministic
 providers are tested; actual model inference and continuous autonomy are not.
+An opt-in [`ActorMemory`](docs/ACTOR_MEMORY.md) adapter can persist recent,
+host-issued event-observation grants and revocations per resident; this is
+**not** deep memory, live-presence proof, or a retrofit of the existing
+`listen`/HTTP feed privacy behavior.
 Small local NPC-model options, including Patrick's Hugging Face `character` and
 `npc` searches, are tracked as **research candidates** in
 [`docs/NPC_MODEL_CANDIDATES.md`](docs/NPC_MODEL_CANDIDATES.md) and the offline
