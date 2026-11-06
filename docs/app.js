@@ -22,6 +22,12 @@
     feed: byId("feed"),
     feedState: byId("feed-state"),
     room: byId("room-description"),
+    mapGrid: byId("map-grid"),
+    mapSpace: byId("map-space"),
+    mapPosition: byId("map-position"),
+    mapStatus: byId("map-status"),
+    mapNote: byId("map-note"),
+    mapLegend: byId("map-legend"),
     commandInput: byId("command-input"),
     send: byId("send-button"),
     commandHint: byId("command-hint"),
@@ -92,6 +98,10 @@
     if (window.location.protocol === "https:" && url.protocol !== "https:") {
       throw new Error("An HTTPS page requires an HTTPS REALM host. A public tunnel is not configured by this page.");
     }
+    // Never send bearer secrets over cleartext to a network host.
+    if (url.protocol === "http:" && !["localhost", "127.0.0.1", "[::1]"].includes(url.hostname.toLowerCase())) {
+      throw new Error("HTTP is permitted only for loopback development hosts. Use HTTPS for remote worlds.");
+    }
     if (url.pathname !== "/" && url.pathname !== "") {
       throw new Error("Enter the host origin only; API routes are added automatically.");
     }
@@ -120,7 +130,9 @@
     catch { throw new Error("The host returned a response that was not JSON."); }
     if (!response.ok) {
       const detail = typeof data.error === "string" ? data.error : "Request rejected by the host";
-      throw new Error(detail + " (HTTP " + response.status + ")");
+      const error = new Error(detail + " (HTTP " + response.status + ")");
+      error.status = response.status;
+      throw error;
     }
     return data;
   }
@@ -144,7 +156,30 @@
     ui.accessState.textContent = "Host authorization required";
     ui.room.textContent = "No character is connected.\n\nThe current room will appear here when you enter a hosted REALM.";
     ui.commandInput.value = "";
+    if (window.RealmMap) window.RealmMap.setUnavailable(mapElements, "Connect a compatible host to view its authorized map.");
     if (note) setNote(note);
+  }
+
+  const mapElements = { grid: ui.mapGrid, space: ui.mapSpace, position: ui.mapPosition,
+    status: ui.mapStatus, note: ui.mapNote, legend: ui.mapLegend };
+
+  async function refreshMap(session) {
+    if (!window.RealmMap || current !== session || session.mapUnsupported || session.mapPolling) return;
+    session.mapPolling = true;
+    try {
+      const payload = await request(session, "/api/v1/map?player=" + encodeURIComponent(session.player));
+      if (current !== session) return;
+      window.RealmMap.renderMap(document, mapElements, payload);
+    } catch (error) {
+      if (current !== session) return;
+      if (error.status === 404 || error.status === 501) session.mapUnsupported = true;
+      window.RealmMap.setUnavailable(mapElements, session.mapUnsupported
+        ? "This host does not provide a map route yet. Room descriptions and commands still work."
+        : "Host map update failed: " + error.message);
+    } finally {
+      session.mapPolling = false;
+      session.mapUpdated = Date.now();
+    }
   }
 
   async function refreshRoom(session) {
@@ -176,6 +211,7 @@
       }
       session.cursor = Math.max(session.cursor, parseCursor(data.cursor, session.cursor));
       session.failures = 0;
+      if (Date.now() - session.mapUpdated > 12000) await refreshMap(session);
     } catch (error) {
       if (current !== session) return;
       session.failures++;
@@ -203,7 +239,8 @@
     ui.connect.disabled = true;
     ui.connect.textContent = "Connecting…";
     setNote("Contacting the host…");
-    const session = { base, token, player, cursor: 0, polling: false, failures: 0, timer: null };
+    const session = { base, token, player, cursor: 0, polling: false, failures: 0,
+      mapUnsupported: false, mapPolling: false, mapUpdated: 0, timer: null };
     try {
       const health = await request(session, "/api/v1/health", { unauthenticated: true });
       if (health.ok !== true || typeof health.world_id !== "string") throw new Error("The endpoint is not a compatible REALM gateway.");
@@ -212,6 +249,8 @@
       current = session;
       resetFeed();
       setConnectionState(true);
+      // Keep the token in the session object only, not in the password input DOM.
+      ui.accessToken.value = "";
       ui.worldName.textContent = health.world_id;
       ui.player.textContent = player;
       ui.worldState.textContent = "Persistent host state";
@@ -220,6 +259,7 @@
       appendFeed({ label: "HOST / JOIN", message: typeof joined.text === "string" ? joined.text : "Connected to host.", icon: "✦" });
       try { await refreshRoom(session); }
       catch (error) { appendFeed({ category: "error", label: "ROOM UPDATE", message: error.message, icon: "!" }); }
+      await refreshMap(session);
       session.timer = setInterval(() => poll(session), POLL_DELAY_MS);
       ui.commandInput.focus();
     } catch (error) {
@@ -254,6 +294,7 @@
       try { await refreshRoom(session); }
       catch (error) { appendFeed({ category: "error", label: "ROOM UPDATE", message: error.message, icon: "!" }); }
       await poll(session);
+      await refreshMap(session);
     } catch (error) {
       if (current === session) appendFeed({ category: "error", label: "COMMAND REJECTED", message: error.message, icon: "!" });
     } finally {

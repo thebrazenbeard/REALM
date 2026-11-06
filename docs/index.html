@@ -7,6 +7,7 @@
   <meta name="theme-color" content="#0b111b">
   <title>REALM — World Console</title>
   <link rel="stylesheet" href="styles.css">
+  <script src="map.js" defer></script>
   <script src="app.js" defer></script>
 </head>
 <body>
@@ -106,6 +107,23 @@ The current room will appear here when you enter a hosted REALM.</pre>
         <div class="visibility-note"><span aria-hidden="true">◈</span> You only see what your character is permitted to know.</div>
       </aside>
     </main>
+
+    <section class="panel map-panel" aria-labelledby="map-title">
+      <div class="panel-title"><span>04 / WAYFINDER</span><span class="panel-deco">✧</span></div>
+      <div class="map-heading">
+        <h2 id="map-title">Local overlay</h2>
+        <span class="feed-badge" id="map-status">MAP UNAVAILABLE</span>
+      </div>
+      <div class="map-meta">
+        <span id="map-space">Unknown location</span>
+        <span id="map-position">—</span>
+      </div>
+      <div class="map-scroll" tabindex="0" aria-label="Scrollable host-provided 2D map viewport">
+        <div class="map-grid" id="map-grid" role="grid" aria-label="No host map available"></div>
+      </div>
+      <p class="map-note" id="map-note">Connect a compatible host to view its authorized map. No map is invented locally.</p>
+      <p class="map-legend" id="map-legend"></p>
+    </section>
 
     <footer class="footer">
       <span>REALM <span class="footer-separator">/</span> A local-first, persistent text-world engine</span>
