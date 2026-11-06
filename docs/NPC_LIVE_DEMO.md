@@ -27,7 +27,7 @@ From an up-to-date source checkout on Windows Lappy, choose a **fresh path**:
 ```powershell
 py -3 .\scripts\run_siltglass_npc_duet.py `
   --db 'D:\VERA\realm-worlds\siltglass-reach\npc-duet-unique-trial.sqlite3' `
-  --llama-cli 'C:\Users\patri\AppData\Local\Microsoft\WinGet\Packages\ggml.llamacpp_Microsoft.Winget.Source_8wekyb3d8bbwe\llama-cli.exe' `
+  --llama-cli 'C:\path\to\your\llama-cli.exe' `
   --stealth-model 'D:\VERA\models\realm-npc\stealth-rifle-Q4_K_M.gguf' `
   --soup-model 'D:\VERA\models\realm-npc\npc-voice-soup06.Q5_K_M.gguf' `
   --session local_trial_01 `
@@ -39,6 +39,8 @@ host receipts before claiming live installation. Use a unique database name
 for every fresh experiment. The script refuses existing DBs, including
 partially completed ones, because a live model timeout or unexpected text
 must never trigger blind re-execution against saved state.
+Replace the `llama-cli.exe` placeholder with the actual executable on your
+own host; do not commit home-directory paths or private local configuration.
 
 For source-only regression with no models or downloads:
 
