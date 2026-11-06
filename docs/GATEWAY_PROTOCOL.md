@@ -47,6 +47,24 @@ For browser requests, Origin must exactly match one explicitly configured
 | `POST /api/v1/command` | `{"player":"Patrick","command":"look","action_id":"optional-unique-id"}` | `{"ok":true,"text":"...","cursor":1}` |
 | `GET /api/v1/room?player=Patrick` | query | `{"ok":true,"text":"...","cursor":1}` |
 | `GET /api/v1/feed?player=Patrick&after=1` | query | `{"ok":true,"events":[...],"cursor":2}` |
+| `GET /api/v1/map?player=Patrick` | query; optional authored geography | `{"ok":true,"space":{...},"origin":{...},"width":3,"height":2,"tiles":[...],"markers":[...],"player":{...},"legend":[...]}` |
+
+The map endpoint reads the joined player's **actual persisted room** from
+`players.room_id` and picks the closest authored geography layer containing
+that room. If no geography/worldpack map is installed for it, the host returns
+`404 {"ok":false,"error":"No map is configured for this location"}`. It does
+not manufacture a terrain map from ordinary textual rooms. `tiles` contain
+viewport-relative `x,y,glyph,terrain,passable`; `markers` contain
+`id,name,kind,x,y`; `origin` contains the absolute tile offset. The response
+is bounded to 32×32 cells, and the `player` marker may be `null` when absent
+from the viewport. The hosting browser must render content as inert text.
+
+`Geography(db_path)` can define a world hierarchy (universe/system/planet/
+region/settlement/room) alongside the base Engine's SQLite tables, and
+world authors can supply explicit terrain tiles and travel routes. This is
+an authoring API, not an automatic galaxy generator or public worldpack
+loader. Ship departure/arrival state is persisted and advanced by explicit
+host ticks; no always-running simulation is implied.
 
 Each event is `{id,kind,actor,text,room,at}`. The feed is **polling**, not
 server push. It is filtered to the player's current room, returns up to 100
@@ -57,6 +75,11 @@ entire previous history as new activity.
 Only names, not authenticated identities, exist in the first prototype.
 The gateway bearer token grants full local world access, including use of
 other player names. It is strictly a single-owner development adapter.
+**The map endpoint has the same shared-token limitation**: supplying another
+joined player's name can expose their view, and the current map snapshot may
+list author-defined markers the player has not discovered. Do not expose it
+to untrusted users until player-bound auth, fog of war and information-flow
+policy are implemented and tested.
 Public multiplayer requires player-bound authentication and authorization,
 rate limiting, meaningful presence, privacy rules, and an independent
 security review before any network exposure.
@@ -75,3 +98,4 @@ Telnet by default.
 REALM is the independent public engine. Driftspace can later be a separately
 hosted, **private** REALM worldpack; Wreckforge proprietary content must
 not be copied into public REALM code or demo data.
+

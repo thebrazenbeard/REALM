@@ -17,6 +17,7 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
 from .engine import Engine
+from .geography import Geography, MapUnavailable
 
 
 MAX_BODY_BYTES = 4096
@@ -33,6 +34,7 @@ class Gateway:
 
     def __init__(self, db_path: str | Path, *, world_id: str = "demo"):
         self.engine = Engine(db_path)
+        self.geography = Geography(db_path)
         self.world_id = world_id
 
     def _read(self) -> sqlite3.Connection:
@@ -67,6 +69,25 @@ class Gateway:
         if not isinstance(player, str):
             raise ValueError("Player must be a string")
         return {"ok": True, "text": self.engine.act(player, "look"), "cursor": self.cursor()}
+
+    def map(self, player: str) -> dict:
+        """Map for the joined character's persisted room, if one is authored.
+
+        The shared gateway bearer secret is *not* a per-player identity token.
+        Do not expose this route publicly before scoped authentication, fog of
+        war and visibility authorization have been implemented.
+        """
+        if not isinstance(player, str):
+            raise ValueError("Player must be a string")
+        db = self._read()
+        try:
+            row = db.execute("SELECT id,room_id FROM players WHERE id=?", (player,)).fetchone()
+            if row is None:
+                raise ValueError("Join this REALM before reading the map")
+            room_id = row["room_id"]
+        finally:
+            db.close()
+        return {"ok": True, **self.geography.snapshot_for_room(room_id)}
 
     def feed(self, player: str, after: int) -> dict:
         if not isinstance(player, str) or not 0 <= after <= 2**63 - 1:
@@ -199,9 +220,14 @@ class GatewayHandler(BaseHTTPRequestHandler):
                 result = self.server.gateway.feed(player, int(raw_after))
             elif path == "/api/v1/room":
                 result = self.server.gateway.room(params.get("player", [""])[0])
+            elif path == "/api/v1/map":
+                result = self.server.gateway.map(params.get("player", [""])[0])
             else:
                 self._send(404, {"ok": False, "error": "Unknown endpoint"})
                 return
+        except MapUnavailable as error:
+            self._send(404, {"ok": False, "error": str(error)})
+            return
         except ValueError as error:
             self._send(400, {"ok": False, "error": str(error)})
             return
@@ -265,3 +291,4 @@ def main(argv: list[str] | None = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+

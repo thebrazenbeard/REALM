@@ -59,6 +59,42 @@ class GatewayTests(unittest.TestCase):
         self.assertEqual(401, status)
         self.assertFalse(body["ok"])
 
+    def _install_generic_map(self):
+        geo = self.gateway.geography
+        geo.add_place("demo_universe", "Demo universe", "universe")
+        geo.add_place("demo_system", "Demo system", "system", "demo_universe")
+        geo.add_place("demo_planet", "Demo planet", "planet", "demo_system")
+        geo.add_place("demo_region", "Demo region", "region", "demo_planet")
+        geo.add_place("demo_town", "Demo town", "settlement", "demo_region")
+        geo.add_place("atrium", "Demo atrium", "room", "demo_town", x=0, y=0)
+        geo.add_place("corridor", "Demo corridor", "room", "demo_town", x=2, y=0)
+        geo.set_map("demo_town", [".^.", "..~"])
+
+    def test_map_endpoint_does_not_invent_unconfigured_world(self):
+        self.send("/api/v1/join", {"player": "Patrick"})
+        status, payload = self.send("/api/v1/map?player=Patrick", token=False)
+        self.assertEqual(401, status)
+        status, payload = self.send("/api/v1/map?player=Patrick")
+        self.assertEqual(404, status)
+        self.assertIn("No map is configured", payload["error"])
+        status, payload = self.send("/api/v1/map?player=NotJoined")
+        self.assertEqual(400, status)
+
+    def test_map_endpoint_reads_actual_player_room_and_moves(self):
+        self._install_generic_map()
+        self.send("/api/v1/join", {"player": "Patrick"})
+        status, payload = self.send("/api/v1/map?player=Patrick")
+        self.assertEqual(200, status)
+        self.assertTrue(payload["ok"])
+        self.assertEqual("demo_town", payload["space"]["id"])
+        self.assertEqual({"x": 0, "y": 0}, payload["player"])
+        self.assertEqual("forest", payload["tiles"][1]["terrain"])
+        self.send("/api/v1/command", {"player": "Patrick", "command": "north"})
+        status, payload = self.send("/api/v1/map?player=Patrick")
+        self.assertEqual(200, status)
+        self.assertEqual({"x": 2, "y": 0}, payload["player"])
+        self.assertEqual(["atrium", "corridor"], [item["id"] for item in payload["markers"]])
+
     def test_exact_origin_and_preflight(self):
         status, _ = self.send("/api/v1/health", token=False, origin="https://evil.example")
         self.assertEqual(403, status)
@@ -135,3 +171,4 @@ class GatewayTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
