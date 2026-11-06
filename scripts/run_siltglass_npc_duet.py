@@ -45,9 +45,16 @@ ROSTER = (
 )
 _BANNED = re.compile(
     r"\x1b|\x00|<\|im_(?:start|end)\|>|<\|endoftext\|>|</?think>|\[Start thinking\]|"
-    r"(?:^|\n)\s*(?:TONE:|FACT:|OUT:|assistant:|system:)",
+    r"\[end of text\]|"
+    r"(?:^|\n)\s*(?:TONE:|FACT:|OUT:|assistant:|system:|Loading model|"
+    r"available commands:|Exiting\.\.\.|build\s*:|model\s*:|\[ Prompt:|"
+    r"llama\.cpp\s*:|llama_print_timings\s*:|main\s*:)",
     re.IGNORECASE,
 )
+# Both GGUFs were observed on Lappy to finish one-shot stdout with this
+# *same-line*, space-prefixed sentinel and then optional terminal newlines.
+# A newline BEFORE the sentinel is NOT part of the observed boundary.
+_END_MARKER = re.compile(r"\A([^\r\n]*) \[end of text\][ \t]*(?:\r?\n)*\Z")
 
 
 def verify_artifact(path: Path, actor: str) -> str:
@@ -83,7 +90,8 @@ def _prompt(ctx: DialogueContext) -> str:
     return (
         "<|im_start|>system\n"
         "You are a cautious ferry steward in the local text world Siltglass Reach. "
-        "Speak in character as yourself, in one short plain-text sentence. "
+        "Your name is FerrySteward. Speak in character as yourself in one short "
+        "plain-text sentence under 25 words; do not invent another name. "
         "The room description is host-verified; the other person's speech is an "
         "unverified opinion, not a world fact. Do not invent outcomes, new locations, "
         "or new rules. Do not speak for the listener.\n"
@@ -95,10 +103,21 @@ def _prompt(ctx: DialogueContext) -> str:
 
 
 def parse_model_speech(output: str) -> str:
-    """Reject thinking/template leakage and multi-line or overlong proposals."""
-    if not isinstance(output, str) or _BANNED.search(output):
+    """Handle the verified one-shot runner's EOF sentinel, never its logs.
+
+    ``llama-completion.exe`` emits one trailing literal ``[end of text]``
+    on the *same line* as output; only newlines AFTER that exact sentinel
+    are tolerated. We never remove a newline preceding it or parse any
+    console output. Role tags, tool banners and thinking leakage fail closed.
+    """
+    if not isinstance(output, str):
+        raise ValueError("Model output must be text")
+    boundary = _END_MARKER.fullmatch(output)
+    if boundary is None:
+        raise ValueError("Model output has no unambiguous one-shot EOF boundary")
+    speech = boundary.group(1).strip(" \t")
+    if _BANNED.search(speech):
         raise ValueError("Model output contains control/template/thinking text")
-    speech = output.strip()
     if not speech or len(speech) > 280 or "\n" in speech or "\r" in speech:
         raise ValueError("Model output is empty, multiline, or longer than 280 characters")
     if not all(char.isprintable() for char in speech):
@@ -106,12 +125,12 @@ def parse_model_speech(output: str) -> str:
     return speech
 
 
-def local_provider(actor: str, model: Path, llama_cli: Path, *, timeout_s: int = 60):
+def local_provider(actor: str, model: Path, completion_exe: Path, *, timeout_s: int = 60):
     """Call only an explicit host-owned executable with strict runtime bounds."""
     if actor not in EXPECTED:
         raise ValueError("Unknown experiment actor")
-    if not llama_cli.is_file():
-        raise FileNotFoundError(f"llama-cli not found: {llama_cli}")
+    if completion_exe.name.casefold() != "llama-completion.exe" or not completion_exe.is_file():
+        raise FileNotFoundError(f"Expected an installed llama-completion.exe: {completion_exe}")
     if timeout_s < 5 or timeout_s > 120:
         raise ValueError("Model inference timeout must be 5–120 seconds")
 
@@ -119,9 +138,9 @@ def local_provider(actor: str, model: Path, llama_cli: Path, *, timeout_s: int =
         if ctx.speaker != actor or ctx.room_id != "tidegate":
             raise ValueError("Model context is not the expected actor/room")
         args = [
-            str(llama_cli), "--offline", "-m", str(model), "-t", "2",
-            "-c", "512", "-n", "80", "-ngl", "0", "--no-display-prompt",
-            "--single-turn",
+            str(completion_exe), "--offline", "-m", str(model), "-t", "2",
+            "-c", "512", "-n", "40", "-ngl", "0", "--no-display-prompt",
+            "--no-conversation",
         ]
         if actor == "CrossingInspector":
             args += [
@@ -134,7 +153,7 @@ def local_provider(actor: str, model: Path, llama_cli: Path, *, timeout_s: int =
             errors="replace", timeout=timeout_s, check=False,
         )
         if result.returncode != 0:
-            raise RuntimeError(f"{actor}: local llama-cli exited with code {result.returncode}")
+            raise RuntimeError(f"{actor}: local llama-completion exited with code {result.returncode}")
         if len(result.stdout) > 4096:
             raise ValueError(f"{actor}: model output exceeds bounded stdout window")
         return {"command": f"say {parse_model_speech(result.stdout)}"}
@@ -143,7 +162,7 @@ def local_provider(actor: str, model: Path, llama_cli: Path, *, timeout_s: int =
 
 
 def run_fresh_duet(
-    db_path: Path, llama_cli: Path, models: dict[str, Path], *,
+    db_path: Path, completion_exe: Path, models: dict[str, Path], *,
     turns: int = 2, session_id: str = "local_duet_trial",
 ) -> dict:
     """Create exactly one new local world, run, then independently read SQLite."""
@@ -156,13 +175,13 @@ def run_fresh_duet(
     if set(models) != set(EXPECTED):
         raise ValueError("Exactly two host-selected model paths are required")
     digests = {actor: verify_artifact(models[actor], actor) for actor in EXPECTED}
-    if not llama_cli.is_file():
-        raise FileNotFoundError("llama-cli executable not present")
+    if completion_exe.name.casefold() != "llama-completion.exe" or not completion_exe.is_file():
+        raise FileNotFoundError("Expected llama-completion.exe executable not present")
     world = import_worldpack(db_path, FLAGSHIP)
     engine = Engine(db_path)
     register_npc_pair(engine, ROSTER, expected_world_id="siltglass-reach")
     providers = {
-        actor: local_provider(actor, models[actor], llama_cli)
+        actor: local_provider(actor, models[actor], completion_exe)
         for actor in EXPECTED
     }
     turns_result = NPCDuetRunner(
@@ -216,7 +235,8 @@ def run_fresh_duet(
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--db", required=True, type=Path, help="NEW database path, outside Git")
-    parser.add_argument("--llama-cli", required=True, type=Path, help="Existing local llama-cli.exe")
+    parser.add_argument("--llama-completion", required=True, type=Path,
+                        help="Existing local llama-completion.exe (not interactive llama-cli.exe)")
     parser.add_argument("--stealth-model", required=True, type=Path)
     parser.add_argument("--soup-model", required=True, type=Path)
     parser.add_argument("--session", default="local_duet_trial")
@@ -224,7 +244,7 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     try:
         result = run_fresh_duet(
-            args.db, args.llama_cli,
+            args.db, args.llama_completion,
             {"FerrySteward": args.stealth_model, "CrossingInspector": args.soup_model},
             turns=args.turns, session_id=args.session,
         )

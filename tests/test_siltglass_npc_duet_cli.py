@@ -20,7 +20,7 @@ class SiltglassModelAdapterTests(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.work = Path(self.temp.name)
-        self.cli = self.work / "llama-cli.exe"
+        self.cli = self.work / "llama-completion.exe"
         self.cli.write_bytes(b"fake test executable")
         self.models = {
             "FerrySteward": self.work / "stealth-rifle-Q4_K_M.gguf",
@@ -32,10 +32,27 @@ class SiltglassModelAdapterTests(unittest.TestCase):
             "", "hi\nthere", "[Start thinking] maybe", "<think>reason</think>",
             "<|im_start|>assistant", "FACT: something", "OUT: testing",
             "a" * 281, "hi\x1b[31m", "hello\x00world",
+            "[end of text] in a story", "hi [end of text] [end of text]",
+            "Loading model...\nI am a steward.",
+            "available commands:\nI am a steward.",
+            "I am a steward.\n[ Prompt: 100 t/s ]",
+            "> <|im_start|>system\nI am a steward.",
+            "Hello\n[end of text]", "Hello\r\n[end of text]",
+            "Hello\n\n[end of text]", "Hello\n [end of text]",
+            "llama.cpp: context size 512 [end of text]",
+            "main: seed = 123 [end of text]",
+            "llama_print_timings: tokens 80 [end of text]",
+            "Loading model... [end of text]",
+            "Hello [end of text] [end of text]",
+            "Hello [end of text]\nExiting...",
+            "Hello", "Hello [end of text]\nOther line",
         ):
             with self.subTest(text=text), self.assertRaises(ValueError):
                 demo.parse_model_speech(text)
-        self.assertEqual("Crossing not yet inspected.", demo.parse_model_speech(" Crossing not yet inspected. "))
+        self.assertEqual(
+            "Crossing not yet inspected.",
+            demo.parse_model_speech(" Crossing not yet inspected. [end of text]\n\n"),
+        )
 
     def test_prompt_explicitly_distinguishes_room_truth_from_prior_speech(self):
         from realm.conversations import DialogueContext
@@ -58,7 +75,7 @@ class SiltglassModelAdapterTests(unittest.TestCase):
         )
         class FakeResult:
             returncode = 0
-            stdout = "I need the ledger before deciding."
+            stdout = "I need the ledger before deciding. [end of text]\n\n"
         with patch.object(demo.subprocess, "run", return_value=FakeResult()) as launch:
             result = demo.local_provider("CrossingInspector", self.models["CrossingInspector"], self.cli)(context)
         self.assertEqual({"command": "say I need the ledger before deciding."}, result)
@@ -66,6 +83,9 @@ class SiltglassModelAdapterTests(unittest.TestCase):
         self.assertIn("--offline", args)
         self.assertIn("-ngl", args)
         self.assertEqual("0", args[args.index("-ngl") + 1])
+        self.assertIn("--no-conversation", args)
+        self.assertNotIn("--single-turn", args)
+        self.assertEqual("40", args[args.index("-n") + 1])
         self.assertEqual("off", args[args.index("--reasoning") + 1])
         self.assertEqual(60, launch.call_args.kwargs["timeout"])
 
@@ -79,7 +99,7 @@ class SiltglassModelAdapterTests(unittest.TestCase):
         utterances = ["The public slate asks us to report altered paths.",
                       "We must inspect the marks before allowing passage."]
         with patch.object(demo, "verify_artifact", side_effect=["a" * 64, "b" * 64]), \
-             patch.object(demo.subprocess, "run", side_effect=[FakeResult(s) for s in utterances]) as launch:
+             patch.object(demo.subprocess, "run", side_effect=[FakeResult(s + " [end of text]\n\n") for s in utterances]) as launch:
             db_path = self.work / "brand_new.sqlite3"
             result = demo.run_fresh_duet(db_path, self.cli, self.models, turns=2)
         self.assertEqual(2, launch.call_count)
@@ -108,8 +128,8 @@ class SiltglassModelAdapterTests(unittest.TestCase):
         db_path = self.work / "failure_after_one.sqlite3"
         with patch.object(demo, "verify_artifact", return_value="c" * 64), \
              patch.object(demo.subprocess, "run", side_effect=[
-                 FakeResult("We should report the unusual water marks."),
-                 FakeResult("<think>Maybe the river is magic</think>"),
+                 FakeResult("We should report the unusual water marks. [end of text]\n"),
+                 FakeResult("<think>Maybe the river is magic</think> [end of text]\n"),
              ]):
             with self.assertRaisesRegex(ValueError, "thinking"):
                 demo.run_fresh_duet(db_path, self.cli, self.models, turns=2)

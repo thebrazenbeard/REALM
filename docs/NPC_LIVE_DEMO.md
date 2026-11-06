@@ -13,8 +13,13 @@ The entry point `scripts/run_siltglass_npc_duet.py`:
    the checkout. Never overwrites or reuses an existing save or identity.
 3. Imports only the optional, validated Siltglass Reach worldpack and reserves
    two fresh resident names in a transaction.
-4. Calls the owner's `llama-cli` locally, CPU-only, **sequentially**, with a
-   hard 60-second timeout per invocation and at most four total turns. The
+4. Calls the owner's **non-interactive** `llama-completion.exe` locally,
+   CPU-only, **sequentially**, with a hard 60-second timeout per invocation,
+   `--no-conversation`, and at most four total turns. Its separate stderr
+   diagnostics and interactive CLI banners are never interpreted as speech.
+   Only one exact terminal `[end of text]` sentinel is removed from stdout;
+   any internal sentinel, role token, control character or multiline text
+   is rejected. The
    Soup06 role uses `--reasoning off` and its model-specific TONE/FACT/OUT
    prompt. Both model responses are untrusted, one-line speech proposals.
 5. Lets REALM's `NPCDuetRunner` enforce registered identities, current room,
@@ -27,7 +32,7 @@ From an up-to-date source checkout on Windows Lappy, choose a **fresh path**:
 ```powershell
 py -3 .\scripts\run_siltglass_npc_duet.py `
   --db 'D:\VERA\realm-worlds\siltglass-reach\npc-duet-unique-trial.sqlite3' `
-  --llama-cli 'C:\path\to\your\llama-cli.exe' `
+  --llama-completion 'C:\path\to\your\llama-completion.exe' `
   --stealth-model 'D:\VERA\models\realm-npc\stealth-rifle-Q4_K_M.gguf' `
   --soup-model 'D:\VERA\models\realm-npc\npc-voice-soup06.Q5_K_M.gguf' `
   --session local_trial_01 `
@@ -39,7 +44,7 @@ host receipts before claiming live installation. Use a unique database name
 for every fresh experiment. The script refuses existing DBs, including
 partially completed ones, because a live model timeout or unexpected text
 must never trigger blind re-execution against saved state.
-Replace the `llama-cli.exe` placeholder with the actual executable on your
+Replace the `llama-completion.exe` placeholder with the actual executable on your
 own host; do not commit home-directory paths or private local configuration.
 
 For source-only regression with no models or downloads:

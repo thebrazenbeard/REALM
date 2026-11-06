@@ -103,6 +103,12 @@ necessarily correct for every model; soup06 requires `--reasoning off` and its
 documented raw format. A production service, multi-NPC scheduling, substantive
 memory, cross-model benchmarks, and KoboldCPP interoperability remain untested.
 
+For the **ledger-connected duet**, use the separate non-interactive
+`llama-completion.exe` stdout protocol, not the interactive `llama-cli` banner,
+prompt echo, and performance footer. Both were observed locally on Lappy;
+only the former yields a bounded parseable speech channel. The adapter
+rejects untrusted model claims as world authority.
+
 ## Reproducible selection gate
 
 Before saying that any model is a *REALM-qualified NPC*, preserve a receipt
