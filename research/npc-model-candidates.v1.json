@@ -1,0 +1,126 @@
+{
+  "schema": "realm.npc-model-candidates.v1",
+  "review_date_utc": "2026-11-06",
+  "registry_status": "research_only",
+  "weights_in_repository": false,
+  "weights_status_scope": "this_research_workflow_only",
+  "priority_semantics": "research_triage_order_not_measured_quality",
+  "model_card_revision_pinning": "not_performed",
+  "model_artifact_sha256_verification": "not_performed",
+  "discovery_queries": [
+    "https://huggingface.co/models?pipeline_tag=text-generation&num_parameters=min:0,max:1B&sort=likes&search=character",
+    "https://huggingface.co/models?pipeline_tag=text-generation&num_parameters=min:0,max:1B&sort=downloads&search=npc"
+  ],
+  "model_candidates": [
+    {
+      "repo_id": "walter-bd/npc-voice-soup06",
+      "model_card_url": "https://huggingface.co/walter-bd/npc-voice-soup06",
+      "approx_parameters_millions": 600,
+      "license_label_from_card": "apache-2.0",
+      "roles": ["factual_dialogue_renderer"],
+      "available_format_from_card": "GGUF Q5_K_M",
+      "evidence": "model_card_reviewed",
+      "priority": 1,
+      "limitations": [
+        "Author-reported model-judge results are not independent benchmarks.",
+        "Requires its specific TONE/STYLE/HUMOR/RELATION/ROLE/FACT/OUT template with thinking mode disabled.",
+        "A speech renderer may embellish or contradict supplied facts and must not act as world authority."
+      ],
+      "rights_status": "training_source_review_required",
+      "weights_status": "not_downloaded",
+      "host_benchmark_status": "not_run",
+      "qualified_for_real_players": false
+    },
+    {
+      "repo_id": "cloudunity/stealth-rifle",
+      "model_card_url": "https://huggingface.co/cloudunity/stealth-rifle",
+      "approx_parameters_millions": 494,
+      "license_label_from_card": "apache-2.0",
+      "roles": ["open_ended_roleplay_dialogue"],
+      "available_format_from_card": "GGUF Q4_K_M",
+      "evidence": "model_card_reviewed",
+      "priority": 2,
+      "limitations": [
+        "Card warns of role drift, shallow continuity, and player-agency mistakes.",
+        "Training corpus and mature-content behavior require independent rights and safety review.",
+        "Card speed claims have not been reproduced on Lappy or VN1."
+      ],
+      "rights_status": "training_source_review_required",
+      "weights_status": "not_downloaded",
+      "host_benchmark_status": "not_run",
+      "qualified_for_real_players": false
+    },
+    {
+      "repo_id": "walter-bd/npc-voice-v5-sft",
+      "model_card_url": "https://huggingface.co/walter-bd/npc-voice-v5-sft",
+      "approx_parameters_millions": 600,
+      "license_label_from_card": "apache-2.0",
+      "roles": ["factual_dialogue_renderer"],
+      "available_format_from_card": "GGUF Q5_K_M",
+      "evidence": "model_card_reviewed",
+      "priority": 3,
+      "limitations": [
+        "Earlier dialogue renderer is useful as an ablation for soup06, not a demonstrated superior model.",
+        "Card reports hallucination failures; factual accuracy is unverified on REALM episodes."
+      ],
+      "rights_status": "training_source_review_required",
+      "weights_status": "not_downloaded",
+      "host_benchmark_status": "not_run",
+      "qualified_for_real_players": false
+    },
+    {
+      "repo_id": "Felladrin/LittleLamb-293M-RP",
+      "model_card_url": "https://huggingface.co/Felladrin/LittleLamb-293M-RP",
+      "approx_parameters_millions": 293,
+      "license_label_from_card": "apache-2.0",
+      "roles": ["experimental_ultratiny_roleplay"],
+      "available_format_from_card": "GGUF Q4/Q8",
+      "evidence": "model_card_reviewed",
+      "priority": 4,
+      "limitations": [
+        "Author notes weak differentiation between characters and limited cognitive capacity.",
+        "Exact training-corpus provenance is not fully recoverable per model card."
+      ],
+      "rights_status": "training_source_review_required",
+      "weights_status": "not_downloaded",
+      "host_benchmark_status": "not_run",
+      "qualified_for_real_players": false
+    },
+    {
+      "repo_id": "ramankrishna10/npc-nano-0.5b-sft-gguf",
+      "model_card_url": "https://huggingface.co/ramankrishna10/npc-nano-0.5b-sft-gguf",
+      "approx_parameters_millions": 500,
+      "license_label_from_card": "apache-2.0",
+      "roles": ["tiny_general_instruct_baseline"],
+      "available_format_from_card": "GGUF Q4_K_M/Q5_K_M",
+      "evidence": "model_card_reviewed",
+      "priority": 5,
+      "limitations": [
+        "Despite its name, the card does not establish specialized game-character behavior.",
+        "Prompt adherence and host compatibility must be tested rather than inferred from file size."
+      ],
+      "rights_status": "training_source_review_required",
+      "weights_status": "not_downloaded",
+      "host_benchmark_status": "not_run",
+      "qualified_for_real_players": false
+    },
+    {
+      "repo_id": "ggml-org/Qwen3.5-0.8B-GGUF",
+      "model_card_url": "https://huggingface.co/ggml-org/Qwen3.5-0.8B-GGUF",
+      "approx_parameters_millions": 800,
+      "license_label_from_card": "apache-2.0",
+      "roles": ["general_instruct_and_action_proposal_baseline"],
+      "available_format_from_card": "GGUF Q4_0",
+      "evidence": "model_card_reviewed",
+      "priority": 6,
+      "limitations": [
+        "Generic baseline, not a roleplay-specific fine-tune.",
+        "Local runtime/model compatibility, action schema reliability and resource use remain untested."
+      ],
+      "rights_status": "training_source_review_required",
+      "weights_status": "not_downloaded",
+      "host_benchmark_status": "not_run",
+      "qualified_for_real_players": false
+    }
+  ]
+}

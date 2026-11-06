@@ -68,6 +68,11 @@ development servers to the public internet.**
 The model-free [`ResidentController`](docs/RESIDENT_PROPOSALS.md) now gives a
 host one validation boundary for future NPC **action proposals**, but does
 not generate actions or provide resident drives, memories, or autonomous ticks.
+Small local NPC-model options, including Patrick's Hugging Face `character` and
+`npc` searches, are tracked as **research candidates** in
+[`docs/NPC_MODEL_CANDIDATES.md`](docs/NPC_MODEL_CANDIDATES.md) and the offline
+[`research/npc-model-candidates.v1.json`](research/npc-model-candidates.v1.json).
+No weights are bundled, installed or benchmarked by this registry.
 
 The browser uses HTTP polling, not push notifications. Presence still means
 saved room position, not reliable online/offline status.
