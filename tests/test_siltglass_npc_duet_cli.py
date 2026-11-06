@@ -5,6 +5,7 @@ import sqlite3
 import sys
 import tempfile
 import unittest
+from contextlib import closing
 from pathlib import Path
 from unittest.mock import patch
 
@@ -87,7 +88,7 @@ class SiltglassModelAdapterTests(unittest.TestCase):
         self.assertEqual(2, result["durable_event_count"])
         self.assertEqual(2, result["durable_receipt_count"])
         self.assertEqual(utterances, [item["speech"] for item in result["turns"]])
-        with sqlite3.connect(db_path) as db:
+        with closing(sqlite3.connect(db_path)) as db:
             identities = db.execute("SELECT actor FROM npc_actor_registry ORDER BY actor").fetchall()
             events = db.execute("SELECT actor,payload_json FROM events WHERE kind='say' ORDER BY id").fetchall()
         self.assertEqual(2, len(identities))
@@ -112,7 +113,7 @@ class SiltglassModelAdapterTests(unittest.TestCase):
              ]):
             with self.assertRaisesRegex(ValueError, "thinking"):
                 demo.run_fresh_duet(db_path, self.cli, self.models, turns=2)
-        with sqlite3.connect(db_path) as db:
+        with closing(sqlite3.connect(db_path)) as db:
             event_count = db.execute("SELECT COUNT(*) FROM events WHERE kind='say'").fetchone()[0]
             receipt_count = db.execute("SELECT COUNT(*) FROM action_receipts").fetchone()[0]
         self.assertEqual(1, event_count)
