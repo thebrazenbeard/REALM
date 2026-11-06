@@ -97,13 +97,13 @@ def classify_event(
     """
     if (type(event_id) is not int or event_id <= 0
             or not isinstance(kind, str) or not _KIND.fullmatch(kind)
-            or not isinstance(actor, str) or not actor
-            or (room_id is not None and (not isinstance(room_id, str) or not room_id))
+            or not isinstance(actor, str) or not actor.strip()
+            or (room_id is not None and (not isinstance(room_id, str) or not room_id.strip()))
             or type(explicit_public_consent) is not bool
             or type(memory_consent) is not bool
             or not isinstance(witnessed_ids, frozenset)
             or not isinstance(recipient_ids, frozenset)
-            or any(not isinstance(x, str) or not x for x in witnessed_ids | recipient_ids)):
+            or any(not isinstance(x, str) or not x.strip() for x in witnessed_ids | recipient_ids)):
         raise VisibilityPolicyError("Invalid host event-audience metadata")
     if visibility is None:
         if kind in {"private_message", "whisper", "tell"}:
@@ -124,12 +124,14 @@ def classify_event(
     elif explicit_public_consent:
         raise VisibilityPolicyError("Public consent flag without a public event class")
     if visibility is Visibility.WITNESSED_ROOM:
-        if room_id is None or not witnessed_ids:
+        if room_id is None or not witnessed_ids or recipient_ids:
             raise VisibilityPolicyError("Witnessed event needs event-time room and witnesses")
     if visibility is Visibility.PRIVATE_MESSAGE and not recipient_ids:
         raise VisibilityPolicyError("Private event needs explicit recipients")
-    if visibility is Visibility.MODERATION_LEDGER and memory_consent:
-        raise VisibilityPolicyError("Moderation ledger is not NPC-memory material")
+    if visibility is Visibility.MODERATION_LEDGER and (
+        memory_consent or recipient_ids or witnessed_ids
+    ):
+        raise VisibilityPolicyError("Moderation ledger cannot carry gameplay or NPC-memory grants")
     return EventAudience(
         world_id=policy.world_id, event_id=event_id, kind=kind,
         actor=actor, visibility=visibility, policy_revision=policy.revision,
@@ -139,33 +141,63 @@ def classify_event(
     )
 
 
+def _valid_record_shape(policy: WorldVisibilityPolicy, record: EventAudience | None) -> bool:
+    """Revalidate *read-side* data independent of the proposal classifier.
+
+    Durable storage, migrations and test fixtures can construct EventAudience
+    without ever calling `classify_event`. An impossible record must not be
+    interpreted using only the most permissive of its contradictory fields.
+    """
+    if (not isinstance(policy, WorldVisibilityPolicy)
+            or not isinstance(record, EventAudience)
+            or record.world_id != policy.world_id
+            or record.policy_revision != policy.revision
+            or type(record.event_id) is not int or record.event_id <= 0
+            or not isinstance(record.kind, str) or not _KIND.fullmatch(record.kind)
+            or not isinstance(record.actor, str) or not record.actor.strip()
+            or (record.room_id is not None
+                and (not isinstance(record.room_id, str) or not record.room_id.strip()))
+            or not isinstance(record.visibility, Visibility)
+            or type(record.explicitly_public) is not bool
+            or type(record.memory_consent) is not bool
+            or type(record.revoked_all) is not bool
+            or record.revoked_all
+            or not isinstance(record.witnessed_ids, frozenset)
+            or not isinstance(record.recipient_ids, frozenset)
+            or not isinstance(record.revoked_ids, frozenset)
+            or any(not isinstance(x, str) or not x.strip()
+                   for x in record.witnessed_ids | record.recipient_ids | record.revoked_ids)
+            or (record.kind in {"moderation", "moderation_note", "ban_audit"}
+                and record.visibility is not Visibility.MODERATION_LEDGER)
+            or (record.kind in {"private_message", "whisper", "tell"}
+                and record.visibility is not Visibility.PRIVATE_MESSAGE)):
+        return False
+    if record.visibility is Visibility.PUBLIC_CHRONICLE:
+        return record.explicitly_public is True and not record.recipient_ids
+    if record.explicitly_public:
+        return False
+    if record.visibility is Visibility.WITNESSED_ROOM:
+        return bool(record.room_id and record.witnessed_ids and not record.recipient_ids)
+    if record.visibility is Visibility.PRIVATE_MESSAGE:
+        return bool(record.recipient_ids)
+    if record.visibility is Visibility.MODERATION_LEDGER:
+        return not record.memory_consent and not record.recipient_ids and not record.witnessed_ids
+    return False
+
+
 def can_read_event(
     policy: WorldVisibilityPolicy, record: EventAudience | None,
     viewer: ViewerGrant,
 ) -> bool:
     """Read-only decision; no existing Gateway endpoint invokes this yet."""
-    if (not isinstance(record, EventAudience)
+    if (not _valid_record_shape(policy, record)
             or not isinstance(viewer, ViewerGrant)
-            or record.world_id != policy.world_id
             or viewer.world_id != policy.world_id
-            or record.policy_revision != policy.revision
-            or type(record.event_id) is not int or record.event_id <= 0
-            or not isinstance(record.actor, str) or not record.actor
-            or not isinstance(viewer.principal, str) or not viewer.principal
+            or not isinstance(viewer.principal, str) or not viewer.principal.strip()
             or viewer.world_member is not True
             or not isinstance(viewer.purpose, ReadPurpose)
-            or not isinstance(record.visibility, Visibility)
-            or not isinstance(record.witnessed_ids, frozenset)
-            or not isinstance(record.recipient_ids, frozenset)
-            or any(not isinstance(x, str) or not x
-                   for x in record.witnessed_ids | record.recipient_ids)
-            or (record.kind in {"moderation", "moderation_note", "ban_audit"}
-                and record.visibility is not Visibility.MODERATION_LEDGER)
-            or (record.kind in {"private_message", "whisper", "tell"}
-                and record.visibility is not Visibility.PRIVATE_MESSAGE)
-            or record.revoked_all is not False
-            or not isinstance(record.revoked_ids, frozenset)
-            or not isinstance(viewer.capabilities, frozenset)):
+            or not isinstance(viewer.capabilities, frozenset)
+            or any(not isinstance(x, str) or not x.strip() for x in viewer.capabilities)):
         return False
     viewer_id = viewer.principal.casefold()
     if viewer_id in {x.casefold() for x in record.revoked_ids if isinstance(x, str)}:
@@ -208,6 +240,6 @@ def revoke_event_access(record: EventAudience, *, principal: str | None = None) 
 
     if principal is None:
         return replace(record, revoked_all=True)
-    if not isinstance(principal, str) or not principal:
+    if not isinstance(principal, str) or not principal.strip():
         raise VisibilityPolicyError("Revocation principal required")
     return replace(record, revoked_ids=record.revoked_ids | {principal.casefold()})
