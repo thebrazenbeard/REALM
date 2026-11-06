@@ -37,6 +37,14 @@ The gateway must still enforce authentication, permissions, and exact-origin
 CORS. **A token in a browser is accessible to the local user and browser
 extensions**; do not regard this design as hardened internet deployment.
 
+Disconnect aborts outstanding browser HTTP requests and clears the in-memory
+session credential. Delayed responses from an old connection cannot create a
+new polling loop, append errors to a rejoined player's transcript, or reset the
+controls for a newer connection. Concurrent join attempts are ignored while
+one is in flight. **Aborting
+the browser request does not roll back a command that the host may have already
+committed.** The host action-ID replay guard remains authoritative for retries.
+
 Only output returned by the gateway can populate live world fields. Remote
 text is added through `textContent`, never parsed as HTML. The room and feed
 must represent only the connected character's authorized knowledge, enforced
@@ -116,6 +124,13 @@ the authenticated player may still see author-defined markers they should not
 know. The optional map endpoint is implemented in the combined gateway
 integration candidate, not by static Pages hosting itself.
 
+The `player` field can explicitly be `null` when the host provides an
+authorized viewport that does not contain the player. The browser still renders
+the host's tiles, reports **Player outside viewport**, and does not invent an
+`@` location. A missing or malformed `player` field is rejected as a protocol
+error. Blank cells are announced to assistive technology as unknown or hidden,
+not necessarily unexplored.
+
 Security improvement: the browser rejects HTTP host URLs except loopback
 (`localhost`, `127.0.0.1`, `[::1]`), even if the page was opened locally.
 Remote hosts require HTTPS before sending a token.
@@ -148,7 +163,8 @@ browser controller's join, map, movement, disconnect, and wrong-token paths
 through real HTTP requests. The subprocess is terminated and temporary data
 is removed after the test.
 
-Executed against the integrated REALM candidate:
-**13/13 Node tests passed** (including live Python gateway). This is stronger
+The browser suite includes the null-player viewport compatibility regression
+and stale-session cancellation tests. The executed suite includes a live Python
+gateway integration test. This is stronger
 than independent mocks but **still not a Chromium/Firefox rendering test**, nor
 production authentication, remote HTTPS qualification, deployment or publication.

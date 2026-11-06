@@ -65,7 +65,13 @@
       const key = `${x},${y}`;
       if (!markers.has(key)) markers.set(key, safeText(marker.kind, 40));
     }
-    const player = point(payload.player, width, height, "player");
+    // The geography API explicitly uses null when the player is outside this
+    // authorized viewport (or when producing an observer-only snapshot).
+    // Missing and malformed fields are still protocol errors.
+    if (!Object.prototype.hasOwnProperty.call(payload, "player")) {
+      throw new Error("Invalid player coordinates in host map.");
+    }
+    const player = payload.player === null ? null : point(payload.player, width, height, "player");
     const legend = Array.isArray(payload.legend) ? payload.legend.slice(0, 32).map((item) => ({
       glyph: glyph(item.glyph), terrain: safeText(item.terrain, 50),
     })) : [];
@@ -85,7 +91,7 @@
       for (let x = 0; x < map.width; x++) {
         const tile = map.rows[y][x];
         const marker = map.markers.get(`${x},${y}`);
-        const isPlayer = x === map.player.x && y === map.player.y;
+        const isPlayer = map.player !== null && x === map.player.x && y === map.player.y;
         const cell = doc.createElement("span");
         const terrain = tile ? tile.terrain.toLowerCase() : "unknown";
         cell.className = "map-cell" + (TERRAIN_CLASSES.has(terrain) ? ` map-${terrain}` : "") +
@@ -94,7 +100,7 @@
           Object.prototype.hasOwnProperty.call(MARKER_GLYPHS, marker) ? MARKER_GLYPHS[marker] : "*"
         ) : (tile ? tile.glyph : " "));
         cell.setAttribute("role", "gridcell");
-        cell.setAttribute("aria-label", `${x},${y}: ${isPlayer ? "your position" : marker || (tile ? terrain : "unexplored")}`);
+        cell.setAttribute("aria-label", `${x},${y}: ${isPlayer ? "your position" : marker || (tile ? terrain : "unknown or hidden")}`);
         row.append(cell);
       }
       fragment.append(row);
@@ -102,12 +108,14 @@
     elements.grid.replaceChildren(fragment);
     elements.grid.setAttribute("aria-label", `${map.space.name} map, ${map.width} columns by ${map.height} rows`);
     elements.space.textContent = `${map.space.name} / ${map.space.kind}`;
-    elements.position.textContent = `@ ${map.player.x},${map.player.y}`;
+    elements.position.textContent = map.player === null
+      ? "Player outside viewport" : `@ ${map.player.x},${map.player.y}`;
     elements.status.textContent = `LIVE HOST MAP · ${map.width}×${map.height}`;
     elements.status.classList.add("is-live");
     elements.note.textContent = "The host controls visibility. Blank cells are unexplored or withheld.";
     const legend = map.legend.map((entry) => `${entry.glyph} ${entry.terrain}`).join("  ·  ");
-    elements.legend.textContent = legend ? `@ you  ·  ${legend}` : "@ you  ·  * other marker";
+    const playerLegend = map.player === null ? "" : "@ you";
+    elements.legend.textContent = [playerLegend, legend || "* other marker"].filter(Boolean).join("  ·  ");
     return map;
   }
 

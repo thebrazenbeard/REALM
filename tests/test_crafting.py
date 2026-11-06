@@ -1,6 +1,7 @@
 """Host-side persistence, contention and resource-economy regression tests."""
 
 import sqlite3
+from contextlib import closing
 import sys
 import tempfile
 import unittest
@@ -69,7 +70,7 @@ class CraftingTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "different command"):
             self.crafting.perform("Patrick", "gather stone", action_id="tx-2")
         self.assertIn("field knife x1", self.crafting.perform("Patrick", "resources"))
-        with sqlite3.connect(self.db_path) as db:
+        with closing(sqlite3.connect(self.db_path)) as db, db:
             self.assertEqual(1, db.execute("SELECT COUNT(*) FROM events WHERE kind='craft'").fetchone()[0])
 
     def test_duplicate_recipe_definition_identical_is_safe_but_conflict_rejected(self):
@@ -91,7 +92,7 @@ class CraftingTests(unittest.TestCase):
             outputs = list(pool.map(take, ["Patrick", "Vera"]))
         self.assertEqual(1, sum("x9" in output for output in outputs))
         self.assertEqual(1, sum("No wood remains" in output for output in outputs))
-        with sqlite3.connect(self.db_path) as db:
+        with closing(sqlite3.connect(self.db_path)) as db, db:
             left = db.execute("SELECT remaining FROM gathering_nodes WHERE room_id='corridor' AND material='wood'").fetchone()[0]
             total = db.execute("SELECT SUM(quantity) FROM material_pouches WHERE material='wood'").fetchone()[0]
         self.assertEqual((0, 9), (left, total))

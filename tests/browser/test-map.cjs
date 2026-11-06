@@ -77,6 +77,26 @@ test("renders player position, marker and terrain as inert text nodes", () => {
   assert.equal(els.legend.textContent, "@ you  ·  ^ trees");
 });
 
+test("renders a valid host map when the player is outside its viewport", () => {
+  const doc = { createElement: element, createDocumentFragment: element };
+  const els = { grid: element(), space: element(), position: element(), status: element(), note: element(), legend: element() };
+  const data = fixture(); data.player = null;
+  const parsed = map.renderMap(doc, els, data);
+  assert.equal(parsed.player, null);
+  const row = els.grid.children[0].children[0];
+  assert.equal(row.children[1].textContent, "^");
+  assert.equal(els.status.textContent, "LIVE HOST MAP · 3×2");
+  assert.match(els.position.textContent, /outside/i);
+  assert.doesNotMatch(els.legend.textContent, /@ you/);
+});
+
+test("a missing or invalid player field is not silently accepted as outside the viewport", () => {
+  const absent = fixture(); delete absent.player;
+  assert.throws(() => map.validateMap(absent), /player coordinates/);
+  const invalid = fixture(); invalid.player = { x: "1", y: 0 };
+  assert.throws(() => map.validateMap(invalid), /player coordinates/);
+});
+
 test("unavailable map explicitly clears the previous world snapshot", () => {
   const els = { grid: element(), space: element(), position: element(), status: element(), note: element(), legend: element() };
   els.grid.append(element());

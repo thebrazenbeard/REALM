@@ -8,19 +8,22 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sqlite3
+from contextlib import closing
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
 from .auth import CredentialStore
-from .engine import Engine
+from .engine import Engine, _SEED_EXITS, _SEED_ITEMS, _SEED_ROOMS, _pristine_schema, _schema_snapshot
 from .geography import Geography, MapUnavailable
 from .router import CommandRouter
 
 
 MAX_BODY_BYTES = 4096
 MAX_FEED_EVENTS = 100
+_WORLD_ID = re.compile(r"^[A-Za-z][A-Za-z0-9_-]{0,63}$")
 
 
 class Gateway:
@@ -31,12 +34,69 @@ class Gateway:
     APIs; this is not public account registration or session management.
     """
 
-    def __init__(self, db_path: str | Path, *, world_id: str = "demo"):
+    def __init__(
+        self, db_path: str | Path, *, world_id: str = "demo",
+        adopt_unbound_world: bool = False,
+    ):
+        if not isinstance(world_id, str) or not _WORLD_ID.fullmatch(world_id):
+            raise ValueError("world_id must start with a letter and contain 1–64 letters, digits, '_' or '-'")
         self.engine = Engine(db_path)
+        self._bind_world_id(world_id, adopt_unbound_world=adopt_unbound_world)
         self.geography = Geography(db_path)
         self.router = CommandRouter(self.engine)
         self.credentials = CredentialStore(self.engine)
         self.world_id = world_id
+
+    def _bind_world_id(self, world_id: str, *, adopt_unbound_world: bool) -> None:
+        """Persist the host's world identity before any gateway can serve it.
+
+        This check is transactional across competing gateway processes. An old
+        unbound database containing gameplay history cannot be silently
+        relabeled; only an explicit local operator adoption may bind it.
+        """
+        with closing(self.engine._connect()) as db, db:
+            db.execute("BEGIN IMMEDIATE")
+            bound = db.execute(
+                "SELECT value FROM world_meta WHERE key='world_id'"
+            ).fetchone()
+            if bound is not None:
+                if bound[0] != world_id:
+                    raise ValueError("world database is already bound to a different world_id")
+                return
+            if self._has_unbound_world_data(db) and not adopt_unbound_world:
+                raise ValueError("unbound existing world database requires explicit local adoption")
+            db.execute(
+                "INSERT INTO world_meta (key,value) VALUES ('world_id',?)", (world_id,)
+            )
+
+    @staticmethod
+    def _has_unbound_world_data(db: sqlite3.Connection) -> bool:
+        """Detect played *or authored* state in a legacy unbound database.
+
+        A pristine engine creates only generic seed rooms/exits/items. Even
+        unplayed authored fiction, provisioned tokens or future plugin tables
+        must require deliberate operator adoption instead of silent relabeling.
+        """
+        for table in ("players", "events", "action_receipts", "world_meta"):
+            if db.execute(f"SELECT EXISTS(SELECT 1 FROM {table})").fetchone()[0]:
+                return True
+        seeded = (
+            ("rooms", "id,name,description", _SEED_ROOMS),
+            ("exits", "room_id,direction,destination", _SEED_EXITS),
+            ("items", "id,name,description,room_id", _SEED_ITEMS),
+        )
+        for table, columns, expected in seeded:
+            if sorted(tuple(row) for row in db.execute(f"SELECT {columns} FROM {table}")) != sorted(expected):
+                return True
+        # The complete stored schema must match the one generated from the
+        # same core DDL, not merely known names. This rejects added columns,
+        # constraints, rewritten built-in indexes, triggers and views.
+        if _schema_snapshot(db) != _pristine_schema():
+            return True
+        # sqlite_sequence may keep evidence even after events were deleted.
+        if db.execute("SELECT EXISTS(SELECT 1 FROM sqlite_sequence)").fetchone()[0]:
+            return True
+        return False
 
     def _read(self) -> sqlite3.Connection:
         conn = sqlite3.connect(str(self.engine.db_path), timeout=10)
@@ -301,6 +361,10 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="REALM local-only JSON gateway (prototype)")
     parser.add_argument("--db", type=Path, default=Path("realm.sqlite3"))
     parser.add_argument("--world-id", default="demo")
+    parser.add_argument(
+        "--adopt-unbound-world", action="store_true",
+        help="Explicitly bind an existing pre-identity world database to --world-id (local operator only)",
+    )
     parser.add_argument("--port", type=int, default=8768)
     parser.add_argument("--demo-crafting", action="store_true", help="Install optional noncanonical gathering and recipe fixtures")
     parser.add_argument(
@@ -312,7 +376,10 @@ def main(argv: list[str] | None = None) -> int:
     operator.add_argument("--rotate-player", metavar="PLAYER", help="Rotate a player token locally, then exit")
     operator.add_argument("--revoke-player", metavar="PLAYER", help="Revoke a player token locally, then exit")
     args = parser.parse_args(argv)
-    gateway = Gateway(args.db, world_id=args.world_id)
+    gateway = Gateway(
+        args.db, world_id=args.world_id,
+        adopt_unbound_world=args.adopt_unbound_world,
+    )
     if args.provision_player:
         print(f"New token for {args.provision_player}: {gateway.credentials.provision(args.provision_player)}")
         return 0

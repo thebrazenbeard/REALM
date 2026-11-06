@@ -3,6 +3,7 @@
 import json
 import http.client
 import sqlite3
+from contextlib import closing
 import sys
 import tempfile
 import threading
@@ -63,7 +64,8 @@ class GatewayTests(unittest.TestCase):
             with request.urlopen(req, timeout=3) as response:
                 return response.status, json.loads(response.read() or b"{}")
         except error.HTTPError as exc:
-            return exc.code, json.loads(exc.read())
+            with closing(exc):
+                return exc.code, json.loads(exc.read())
 
     def test_health_and_authentication(self):
         self.assertEqual((200, {"ok": True, "world_id": "sandbox"}), self.send("/api/v1/health", token=False))
@@ -192,12 +194,12 @@ class GatewayTests(unittest.TestCase):
     def test_restart_reads_same_persisted_state(self):
         self.send("/api/v1/join", {"player": "Patrick"})
         self.send("/api/v1/command", {"player": "Patrick", "command": "north"})
-        other = Gateway(self.db)
+        other = Gateway(self.db, world_id="sandbox")
         self.assertIn("Corridor", other.room("Patrick")["text"])
 
     def test_concurrent_first_join_one_identity_is_stable(self):
         with ThreadPoolExecutor(max_workers=2) as pool:
-            results = list(pool.map(lambda _: Gateway(self.db).join("Patrick"), range(2)))
+            results = list(pool.map(lambda _: Gateway(self.db, world_id="sandbox").join("Patrick"), range(2)))
         self.assertEqual(2, len(results))
         self.assertEqual(1, sum("Welcome, Patrick." in item["text"] for item in results))
         self.assertEqual(1, sum("Welcome back, Patrick." in item["text"] for item in results))
@@ -237,17 +239,17 @@ class GatewayTests(unittest.TestCase):
 
     def test_credential_rotation_revoke_and_no_plaintext_storage(self):
         first = self.player_tokens["Patrick"]
-        with sqlite3.connect(self.db) as connection:
+        with closing(sqlite3.connect(self.db)) as connection, connection:
             stored = connection.execute("SELECT token_digest FROM player_credentials WHERE player_name='Patrick'").fetchone()[0]
         self.assertNotEqual(first, stored)
         self.assertNotIn(first, stored)
         with self.assertRaises(ValueError):
             self.gateway.credentials.provision("Patrick")
         rotated = self.gateway.credentials.rotate("patrick")
-        self.assertIsNone(Gateway(self.db).credentials.authenticate(first))
-        self.assertEqual("Patrick", Gateway(self.db).credentials.authenticate(rotated))
+        self.assertIsNone(Gateway(self.db, world_id="sandbox").credentials.authenticate(first))
+        self.assertEqual("Patrick", Gateway(self.db, world_id="sandbox").credentials.authenticate(rotated))
         self.assertTrue(self.gateway.credentials.revoke("PATRICK"))
-        self.assertIsNone(Gateway(self.db).credentials.authenticate(rotated))
+        self.assertIsNone(Gateway(self.db, world_id="sandbox").credentials.authenticate(rotated))
 
     def test_shared_process_secret_no_longer_authorizes_gameplay(self):
         self.send("/api/v1/join", {"player": "Patrick"})
@@ -260,6 +262,7 @@ class GatewayTests(unittest.TestCase):
         with self.assertRaises(error.HTTPError) as raised:
             request.urlopen(req, timeout=3)
         self.assertEqual(401, raised.exception.code)
+        raised.exception.close()
 
 
 if __name__ == "__main__":

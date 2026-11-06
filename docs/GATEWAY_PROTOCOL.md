@@ -40,6 +40,16 @@ PYTHONPATH=src python -m realm.gateway \
 The obsolete process-wide `REALM_GATEWAY_TOKEN` no longer authorizes gameplay.
 The `GatewayServer` constructor no longer accepts a world-wide token parameter.
 
+The first gateway opening a new SQLite file transactionally binds its
+`--world-id` into the database's `world_meta`. Every later gateway reopening
+that file **must** supply the same identity; changing only the HTTP label can
+never turn an existing player's world into a different REALM. A pre-upgrade
+database that already contains player/event history but has no binding fails
+closed until the local owner reviews it and explicitly runs the intended
+`--world-id` with `--adopt-unbound-world` **once**. That flag never overrides
+an existing different binding. Back up any valued local data before adoption;
+this is administrative metadata migration, not an inter-world import or merge.
+
 The server listens on `127.0.0.1` only, regardless of flags. Host your
 static HTML locally for initial testing. A GitHub Pages site can host HTML,
 CSS, and JavaScript but **cannot execute the Python game host**. An actual

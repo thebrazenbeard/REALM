@@ -14,7 +14,8 @@ import re
 from pathlib import Path
 from typing import Any
 
-from .engine import Engine, _SEED_EXITS, _SEED_ITEMS, _SEED_ROOMS
+from .auth import _CREDENTIAL_SCHEMA_SQL
+from .engine import Engine, _SEED_EXITS, _SEED_ITEMS, _SEED_ROOMS, _pristine_schema, _schema_snapshot
 
 
 SCHEMA = "realm.worldpack.v1"
@@ -166,9 +167,30 @@ def import_worldpack(db_path: str | Path, worldpack_path: str | Path) -> dict:
             if old_hash[0] != digest:
                 raise WorldpackError("A different worldpack is already installed; existing world state is protected")
             return {"world_id": pack["world_id"], "sha256": digest, "unchanged": True}
+        existing_world_id = db.execute(
+            "SELECT value FROM world_meta WHERE key='world_id'"
+        ).fetchone()
+        if existing_world_id is not None and existing_world_id[0] != pack["world_id"]:
+            raise WorldpackError(
+                "World database is already bound to another world_id; create a fresh database for this pack"
+            )
         if any(db.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0] for table in
                ("players", "events", "action_receipts")):
             raise WorldpackError("The demo world has player or event history; import requires a pristine world")
+        credential_table = db.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='player_credentials'"
+        ).fetchone()
+        if credential_table is not None and db.execute(
+            "SELECT EXISTS(SELECT 1 FROM player_credentials)"
+        ).fetchone()[0]:
+            raise WorldpackError("The demo world has provisioned credentials; import before provisioning players")
+        expected_schema = _pristine_schema(
+            _CREDENTIAL_SCHEMA_SQL if credential_table is not None else ""
+        )
+        if _schema_snapshot(db) != expected_schema:
+            raise WorldpackError("The demo world has custom SQL schema objects; refusing import")
+        if db.execute("SELECT EXISTS(SELECT 1 FROM sqlite_sequence)").fetchone()[0]:
+            raise WorldpackError("The demo world has past event IDs; import requires a pristine world")
         present_rooms = [tuple(row) for row in db.execute("SELECT id,name,description FROM rooms ORDER BY id")]
         present_exits = [tuple(row) for row in db.execute("SELECT room_id,direction,destination FROM exits ORDER BY room_id,direction")]
         present_items = [tuple(row) for row in db.execute(
@@ -193,9 +215,11 @@ def import_worldpack(db_path: str | Path, worldpack_path: str | Path) -> dict:
             [(item["id"], item["name"], item["description"], item["room"]) for item in pack["items"]],
         )
         db.executemany("INSERT INTO world_meta(key,value) VALUES(?,?)", [
-            ("schema", SCHEMA), ("world_id", pack["world_id"]), ("name", pack["name"]),
+            ("schema", SCHEMA), ("name", pack["name"]),
             ("start_room", pack["start_room"]), ("worldpack_sha256", digest),
         ])
+        if existing_world_id is None:
+            db.execute("INSERT INTO world_meta(key,value) VALUES('world_id',?)", (pack["world_id"],))
     return {"world_id": pack["world_id"], "sha256": digest, "unchanged": False}
 
 

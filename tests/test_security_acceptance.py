@@ -7,6 +7,7 @@ qualification. Network exposure, token expiry and fog of war remain blocked.
 from __future__ import annotations
 
 import json
+from contextlib import closing
 import sys
 import tempfile
 import threading
@@ -61,7 +62,8 @@ class SecurityAcceptanceTests(unittest.TestCase):
             with request.urlopen(req, timeout=3) as response:
                 return response.status, json.load(response)
         except error.HTTPError as exception:
-            return exception.code, json.load(exception)
+            with closing(exception):
+                return exception.code, json.load(exception)
 
     def test_gateway_binds_only_to_loopback(self):
         self.assertEqual("127.0.0.1", self.server.server_address[0])

@@ -1,9 +1,30 @@
-# REALM — a reusable, local-first MUD engine
+# REALM — Roleplaying Engine for Autonomous Living MUDs
+
+## Product vision (target capabilities)
+
+> REALM (Roleplaying Engine for Autonomous Living MUDs) transforms static text
+> worlds into living ecosystems. Replacing rigid scripts with neural agents, it
+> features persistent state, dynamic drives, and deep memory. Players explore
+> an ever-evolving world, co-creating dynamic history alongside autonomous NPCs
+> in real time.
+
+**This is not a list of completed features.** In the
+current release, the deterministic engine validates and commits gameplay.
+Neural NPCs will eventually *propose* actions, but will never acquire authority
+to bypass world rules or write directly to the state database. See
+[`docs/ROADMAP.md`](docs/ROADMAP.md) for implemented versus planned milestones.
 
 This is an original **Python/SQLite text-world prototype** with local terminal,
 loopback HTTP, loopback Telnet, and a static browser console. It is deliberately
 independent of any one fictional setting. The previous README was a speculative
 concept document, not binding canon or an implemented feature list.
+
+**Players and creators:** Author your own isolated worldpack, import it into a
+fresh SQLite instance, and play with multiple local clients. The setting-neutral
+engine does not depend on its example worlds. Inviting players over a remote
+network needs a separately qualified encrypted access path; the current gateways
+are not safe to expose directly to the internet. Optional AI co-players are
+under development, not yet live NPCs in the shipped prototype.
 
 Patrick's intended separation: **REALM** is the public engine; **Driftspace** is
 a distinct private world Patrick can host as a REALM instance. Driftspace canon,
@@ -14,7 +35,7 @@ generic worldpack importer exists; a canonical Driftspace worldpack does not.
 
 The current integration candidate supports:
 
-- Separate persistent worlds: each SQLite file is a world, seeded with three deliberately **noncanonical demo rooms**.
+- Separate persistent worlds: each SQLite file is a world, seeded with three deliberately **noncanonical demo rooms**. The loopback gateway persists its `world_id` binding and rejects an attempt to relabel an existing database (see `docs/GATEWAY_PROTOCOL.md` for legacy adoption).
 - Player names and persistent positions across restarts. Presence is their **last saved location**, not proof they are currently online.
 - Room descriptions and exits; movement; item take/drop/inventory (with transaction-level contention); player presence and shared room history.
 - Durable player speech, readable by others with `listen`/`history`.
@@ -23,6 +44,8 @@ The current integration candidate supports:
 - One terminal client per player, using the same database path, with stdlib-only runtime dependencies.
 - Versioned worldpack validation/import with a generic shore example; existing
   played worlds cannot be silently replaced (see `WORLDPACKS.md`).
+- An offline worldpack authoring CLI (`python -m realm.builder`) to create rooms,
+  link exits, and place initial items without editing engine code.
 - Persistent authored geography (systems, planets, settlements), bounded 2D
   ASCII terrain, weighted routes, and explicit spacecraft ticks.
 - Resource gathering in bounded batches, recipes, persistent structures,
@@ -41,6 +64,10 @@ automatic simulation ticks, inter-world portals, combat, moderation,
 distributed state, or the canonical Driftspace setting. Local CLI/Telnet names
 are not durable authenticated account identities. **Do not expose these
 development servers to the public internet.**
+
+The model-free [`ResidentController`](docs/RESIDENT_PROPOSALS.md) now gives a
+host one validation boundary for future NPC **action proposals**, but does
+not generate actions or provide resident drives, memories, or autonomous ticks.
 
 The browser uses HTTP polling, not push notifications. Presence still means
 saved room position, not reliable online/offline status.
@@ -80,6 +107,12 @@ node --test tests/browser/test-map.cjs tests/browser/test-client.cjs
 ```
 
 On Windows PowerShell use `$env:PYTHONPATH = 'src'` before running `python -m realm`.
+
+To create your **own** world, start with the guarded offline builder in
+[`WORLDPACKS.md`](WORLDPACKS.md). To try the separate, original 24-room flagship
+showcase, see [Siltglass Reach](worlds/flagship/siltglass-reach/README.md).
+Each world runs from its **own SQLite file**; sharing a database path is how
+local players share *one* world, not how unrelated world owners share state.
 
 ## Architecture boundary
 
