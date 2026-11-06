@@ -4,6 +4,7 @@ from pathlib import Path
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
@@ -45,6 +46,13 @@ class BuilderTests(unittest.TestCase):
         with self.assertRaises(FileExistsError):
             new_world(self.pack, "changed", "Changed", "start", "Start", "Changed.")
         self.assertEqual(original, self.pack.read_bytes())
+
+    def test_failed_atomic_new_does_not_leave_partial_target(self):
+        with patch("realm.builder.os.link", side_effect=OSError("unsupported filesystem")):
+            with self.assertRaisesRegex(OSError, "unsupported filesystem"):
+                self.create()
+        self.assertFalse(self.pack.exists())
+        self.assertEqual([], list(self.root.glob(".realm-pack-*.tmp")))
 
     def test_failed_edits_do_not_modify_worldpack(self):
         self.create()

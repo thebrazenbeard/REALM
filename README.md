@@ -1,12 +1,14 @@
 # REALM — Roleplaying Engine for Autonomous Living MUDs
 
+## Product vision (target capabilities)
+
 > REALM (Roleplaying Engine for Autonomous Living MUDs) transforms static text
 > worlds into living ecosystems. Replacing rigid scripts with neural agents, it
 > features persistent state, dynamic drives, and deep memory. Players explore
 > an ever-evolving world, co-creating dynamic history alongside autonomous NPCs
 > in real time.
 
-**This is the product vision, not a list of completed features.** In the
+**This is not a list of completed features.** In the
 current release, the deterministic engine validates and commits gameplay.
 Neural NPCs will eventually *propose* actions, but will never acquire authority
 to bypass world rules or write directly to the state database. See

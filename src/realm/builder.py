@@ -22,12 +22,7 @@ def _save(path: Path, pack: dict, *, new: bool = False) -> None:
     data = (json.dumps(normalized, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
     if len(data) > 512 * 1024:
         raise WorldpackError("Authored worldpack exceeds the importer file-size limit")
-    if new:
-        # Exclusive creation: do not replace a user's existing worldpack.
-        with path.open("xb") as handle:
-            handle.write(data)
-        return
-    if not path.is_file():
+    if not new and not path.is_file():
         raise WorldpackError("Worldpack does not exist; create it with 'new' first")
     temp_name = None
     try:
@@ -37,7 +32,15 @@ def _save(path: Path, pack: dict, *, new: bool = False) -> None:
             handle.write(data)
             handle.flush()
             os.fsync(handle.fileno())
-        os.replace(temp_name, path)
+        if new:
+            # A hard-link installs the *complete* temporary file only if the
+            # destination does not exist. Unlike open('xb') followed by write,
+            # an interruption cannot strand a half-authored target file.
+            # Source and destination share a directory/filesystem. If this
+            # filesystem does not support hard links, fail closed.
+            os.link(temp_name, path)
+        else:
+            os.replace(temp_name, path)
     finally:
         if temp_name is not None and os.path.exists(temp_name):
             os.unlink(temp_name)
