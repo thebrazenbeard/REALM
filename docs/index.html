@@ -1,0 +1,116 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="referrer" content="no-referrer">
+  <meta name="theme-color" content="#0b111b">
+  <title>REALM — World Console</title>
+  <link rel="stylesheet" href="styles.css">
+  <script src="app.js" defer></script>
+</head>
+<body>
+  <div class="ambient ambient-one" aria-hidden="true"></div>
+  <div class="ambient ambient-two" aria-hidden="true"></div>
+
+  <div class="shell">
+    <header class="masthead">
+      <a class="brand" href="./" aria-label="REALM World Console home">
+        <span class="brand-mark" aria-hidden="true">R<span>·</span></span>
+        <span class="brand-copy"><strong>REALM</strong><small>WORLD CONSOLE <span class="brand-version">/ v0.1 preview</span></small></span>
+      </a>
+      <div class="header-status">
+        <span class="connection-dot" id="connection-dot" aria-hidden="true"></span>
+        <span id="connection-status" role="status" aria-live="polite">Offline — no world connected</span>
+      </div>
+    </header>
+
+    <section class="intro" aria-labelledby="intro-title">
+      <div>
+        <p class="eyebrow">ONE ENGINE. MANY WORLDS.</p>
+        <h1 id="intro-title">A world you can <em>return to.</em></h1>
+        <p>Explore, speak, discover, and leave a trace. This is the browser client for a REALM host. Every world has its own rules and history.</p>
+      </div>
+      <div class="intro-sigil" aria-hidden="true"><span>R</span><i></i><i></i><i></i></div>
+    </section>
+
+    <section class="connection-card" aria-labelledby="connect-title">
+      <div class="connection-heading">
+        <div><p class="eyebrow">CONNECTION</p><h2 id="connect-title">Enter a world</h2></div>
+        <span class="mode-label" id="mode-label">OFFLINE PREVIEW</span>
+      </div>
+      <form id="connection-form" class="connection-form">
+        <label for="host-url">REALM host URL
+          <input id="host-url" type="url" inputmode="url" autocomplete="url" spellcheck="false" placeholder="https://your-realm-host.example" required>
+        </label>
+        <label for="player-name">Character name
+          <input id="player-name" type="text" minlength="1" maxlength="24" autocomplete="off" spellcheck="false" placeholder="Explorer" pattern="[A-Za-z][A-Za-z0-9_-]{0,23}" required>
+        </label>
+        <label for="access-token">Access token <span class="hint">(never saved)</span>
+          <input id="access-token" type="password" autocomplete="off" spellcheck="false" placeholder="Required by host" required>
+        </label>
+        <div class="connect-actions">
+          <button type="submit" class="button button-primary" id="connect-button">Connect</button>
+          <button type="button" class="button button-subtle" id="disconnect-button" disabled>Disconnect</button>
+        </div>
+      </form>
+      <p class="connection-note" id="connection-note">This page is static. No live connection or private world data exists here until you provide a compatible host.</p>
+    </section>
+
+    <main class="console" aria-label="REALM world console">
+      <aside class="panel sidebar" aria-label="World information">
+        <div class="panel-title"><span>01 / WORLD</span><span class="panel-deco">✧</span></div>
+        <h2 class="world-name" id="world-name">Unconnected</h2>
+        <p class="muted">The engine is separate from the worlds it hosts. Driftspace can be one private instance; others can have entirely different settings.</p>
+        <div class="info-block">
+          <p class="info-label">CURRENT PLAYER</p>
+          <p id="current-player">None</p>
+        </div>
+        <div class="info-block">
+          <p class="info-label">WORLD STATE</p>
+          <p id="world-state">Not loaded</p>
+        </div>
+        <div class="info-block">
+          <p class="info-label">ACCESS</p>
+          <p id="access-state">Host authorization required</p>
+        </div>
+        <div class="sidebar-foot">REALM records the world.<br>Your character discovers it.</div>
+      </aside>
+
+      <section class="panel timeline" aria-labelledby="timeline-title">
+        <div class="panel-title"><span>02 / ACTIVITY</span><span class="panel-deco">✧</span></div>
+        <div class="timeline-heading"><h2 id="timeline-title">World feed</h2><span class="feed-badge" id="feed-state">NOT LIVE</span></div>
+        <ol id="feed" class="feed" aria-label="World events" aria-live="polite" aria-relevant="additions text">
+          <li class="feed-item feed-system"><span class="feed-icon" aria-hidden="true">◇</span><div><small>LOCAL INTERFACE</small><p>This is an offline preview. Connect a REALM host to receive actual world events.</p></div></li>
+        </ol>
+        <form id="command-form" class="command-area" autocomplete="off">
+          <div class="command-header"><label for="command-input">COMMAND</label><span id="command-hint">Connect to issue commands</span></div>
+          <div class="command-row"><span class="prompt-symbol" aria-hidden="true">›</span><input id="command-input" type="text" placeholder="look · go north · say hello" disabled maxlength="500" aria-label="World command"><button class="button button-primary" id="send-button" type="submit" disabled>Send <span aria-hidden="true">↵</span></button></div>
+          <div class="quick-actions" aria-label="Suggested commands">
+            <button type="button" data-command="look" disabled>look</button>
+            <button type="button" data-command="who" disabled>who</button>
+            <button type="button" data-command="inventory" disabled>inventory</button>
+            <button type="button" data-command="listen" disabled>listen</button>
+            <button type="button" data-command="help" disabled>help</button>
+          </div>
+        </form>
+      </section>
+
+      <aside class="panel location" aria-labelledby="location-title">
+        <div class="panel-title"><span>03 / PERCEPTION</span><span class="panel-deco">✧</span></div>
+        <h2 id="location-title">What you can see</h2>
+        <p class="room-caption">ROOM DESCRIPTION</p>
+        <pre id="room-description" class="room-description">No character is connected.
+
+The current room will appear here when you enter a hosted REALM.</pre>
+        <div class="visibility-note"><span aria-hidden="true">◈</span> You only see what your character is permitted to know.</div>
+      </aside>
+    </main>
+
+    <footer class="footer">
+      <span>REALM <span class="footer-separator">/</span> A local-first, persistent text-world engine</span>
+      <span>Terminal clients can use the same world database. <a href="https://github.com/thebrazenbeard/REALM" target="_blank" rel="noopener noreferrer">Source & instructions</a></span>
+    </footer>
+  </div>
+</body>
+</html>
