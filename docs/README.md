@@ -75,3 +75,50 @@ do not put authentication tokens through it on an untrusted network.
 REALM is the generic engine. A private Driftspace worldpack can be loaded by a
 private host when a governed worldpack interface exists. The public browser
 client need not ship the worldpack, unpublished canon, or author-only secrets.
+
+## Optional live map (not yet a gateway v1 route)
+
+The map panel never generates terrain and does not imply that a host supports
+maps. It attempts an optional authenticated `GET /api/v1/map?player=...` route.
+A 404/501 marks the route unsupported for this browser session; room commands
+and the activity feed continue normally. Transient failures show an unavailable
+state instead of stale or fabricated terrain.
+
+Proposed response contract, to align with the server's geography module:
+
+```json
+{
+  "space": { "id": "region-1", "name": "Green Shore", "kind": "region" },
+  "width": 3,
+  "height": 2,
+  "tiles": [
+    { "x": 0, "y": 0, "glyph": "~", "terrain": "water", "passable": false },
+    { "x": 1, "y": 0, "glyph": "^", "terrain": "forest", "passable": true }
+  ],
+  "markers": [{ "id": "s1", "x": 2, "y": 0, "kind": "ship" }],
+  "legend": [{ "glyph": "^", "terrain": "trees" }],
+  "player": { "x": 1, "y": 0 }
+}
+```
+
+Coordinates start at top-left. The browser limits viewports to 32×32 cells and
+64 markers, rejects invalid/duplicate coordinates and control-character glyphs,
+and renders every cell through DOM `textContent`. Unsent tiles remain blank;
+the client must not infer unexplored rooms or hidden locations. **The server is
+solely responsible for filtering terrain, actors, and maps based on the current
+player's actual permissions.** A shared bearer token is not player identity.
+The map endpoint itself is proposed, not implemented by this client PR.
+
+Security improvement: the browser rejects HTTP host URLs except loopback
+(`localhost`, `127.0.0.1`, `[::1]`), even if the page was opened locally.
+Remote hosts require HTTPS before sending a token.
+
+### Map validation tests
+
+```bash
+node --test tests/browser/test-map.cjs
+node --check docs/map.js
+node --check docs/app.js
+```
+
+These are JavaScript unit/syntax checks, not a real-browser end-to-end host test.
