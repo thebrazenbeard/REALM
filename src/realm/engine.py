@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import re
 import sqlite3
+import time
 from contextlib import closing
 from datetime import datetime, timezone
 from pathlib import Path
@@ -45,11 +46,25 @@ class Engine:
 
     def _connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(str(self.db_path), timeout=10)
-        conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA foreign_keys=ON")
-        conn.execute("PRAGMA busy_timeout=10000")
-        conn.execute("PRAGMA journal_mode=WAL")
-        return conn
+        try:
+            conn.row_factory = sqlite3.Row
+            conn.execute("PRAGMA foreign_keys=ON")
+            conn.execute("PRAGMA busy_timeout=10000")
+            # WAL initialization needs an exclusive database lock. Concurrent
+            # first-time clients can collide during that short transition,
+            # even when their later reads/writes are correctly serialized.
+            for attempt in range(10):
+                try:
+                    conn.execute("PRAGMA journal_mode=WAL")
+                    break
+                except sqlite3.OperationalError as exc:
+                    if "locked" not in str(exc).lower() or attempt == 9:
+                        raise
+                    time.sleep(min(0.05 * (attempt + 1), 0.25))
+            return conn
+        except BaseException:
+            conn.close()
+            raise
 
     def _initialize(self) -> None:
         with closing(self._connect()) as db, db:
@@ -93,6 +108,10 @@ class Engine:
                     response TEXT NOT NULL,
                     PRIMARY KEY(actor, action_id)
                 );
+                CREATE TABLE IF NOT EXISTS world_meta (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL
+                );
                 CREATE INDEX IF NOT EXISTS idx_events_room_id ON events(room_id, id);
                 """
             )
@@ -125,9 +144,11 @@ class Engine:
             db.execute("BEGIN IMMEDIATE")
             player = db.execute("SELECT id,room_id FROM players WHERE id=?", (name,)).fetchone()
             if player is None:
-                db.execute("INSERT INTO players VALUES (?,?,?)", (name, "atrium", self._now()))
-                self._event(db, name, "atrium", "join", {})
-                return f"Welcome, {name}.\n{self._look(db, 'atrium', name)}"
+                configured = db.execute("SELECT value FROM world_meta WHERE key='start_room'").fetchone()
+                start_room = configured[0] if configured is not None else "atrium"
+                db.execute("INSERT INTO players VALUES (?,?,?)", (name, start_room, self._now()))
+                self._event(db, name, start_room, "join", {})
+                return f"Welcome, {name}.\n{self._look(db, start_room, name)}"
             return f"Welcome back, {player['id']}.\n{self._look(db, player['room_id'], player['id'])}"
 
     def _look(self, db: sqlite3.Connection, room_id: str, name: str) -> str:
