@@ -64,7 +64,8 @@ class GatewayTests(unittest.TestCase):
             with request.urlopen(req, timeout=3) as response:
                 return response.status, json.loads(response.read() or b"{}")
         except error.HTTPError as exc:
-            return exc.code, json.loads(exc.read())
+            with closing(exc):
+                return exc.code, json.loads(exc.read())
 
     def test_health_and_authentication(self):
         self.assertEqual((200, {"ok": True, "world_id": "sandbox"}), self.send("/api/v1/health", token=False))
@@ -261,6 +262,7 @@ class GatewayTests(unittest.TestCase):
         with self.assertRaises(error.HTTPError) as raised:
             request.urlopen(req, timeout=3)
         self.assertEqual(401, raised.exception.code)
+        raised.exception.close()
 
 
 if __name__ == "__main__":

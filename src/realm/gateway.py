@@ -91,14 +91,23 @@ class Gateway:
         known_tables = {
             "rooms", "exits", "items", "players", "events", "action_receipts", "world_meta",
         }
-        for (table,) in db.execute("SELECT name FROM sqlite_master WHERE type='table'"):
-            if table in known_tables:
+        for kind, name, table in db.execute("SELECT type,name,tbl_name FROM sqlite_master"):
+            if kind == "table" and name in known_tables:
                 continue
-            # SQLite's sqlite_sequence can retain evidence of deleted events.
-            # Quote schema-derived identifiers defensively.
-            quoted = '"' + table.replace('"', '""') + '"'
-            if db.execute(f"SELECT EXISTS(SELECT 1 FROM {quoted})").fetchone()[0]:
-                return True
+            if kind == "table" and name == "sqlite_sequence":
+                # A deleted autoincrement event can leave durable evidence.
+                if db.execute("SELECT EXISTS(SELECT 1 FROM sqlite_sequence)").fetchone()[0]:
+                    return True
+                continue
+            if kind == "index" and (
+                name.startswith("sqlite_autoindex_")
+                or (name == "idx_events_room_id" and table == "events")
+            ):
+                continue
+            # Unknown even-empty tables, triggers, views and custom indexes are
+            # authored schema changes. Triggers can mutate world state when
+            # a player joins, even if every seeded row still looks pristine.
+            return True
         return False
 
     def _read(self) -> sqlite3.Connection:

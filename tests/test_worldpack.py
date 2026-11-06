@@ -89,6 +89,14 @@ class WorldpackTests(unittest.TestCase):
         with self.assertRaisesRegex(WorldpackError, "credentials"):
             import_worldpack(self.db, self.file)
 
+    def test_custom_sql_trigger_never_survives_worldpack_import(self):
+        self.save()
+        Engine(self.db)
+        with closing(sqlite3.connect(self.db)) as db, db:
+            db.execute("CREATE TRIGGER unsafe_world AFTER INSERT ON players BEGIN DELETE FROM items; END")
+        with self.assertRaisesRegex(WorldpackError, "triggers"):
+            import_worldpack(self.db, self.file)
+
     def test_different_import_never_replaces_live_world(self):
         self.save()
         import_worldpack(self.db, self.file)

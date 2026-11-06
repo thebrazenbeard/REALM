@@ -54,5 +54,15 @@ python -m unittest discover -s tests -q
 node --test tests/browser/test-client.cjs tests/browser/test-map.cjs
 ```
 
+On Windows PowerShell, select the actual Python executable before running
+the live Node/browser gateway integration test. The `python` app alias can
+cause `child_process.spawn` to fail with `EPERM` even when `py -3` works:
+
+```powershell
+$env:REALM_PYTHON = (py -3 -c 'import sys; print(sys.executable)').Trim()
+py -3 -m unittest discover -s tests -q
+node --test tests/browser/test-client.cjs tests/browser/test-map.cjs
+```
+
 See `docs/ROADMAP.md`, `WORLDPACKS.md`, and the flagship content's separate
 `SOURCE_BOUNDARY.md` for current capability and provenance limits.

@@ -92,6 +92,19 @@ class GatewayWorldBindingTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "adoption"):
             Gateway(self.db, world_id="beta")
 
+    def test_unbound_custom_trigger_requires_adoption(self):
+        Engine(self.db)
+        with closing(sqlite3.connect(self.db)) as db, db:
+            db.execute(
+                "CREATE TRIGGER legacy_change AFTER INSERT ON players "
+                "BEGIN DELETE FROM items; END"
+            )
+        with self.assertRaisesRegex(ValueError, "adoption"):
+            Gateway(self.db, world_id="beta")
+        # Rejecting is side-effect free: no player or item was touched.
+        with closing(sqlite3.connect(self.db)) as db:
+            self.assertEqual(2, db.execute("SELECT COUNT(*) FROM items").fetchone()[0])
+
 
 if __name__ == "__main__":
     unittest.main()

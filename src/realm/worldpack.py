@@ -183,6 +183,10 @@ def import_worldpack(db_path: str | Path, worldpack_path: str | Path) -> dict:
             "SELECT EXISTS(SELECT 1 FROM player_credentials)"
         ).fetchone()[0]:
             raise WorldpackError("The demo world has provisioned credentials; import before provisioning players")
+        if db.execute(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type IN ('trigger','view'))"
+        ).fetchone()[0]:
+            raise WorldpackError("The demo world has custom SQL triggers or views; refusing import")
         present_rooms = [tuple(row) for row in db.execute("SELECT id,name,description FROM rooms ORDER BY id")]
         present_exits = [tuple(row) for row in db.execute("SELECT room_id,direction,destination FROM exits ORDER BY room_id,direction")]
         present_items = [tuple(row) for row in db.execute(
