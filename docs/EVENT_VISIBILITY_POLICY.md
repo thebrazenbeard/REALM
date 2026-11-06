@@ -59,6 +59,15 @@ those values. Likewise `witnessed_ids` must be captured from authoritative
 room presence and visibility mechanics in the *same database transaction* as
 the event, never from current `players.room_id` or a later `history` query.
 
+The read predicate now independently validates typed record shape and
+class-specific invariants. A persisted/migrated record might bypass the
+proposal classifier: for example, `PUBLIC_CHRONICLE` combined with private
+recipient IDs is contradictory and **must be denied**, even if the world
+explicitly enabled public chronicles. Witnessed records need an event-time
+room and nonempty witnesses, private records need recipients, and moderation
+records must not contain gameplay recipients or NPC-memory grants. This is
+source-only validation, not a proven gateway parser or database constraint.
+
 The following fields are design candidates, not an implemented migration:
 `world_id`, `event_id`, `visibility_class`, `policy_revision`, `room_id`,
 `witnessed_principals`, `direct_recipients`, explicit public consent, NPC
@@ -110,7 +119,8 @@ does not leak to a late reader; a consented public chronicle **does** admit a
 later world member; private messages reach sender/recipients but not bystander;
 moderation needs explicit capability/purpose; NPC memory needs independent
 consent; per-principal and global revocation deny future reads; wrong-world,
-legacy, unknown class and incompatible policy revision fail closed.
+legacy, unknown class, contradictory direct-constructed records and
+incompatible policy revision fail closed.
 
 Before *any* remote hosting or true neural NPC memory, execute and receipt:
 
