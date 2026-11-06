@@ -15,7 +15,10 @@ from pathlib import Path
 from typing import Any
 
 from .auth import _CREDENTIAL_SCHEMA_SQL
-from .engine import Engine, _SEED_EXITS, _SEED_ITEMS, _SEED_ROOMS, _pristine_schema, _schema_snapshot
+from .engine import (
+    Engine, WorldIntegrityError, _SEED_EXITS, _SEED_ITEMS, _SEED_ROOMS,
+    _pristine_schema, _schema_snapshot,
+)
 
 
 SCHEMA = "realm.worldpack.v1"
@@ -241,7 +244,13 @@ def import_worldpack(db_path: str | Path, worldpack_path: str | Path) -> dict:
     world is rejected. There is no force/reset option.
     """
     pack, digest = read_worldpack(worldpack_path)
-    engine = Engine(db_path)
+    try:
+        engine = Engine(db_path)
+    except WorldIntegrityError as exc:
+        # Preserve the precise startup cause while keeping the importer and
+        # CLI on their documented WorldpackError error boundary. Do not hide
+        # unrelated ValueError exceptions from future Engine code.
+        raise WorldpackError(str(exc)) from exc
     with closing(engine._connect()) as db, db:
         db.execute("BEGIN IMMEDIATE")
         old_hash = db.execute("SELECT value FROM world_meta WHERE key='worldpack_sha256'").fetchone()
@@ -314,6 +323,8 @@ def main(argv: list[str] | None = None) -> int:
     try:
         result = import_worldpack(args.db, args.file)
     except (WorldpackError, OSError) as exc:
+        if isinstance(exc.__cause__, WorldIntegrityError):
+            parser.exit(2, f"Worldpack integrity error: {exc}\n")
         parser.error(str(exc))
     status = "unchanged" if result["unchanged"] else "imported"
     print(f"Worldpack {status}: {result['world_id']} (sha256={result['sha256']})")
