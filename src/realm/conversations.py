@@ -113,17 +113,15 @@ _PHYSICAL_ACTION = (
 )
 _ACTION_MODIFIER = r"(?:(?:quietly|slowly|suddenly|has|had|is|was|just)\s+){0,3}"
 _STAGE_DIRECTION = re.compile(r"^\s*(?:\*[^*\r\n]+\*|\[[^\]\r\n]+\]|\([^)]*\))")
-_OTHER_PERSON_NARRATION = re.compile(
-    r"^\s*(?:[\"']\s*)?(?:the|a|an)\s+(?:[A-Za-z][A-Za-z'-]*\s+){1,4}"
-    + _ACTION_MODIFIER + rf"(?:{_PHYSICAL_ACTION})\b",
-    re.I,
-)
 _PRONOUN_NARRATION = re.compile(
     rf"^\s*(?:he|she|they)\s+{_ACTION_MODIFIER}(?:{_PHYSICAL_ACTION})\b", re.I
 )
-_FALSE_SELF_NAME = re.compile(
-    r"\b(?i:my name is|call me|i(?: am|'m) called|i(?: am|'m))\s+"
+_EXPLICIT_SELF_NAME = re.compile(
+    r"\b(?i:my name is|call me|i(?: am|'m) called)\s+"
     r"([A-Z][A-Za-z0-9_-]*)\b"
+)
+_SIMPLE_SELF_NAME = re.compile(
+    r"\b(?i:i am|i'm)\s+([A-Z][A-Za-z0-9_-]*)\b(?=\s*[,;.!?]|\s*$)"
 )
 
 
@@ -141,13 +139,13 @@ def validate_npc_speech(context: DialogueContext, command: str) -> None:
         raise ValueError("NPC speech exceeds the 25-word dialogue limit")
     if _STAGE_DIRECTION.search(speech):
         raise ValueError("NPC speech begins with a stage direction")
-    if _OTHER_PERSON_NARRATION.search(speech) or _PRONOUN_NARRATION.search(speech):
-        raise ValueError("NPC speech narrates another character's action")
+    if _PRONOUN_NARRATION.search(speech):
+        raise ValueError("NPC speech begins with third-person action narration")
     if "[end of text]" in speech.casefold() or re.search(
         r"</?think>|<\|im_(?:start|end)\|>", speech, re.I
     ):
         raise ValueError("NPC speech contains model-control text")
-    renamed = _FALSE_SELF_NAME.search(speech)
+    renamed = _EXPLICIT_SELF_NAME.search(speech) or _SIMPLE_SELF_NAME.search(speech)
     if renamed is not None and renamed.group(1).casefold() != context.speaker.casefold():
         raise ValueError("NPC speech invents another speaker identity")
     # Camel-case NPC IDs are normal REALM names; normalize them for a
@@ -160,7 +158,7 @@ def validate_npc_speech(context: DialogueContext, command: str) -> None:
     direct = rf"^\s*(?:[\"']\s*)?(?:the\s+)?{listener}\s+{_ACTION_MODIFIER}(?:{_PHYSICAL_ACTION})\b"
     witnessed = (
         rf"\bI\s+(?:watched|saw|heard)\s+(?:the\s+)?{listener}\s+"
-        rf"(?:{_PHYSICAL_ACTION})\b"
+        rf"{_ACTION_MODIFIER}(?:{_PHYSICAL_ACTION})\b"
     )
     if re.search(direct, speech, re.I) or re.search(witnessed, speech, re.I):
         raise ValueError("NPC speech narrates the listener's action")

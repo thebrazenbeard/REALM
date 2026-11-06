@@ -149,6 +149,7 @@ class NPCConversationTests(unittest.TestCase):
             "The inspector nodded.",
             "He nodded.",
             "I watched the crossing inspector nod.",
+            "I watched the crossing inspector quietly nod.",
             "My name is John, and I will take you across.",
             "Call me John, and I will take you across.",
             "I'm John, and I will take you across.",
@@ -200,6 +201,12 @@ class NPCConversationTests(unittest.TestCase):
             "The crossing inspector said that yesterday.",
             "Crossing Inspector said that?",
             "I will check the public slate before boarding anyone.",
+            "The old river turns sharply past the bridge.",
+            "The tide gate turns to face the east.",
+            "The compass points north.",
+            "The ferry turned at the bend.",
+            "I am Here to answer.",
+            "I am Ready to guide you.",
         ):
             with self.subTest(allowed=speech):
                 validate_npc_speech(ctx, f"say {speech}")

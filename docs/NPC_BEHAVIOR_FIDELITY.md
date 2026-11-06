@@ -26,8 +26,10 @@ deterministic checks **before** `ResidentController.commit`:
 - no sampled model-control token fragments;
 - no obvious `My name is John` / `Call me John` / `I'm John` identity
   substitution when the authoritative speaker has another name;
-- no recognized third-person **physical** action narration about the listener,
-  such as `The crossing inspector quietly nodded.` or `He nodded.`
+- no recognized **listener-specific** physical action narration such as
+  `The crossing inspector quietly nodded.` and a few third-person pronoun
+  action openings (`He nodded.`). Landscape descriptions (e.g. `The compass
+  points north.`) are not assumed to be another character's actions.
 
 Reportive speech (`The crossing inspector said that yesterday.`) is not a
 physical action; it remains eligible. Rejected proposals produce no speech
@@ -41,6 +43,10 @@ new provider or retroactively revalidating old speech.
 > refer to a real prior event or fabricate one. General narration, identity,
 > factual truth, emotion, intent and believable dialogue require stronger
 > evaluation; a regex does not establish them.
+
+For similar reasons `I am Ready to help` is not treated as an identity change;
+the identity filter deliberately favors explicit rename phrases and clear
+`I'm John, ...` patterns over aggressive inference from capitalized words.
 
 > **Speech-versus-world boundary:** a model claiming `I closed the gate`
 > cannot itself close the gate. The statement is still a claim, potentially
