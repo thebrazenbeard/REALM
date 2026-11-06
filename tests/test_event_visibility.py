@@ -150,6 +150,66 @@ class EventVisibilityPolicyTests(unittest.TestCase):
         self.assertFalse(can_read_event(other_policy, a, self.viewer("Early", world="different_world")))
         self.assertTrue(can_read_event(other_policy, b, self.viewer("Early", world="different_world")))
 
+    def test_direct_constructed_impossible_records_fail_closed_at_read_time(self):
+        # Durable storage/migrations can bypass `classify_event`; never rely
+        # on write-side validation having run for any incoming record.
+        public_world = replace(self.policy, allow_public_chronicle=True)
+        public = classify_event(public_world, event_id=11, kind="say", actor="Host",
+                                visibility=Visibility.PUBLIC_CHRONICLE,
+                                explicit_public_consent=True)
+        late = self.viewer("Latecomer")
+        self.assertTrue(can_read_event(public_world, public, late))
+        for malformed in (
+            replace(public, recipient_ids=frozenset({"PrivatePerson"})),
+            replace(public, explicitly_public=False),
+            replace(public, explicitly_public="yes"),
+            replace(public, policy_revision="obsolete"),
+            replace(public, kind="moderation_note"),
+            replace(public, kind="say\nforged"),
+            replace(public, revoked_ids=frozenset({None})),
+            replace(public, revoked_ids="Latecomer"),
+            replace(public, revoked_all=0),
+            replace(public, event_id=True),
+            replace(public, memory_consent="yes"),
+        ):
+            with self.subTest(record=repr(malformed)):
+                self.assertFalse(can_read_event(public_world, malformed, late))
+
+        witnessed = self.say()
+        for malformed in (
+            replace(witnessed, room_id=None),
+            replace(witnessed, witnessed_ids=frozenset()),
+            replace(witnessed, recipient_ids=frozenset({"PrivatePerson"})),
+            replace(witnessed, explicitly_public=True),
+            replace(witnessed, room_id=5),
+            replace(witnessed, actor=" "),
+        ):
+            with self.subTest(record=repr(malformed)):
+                self.assertFalse(can_read_event(self.policy, malformed, self.viewer("Early")))
+
+        private = classify_event(self.policy, event_id=12, kind="private_message",
+                                 actor="Sender", recipient_ids=frozenset({"Friend"}))
+        self.assertTrue(can_read_event(self.policy, private, self.viewer("Friend")))
+        self.assertFalse(can_read_event(self.policy,
+                                       replace(private, recipient_ids=frozenset()),
+                                       self.viewer("Sender")))
+        self.assertFalse(can_read_event(self.policy,
+                                       replace(private, explicitly_public=True),
+                                       self.viewer("Friend")))
+
+        moderator = self.viewer("Moderator", purpose=ReadPurpose.MODERATION,
+                                capabilities=frozenset({"moderation_read"}))
+        ledger = classify_event(self.policy, event_id=13, kind="moderation_note", actor="Host")
+        self.assertTrue(can_read_event(self.policy, ledger, moderator))
+        for malformed in (
+            replace(ledger, memory_consent=True),
+            replace(ledger, recipient_ids=frozenset({"Player"})),
+            replace(ledger, witnessed_ids=frozenset({"Player"})),
+        ):
+            self.assertFalse(can_read_event(self.policy, malformed, moderator))
+        self.assertFalse(can_read_event(self.policy, ledger,
+                                       replace(moderator, capabilities=frozenset({None}))))
+
 
 if __name__ == "__main__":
     unittest.main()
