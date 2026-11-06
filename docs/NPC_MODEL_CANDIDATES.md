@@ -23,12 +23,14 @@ fitness, license integrity or actual size.
 2. [NPC-related text-generation models, 0–1B parameters, sorted by downloads](https://huggingface.co/models?pipeline_tag=text-generation&num_parameters=min:0,max:1B&sort=downloads&search=npc)
 
 The short list below adds one useful general-purpose baseline alongside
-roleplay-specific and NPC-voice models. Its ordering is **which experiment to
-attempt first for each distinct role**, not a quality leaderboard.
+roleplay-specific and NPC-voice models. The A/B/C/D labels are **role
+categories**, not a ranking or experiment order. The JSON registry separately
+records a **research-triage order** (soup06 first, Qwen3.5 sixth); neither is
+an independently measured quality ranking or an automatic model selection.
 
 ## Source-inspected shortlist
 
-| Priority / role | Model card and published facts | Why test it / what it cannot prove |
+| Role category | Model card and published facts | Why test it / what it cannot prove |
 | --- | --- | --- |
 | **A — structured action baseline** | [ggml-org/Qwen3.5-0.8B-GGUF](https://huggingface.co/ggml-org/Qwen3.5-0.8B-GGUF), Qwen3.5 0.8B, Apache-2.0 tag; Q4_0 GGUF **563 MB**, Q8_0 834 MB on the publisher page. | Plausible common **text action proposal** baseline. Not an NPC-specialized fine-tune. A current llama.cpp/KoboldCPP build and strict JSON-command tests must establish compatibility; multimodal model metadata is not evidence of a working text-only REALM adapter. |
 | **B — expressive character dialogue** | [cloudunity/stealth-rifle](https://huggingface.co/cloudunity/stealth-rifle), Qwen2.5-0.5B-Instruct roleplay LoRA, Apache-2.0 tag; author lists Q4_K_M around **380 MB** and CPU-focused deployment. | Test for distinct character voice and natural scene replies. The author's reported ~30–37 tokens/s on two threads and roleplay craft scores are **not Lappy measurements**. Card warns of continuity/agency slips and mature content; no public/minor-safe deployment without moderation. |
