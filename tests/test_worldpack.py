@@ -69,12 +69,13 @@ class WorldpackTests(unittest.TestCase):
         self.assertEqual(first["sha256"], again["sha256"])
         self.assertIn("Small stone", Engine(self.db).act("Patrick", "inventory"))
 
-    def test_pristine_gateway_matching_world_id_can_import(self):
+    def test_gateway_initialized_demo_must_import_first(self):
         self.save()
         Gateway(self.db, world_id="sample")
-        imported = import_worldpack(self.db, self.file)
-        self.assertFalse(imported["unchanged"])
-        self.assertIn("Quiet Shore", Gateway(self.db, world_id="sample").join("Patrick")["text"])
+        with self.assertRaisesRegex(WorldpackError, "custom SQL schema"):
+            import_worldpack(self.db, self.file)
+        # Engine/gameplay state has not been replaced by the failed import.
+        self.assertIn("DEMO WORLD", Gateway(self.db, world_id="sample").join("Patrick")["text"])
 
     def test_pristine_gateway_mismatched_world_id_cannot_import(self):
         self.save()
@@ -94,7 +95,26 @@ class WorldpackTests(unittest.TestCase):
         Engine(self.db)
         with closing(sqlite3.connect(self.db)) as db, db:
             db.execute("CREATE TRIGGER unsafe_world AFTER INSERT ON players BEGIN DELETE FROM items; END")
-        with self.assertRaisesRegex(WorldpackError, "triggers"):
+        with self.assertRaisesRegex(WorldpackError, "custom SQL schema"):
+            import_worldpack(self.db, self.file)
+
+    def test_replaced_builtin_index_never_survives_import(self):
+        self.save()
+        Engine(self.db)
+        with closing(sqlite3.connect(self.db)) as db, db:
+            db.execute("DROP INDEX idx_events_room_id")
+            db.execute("CREATE UNIQUE INDEX idx_events_room_id ON events(actor)")
+        with self.assertRaisesRegex(WorldpackError, "custom SQL schema"):
+            import_worldpack(self.db, self.file)
+
+    def test_altered_builtin_table_never_survives_import(self):
+        self.save()
+        Engine(self.db)
+        with closing(sqlite3.connect(self.db)) as db, db:
+            db.execute(
+                "ALTER TABLE events ADD COLUMN poison INTEGER NOT NULL DEFAULT 0 CHECK(poison=1)"
+            )
+        with self.assertRaisesRegex(WorldpackError, "custom SQL schema"):
             import_worldpack(self.db, self.file)
 
     def test_different_import_never_replaces_live_world(self):

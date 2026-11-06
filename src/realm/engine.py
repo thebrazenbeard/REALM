@@ -8,6 +8,7 @@ import sqlite3
 import time
 from contextlib import closing
 from datetime import datetime, timezone
+from functools import lru_cache
 from pathlib import Path
 
 
@@ -29,6 +30,76 @@ _SEED_ITEMS = (
     ("token", "Brass token", "A small unmarked token for testing shared item ownership.", "atrium"),
     ("wrench", "Worn wrench", "A tool left behind in the demonstration workshop.", "workshop"),
 )
+
+_CORE_SCHEMA_SQL = """
+CREATE TABLE IF NOT EXISTS rooms (
+    id TEXT PRIMARY KEY, name TEXT NOT NULL, description TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS exits (
+    room_id TEXT NOT NULL REFERENCES rooms(id),
+    direction TEXT NOT NULL,
+    destination TEXT NOT NULL REFERENCES rooms(id),
+    PRIMARY KEY (room_id, direction)
+);
+CREATE TABLE IF NOT EXISTS players (
+    id TEXT PRIMARY KEY COLLATE NOCASE,
+    room_id TEXT NOT NULL REFERENCES rooms(id),
+    created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS items (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    description TEXT NOT NULL,
+    room_id TEXT REFERENCES rooms(id),
+    held_by TEXT REFERENCES players(id),
+    CHECK ((room_id IS NOT NULL AND held_by IS NULL)
+        OR (room_id IS NULL AND held_by IS NOT NULL))
+);
+CREATE TABLE IF NOT EXISTS events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    occurred_at TEXT NOT NULL,
+    actor TEXT NOT NULL,
+    room_id TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    payload_json TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS action_receipts (
+    actor TEXT NOT NULL,
+    action_id TEXT NOT NULL,
+    command TEXT NOT NULL,
+    response TEXT NOT NULL,
+    PRIMARY KEY(actor, action_id)
+);
+CREATE TABLE IF NOT EXISTS world_meta (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_events_room_id ON events(room_id, id);
+"""
+
+
+def _schema_snapshot(db: sqlite3.Connection) -> dict[str, tuple[str, str, str | None]]:
+    """SQLite's actual stored definitions, including implicit indexes.
+
+    For a *legacy unbound* database we must detect changed constraints and
+    indexes, not just matching table names or currently seeded rows.
+    """
+    return {
+        name: (kind, table, " ".join(ddl.split()) if ddl is not None else None)
+        for kind, name, table, ddl in db.execute(
+            "SELECT type,name,tbl_name,sql FROM sqlite_master"
+        )
+    }
+
+
+@lru_cache(maxsize=4)
+def _pristine_schema(extra_sql: str = "") -> dict[str, tuple[str, str, str | None]]:
+    """Build a read-only canonical fingerprint from the one engine DDL source."""
+    with closing(sqlite3.connect(":memory:")) as db:
+        db.executescript(_CORE_SCHEMA_SQL)
+        if extra_sql:
+            db.executescript(extra_sql)
+        return _schema_snapshot(db)
 
 
 class Engine:
@@ -68,53 +139,7 @@ class Engine:
 
     def _initialize(self) -> None:
         with closing(self._connect()) as db, db:
-            db.executescript(
-                """
-                CREATE TABLE IF NOT EXISTS rooms (
-                    id TEXT PRIMARY KEY, name TEXT NOT NULL, description TEXT NOT NULL
-                );
-                CREATE TABLE IF NOT EXISTS exits (
-                    room_id TEXT NOT NULL REFERENCES rooms(id),
-                    direction TEXT NOT NULL,
-                    destination TEXT NOT NULL REFERENCES rooms(id),
-                    PRIMARY KEY (room_id, direction)
-                );
-                CREATE TABLE IF NOT EXISTS players (
-                    id TEXT PRIMARY KEY COLLATE NOCASE,
-                    room_id TEXT NOT NULL REFERENCES rooms(id),
-                    created_at TEXT NOT NULL
-                );
-                CREATE TABLE IF NOT EXISTS items (
-                    id TEXT PRIMARY KEY,
-                    name TEXT NOT NULL,
-                    description TEXT NOT NULL,
-                    room_id TEXT REFERENCES rooms(id),
-                    held_by TEXT REFERENCES players(id),
-                    CHECK ((room_id IS NOT NULL AND held_by IS NULL)
-                        OR (room_id IS NULL AND held_by IS NOT NULL))
-                );
-                CREATE TABLE IF NOT EXISTS events (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    occurred_at TEXT NOT NULL,
-                    actor TEXT NOT NULL,
-                    room_id TEXT NOT NULL,
-                    kind TEXT NOT NULL,
-                    payload_json TEXT NOT NULL
-                );
-                CREATE TABLE IF NOT EXISTS action_receipts (
-                    actor TEXT NOT NULL,
-                    action_id TEXT NOT NULL,
-                    command TEXT NOT NULL,
-                    response TEXT NOT NULL,
-                    PRIMARY KEY(actor, action_id)
-                );
-                CREATE TABLE IF NOT EXISTS world_meta (
-                    key TEXT PRIMARY KEY,
-                    value TEXT NOT NULL
-                );
-                CREATE INDEX IF NOT EXISTS idx_events_room_id ON events(room_id, id);
-                """
-            )
+            db.executescript(_CORE_SCHEMA_SQL)
             # executescript commits implicitly; lock the first-run seed phase
             # so concurrent clients cannot both initialize the demo rooms.
             db.execute("BEGIN IMMEDIATE")

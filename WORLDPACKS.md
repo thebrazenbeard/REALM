@@ -54,7 +54,12 @@ Once inside, try the look, north, south, take stone_one, and inventory commands.
 
 Use a **new unique database path** for each world. The built-in three-room demo
 is discarded *only when it has no players/events/actions and still exactly
-matches its original untouched seed*. A previously imported worldpack cannot
+matches its original untouched seed and core SQLite schema*. **Import the
+worldpack before starting the HTTP gateway or provisioning player tokens.**
+Gateway startup creates optional credential, geography, and crafting schema;
+the importer deliberately refuses that expanded database even when its world
+ID matches, because replacing a host-prepared world needs explicit migration.
+A previously imported worldpack cannot
 be swapped for another pack. An identical import is idempotent and preserves
 all subsequent gameplay. There is intentionally no force or overwrite
 flag: world-state migration is a different, higher-risk operation.

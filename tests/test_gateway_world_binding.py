@@ -105,6 +105,23 @@ class GatewayWorldBindingTests(unittest.TestCase):
         with closing(sqlite3.connect(self.db)) as db:
             self.assertEqual(2, db.execute("SELECT COUNT(*) FROM items").fetchone()[0])
 
+    def test_replaced_builtin_index_requires_adoption(self):
+        Engine(self.db)
+        with closing(sqlite3.connect(self.db)) as db, db:
+            db.execute("DROP INDEX idx_events_room_id")
+            db.execute("CREATE UNIQUE INDEX idx_events_room_id ON events(actor)")
+        with self.assertRaisesRegex(ValueError, "adoption"):
+            Gateway(self.db, world_id="alpha")
+
+    def test_altered_builtin_table_constraint_requires_adoption(self):
+        Engine(self.db)
+        with closing(sqlite3.connect(self.db)) as db, db:
+            db.execute(
+                "ALTER TABLE events ADD COLUMN poison INTEGER NOT NULL DEFAULT 0 CHECK(poison=1)"
+            )
+        with self.assertRaisesRegex(ValueError, "adoption"):
+            Gateway(self.db, world_id="alpha")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -17,17 +17,20 @@ from datetime import datetime, timezone
 from .engine import Engine, _PLAYER_RE
 
 
+_CREDENTIAL_SCHEMA_SQL = """
+CREATE TABLE IF NOT EXISTS player_credentials (
+    player_name TEXT PRIMARY KEY COLLATE NOCASE,
+    token_digest TEXT UNIQUE NOT NULL,
+    created_at TEXT NOT NULL
+)
+"""
+
+
 class CredentialStore:
     def __init__(self, engine: Engine):
         self.engine = engine
         with closing(engine._connect()) as db, db:
-            db.execute(
-                """CREATE TABLE IF NOT EXISTS player_credentials (
-                    player_name TEXT PRIMARY KEY COLLATE NOCASE,
-                    token_digest TEXT UNIQUE NOT NULL,
-                    created_at TEXT NOT NULL
-                )"""
-            )
+            db.execute(_CREDENTIAL_SCHEMA_SQL)
 
     @staticmethod
     def _digest(token: str) -> str:

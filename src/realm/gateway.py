@@ -16,7 +16,7 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
 from .auth import CredentialStore
-from .engine import Engine, _SEED_EXITS, _SEED_ITEMS, _SEED_ROOMS
+from .engine import Engine, _SEED_EXITS, _SEED_ITEMS, _SEED_ROOMS, _pristine_schema, _schema_snapshot
 from .geography import Geography, MapUnavailable
 from .router import CommandRouter
 
@@ -88,25 +88,13 @@ class Gateway:
         for table, columns, expected in seeded:
             if sorted(tuple(row) for row in db.execute(f"SELECT {columns} FROM {table}")) != sorted(expected):
                 return True
-        known_tables = {
-            "rooms", "exits", "items", "players", "events", "action_receipts", "world_meta",
-        }
-        for kind, name, table in db.execute("SELECT type,name,tbl_name FROM sqlite_master"):
-            if kind == "table" and name in known_tables:
-                continue
-            if kind == "table" and name == "sqlite_sequence":
-                # A deleted autoincrement event can leave durable evidence.
-                if db.execute("SELECT EXISTS(SELECT 1 FROM sqlite_sequence)").fetchone()[0]:
-                    return True
-                continue
-            if kind == "index" and (
-                name.startswith("sqlite_autoindex_")
-                or (name == "idx_events_room_id" and table == "events")
-            ):
-                continue
-            # Unknown even-empty tables, triggers, views and custom indexes are
-            # authored schema changes. Triggers can mutate world state when
-            # a player joins, even if every seeded row still looks pristine.
+        # The complete stored schema must match the one generated from the
+        # same core DDL, not merely known names. This rejects added columns,
+        # constraints, rewritten built-in indexes, triggers and views.
+        if _schema_snapshot(db) != _pristine_schema():
+            return True
+        # sqlite_sequence may keep evidence even after events were deleted.
+        if db.execute("SELECT EXISTS(SELECT 1 FROM sqlite_sequence)").fetchone()[0]:
             return True
         return False
 
