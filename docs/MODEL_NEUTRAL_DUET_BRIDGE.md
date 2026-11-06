@@ -23,9 +23,11 @@ capabilities. Model inference occurs outside a database write lock.
    delimiters and basic stage directions. **The lexical gate does not prove
    factuality, intent, narrative quality, privacy, or absence of hidden text.**
 4. `SimulationClock.plan_next_tick` revalidates the exact host snapshot under
-   its SQLite writer lock and durably records the accepted proposal with a
+   its SQLite writer lock, including both actors' **last join/move event IDs**,
+   and durably records the accepted proposal with a
    host-owned action ID. `apply_pending_tick` rechecks lease, current room,
-   listener co-location, and drives; event/receipt/memory grants/drive updates
+   both position-event witnesses, listener co-location, and drives;
+   event/receipt/memory grants/drive updates
    share one transaction. A crash after planning resumes stored text, never
    reruns a nondeterministic provider for that action.
 5. A session ID is bound to the exact world instance and ordered NPC pair.
@@ -69,7 +71,8 @@ session binding. It uses unique temporary worldpack databases.
 ### Remaining constraints
 
 - First release requires **fresh**, opt-in simulation schemas; the added
-  nullable `required_listener` column is not an in-place migration of
+  nullable `required_listener` and position-witness columns are not an
+  in-place migration of
   existing experimental SQLite saves.
 - A committed NPC utterance is evidence **only that the actor uttered those
   words**, not that their claims are true or ethically permissible.

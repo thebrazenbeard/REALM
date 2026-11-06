@@ -209,6 +209,7 @@ class ModelNeutralDuetBridge:
                 self.clock.plan_next_tick(host_actions=(HostProposedAction(
                     snapshot=speaker, proposal=proposal,
                     action_id=action_id, required_listener=listener,
+                    required_listener_position_event_id=peer.position_event_id,
                 ),))
                 self.clock.apply_pending_tick()
                 stored = self._turn_receipt(actor, action_id)
