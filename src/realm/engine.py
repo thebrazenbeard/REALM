@@ -102,6 +102,10 @@ def _pristine_schema(extra_sql: str = "") -> dict[str, tuple[str, str, str | Non
         return _schema_snapshot(db)
 
 
+class WorldIntegrityError(ValueError):
+    """Existing world data/schema is damaged; startup must not auto-repair."""
+
+
 class Engine:
     """One database file is one isolated REALM instance.
 
@@ -139,11 +143,53 @@ class Engine:
 
     def _initialize(self) -> None:
         with closing(self._connect()) as db, db:
+            # CREATE TABLE IF NOT EXISTS is useful on a *new* database but can
+            # silently hide missing core tables on a bound world. Inspect the
+            # existing authority marker before running any idempotent DDL.
+            # Extra extension tables are allowed; changed/missing core table
+            # and index definitions are not an implicit migration.
+            has_world_metadata_table = db.execute(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master "
+                "WHERE type='table' AND name='world_meta')"
+            ).fetchone()[0]
+            if has_world_metadata_table and db.execute(
+                "SELECT EXISTS(SELECT 1 FROM world_meta)"
+            ).fetchone()[0]:
+                existing_schema = _schema_snapshot(db)
+                changed_core = [
+                    name for name, definition in _pristine_schema().items()
+                    if existing_schema.get(name) != definition
+                ]
+                if changed_core:
+                    raise WorldIntegrityError(
+                        "Bound world integrity failure: missing or modified core SQLite "
+                        "schema objects: " + ", ".join(sorted(changed_core))
+                    )
             db.executescript(_CORE_SCHEMA_SQL)
             # executescript commits implicitly; lock the first-run seed phase
             # so concurrent clients cannot both initialize the demo rooms.
             db.execute("BEGIN IMMEDIATE")
             if db.execute("SELECT COUNT(*) FROM rooms").fetchone()[0] == 0:
+                # An imported world can lose its rooms through external damage
+                # (or a local writer disabling foreign-key enforcement). Never
+                # disguise that loss by installing the generic demo under the
+                # *existing* world identity. Likewise, a previously used demo
+                # with surviving history/metadata is not a fresh database.
+                has_metadata = db.execute(
+                    "SELECT EXISTS(SELECT 1 FROM world_meta)"
+                ).fetchone()[0]
+                has_history = any(
+                    db.execute(f"SELECT EXISTS(SELECT 1 FROM {table})").fetchone()[0]
+                    for table in ("players", "events", "action_receipts", "items", "exits")
+                )
+                has_past_ids = db.execute(
+                    "SELECT EXISTS(SELECT 1 FROM sqlite_sequence)"
+                ).fetchone()[0]
+                if has_metadata or has_history or has_past_ids:
+                    raise WorldIntegrityError(
+                        "World integrity failure: missing all rooms in a previously "
+                        "initialized or bound world; refusing automatic demo reseed"
+                    )
                 db.executemany("INSERT INTO rooms VALUES (?,?,?)", _SEED_ROOMS)
                 db.executemany("INSERT INTO exits VALUES (?,?,?)", _SEED_EXITS)
                 db.executemany(

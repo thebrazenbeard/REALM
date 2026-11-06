@@ -15,7 +15,10 @@ from pathlib import Path
 from typing import Any
 
 from .auth import _CREDENTIAL_SCHEMA_SQL
-from .engine import Engine, _SEED_EXITS, _SEED_ITEMS, _SEED_ROOMS, _pristine_schema, _schema_snapshot
+from .engine import (
+    Engine, WorldIntegrityError, _SEED_EXITS, _SEED_ITEMS, _SEED_ROOMS,
+    _pristine_schema, _schema_snapshot,
+)
 
 
 SCHEMA = "realm.worldpack.v1"
@@ -152,20 +155,109 @@ def read_worldpack(path: str | Path) -> tuple[dict, str]:
     return pack, hashlib.sha256(semantic).hexdigest()
 
 
+def _verify_installed_worldpack(db, pack: dict, digest: str) -> None:
+    """Fail closed on an idempotent retry if imported v1 structure drifted.
+
+    In v1, room and exit definitions and item identities/descriptions are
+    authored, static worldpack data. Players can legitimately carry/drop items,
+    so their current room/holder is deliberately excluded from this comparison.
+    This is *not* an anti-tamper seal or a full SQLite integrity attestation.
+    Call only inside the importer's BEGIN IMMEDIATE transaction.
+    """
+    metadata = dict(db.execute(
+        "SELECT key,value FROM world_meta WHERE key IN "
+        "('schema','world_id','name','start_room','worldpack_sha256')"
+    ))
+    if metadata != {
+        "schema": SCHEMA,
+        "world_id": pack["world_id"],
+        "name": pack["name"],
+        "start_room": pack["start_room"],
+        "worldpack_sha256": digest,
+    }:
+        raise WorldpackError(
+            "Bound world integrity failure: installed identity/metadata differs from this worldpack"
+        )
+
+    authored_rooms = sorted(
+        (room["id"], room["name"], room["description"]) for room in pack["rooms"]
+    )
+    actual_rooms = [tuple(row) for row in db.execute(
+        "SELECT id,name,description FROM rooms ORDER BY id"
+    )]
+    if actual_rooms != authored_rooms:
+        raise WorldpackError(
+            "Bound world integrity failure: authored rooms were removed or changed"
+        )
+
+    authored_exits = sorted(
+        (room["id"], direction, destination)
+        for room in pack["rooms"]
+        for direction, destination in room["exits"].items()
+    )
+    actual_exits = [tuple(row) for row in db.execute(
+        "SELECT room_id,direction,destination FROM exits ORDER BY room_id,direction"
+    )]
+    if actual_exits != authored_exits:
+        raise WorldpackError(
+            "Bound world integrity failure: authored exits were removed or changed"
+        )
+
+    authored_items = sorted(
+        (item["id"], item["name"], item["description"])
+        for item in pack["items"]
+    )
+    actual_items = [tuple(row) for row in db.execute(
+        "SELECT id,name,description FROM items ORDER BY id"
+    )]
+    if actual_items != authored_items:
+        raise WorldpackError(
+            "Bound world integrity failure: authored item definitions were removed or changed"
+        )
+
+    # Carried/dropped locations legitimately change, but a damaged local writer
+    # can bypass SQLite CHECK constraints via PRAGMA ignore_check_constraints.
+    # An item must have exactly one location: room XOR holder. Foreign-key
+    # checks alone do not detect a simultaneously held-and-grounded item.
+    if db.execute(
+        "SELECT EXISTS(SELECT 1 FROM items WHERE "
+        "(room_id IS NULL AND held_by IS NULL) "
+        "OR (room_id IS NOT NULL AND held_by IS NOT NULL))"
+    ).fetchone()[0]:
+        raise WorldpackError(
+            "Bound world integrity failure: item has invalid room/holder placement"
+        )
+
+    # The database file may have been edited by a process that disabled FK
+    # checks. SQLite does not retroactively validate those edits on open.
+    if db.execute("PRAGMA foreign_key_check").fetchone() is not None:
+        raise WorldpackError(
+            "Bound world integrity failure: orphaned SQLite references"
+        )
+
+
 def import_worldpack(db_path: str | Path, worldpack_path: str | Path) -> dict:
     """Import once into a pristine built-in demo database, preserving live data.
 
-    Same-hash retries return an unchanged result. A different pack or an
-    already-used demo world is rejected. There is no force/reset option.
+    Same-hash retries return unchanged only after a bounded structural check
+    of installed worldpack data. A different pack or an already-used demo
+    world is rejected. There is no force/reset option.
     """
     pack, digest = read_worldpack(worldpack_path)
-    engine = Engine(db_path)
+    try:
+        engine = Engine(db_path)
+    except WorldIntegrityError as exc:
+        # Preserve the precise startup cause while keeping the importer and
+        # CLI on their documented WorldpackError error boundary. Do not hide
+        # unrelated ValueError exceptions from future Engine code.
+        raise WorldpackError(str(exc)) from exc
     with closing(engine._connect()) as db, db:
         db.execute("BEGIN IMMEDIATE")
         old_hash = db.execute("SELECT value FROM world_meta WHERE key='worldpack_sha256'").fetchone()
         if old_hash is not None:
             if old_hash[0] != digest:
                 raise WorldpackError("A different worldpack is already installed; existing world state is protected")
+            _verify_installed_worldpack(db, pack, digest)
             return {"world_id": pack["world_id"], "sha256": digest, "unchanged": True}
         existing_world_id = db.execute(
             "SELECT value FROM world_meta WHERE key='world_id'"
@@ -231,6 +323,8 @@ def main(argv: list[str] | None = None) -> int:
     try:
         result = import_worldpack(args.db, args.file)
     except (WorldpackError, OSError) as exc:
+        if isinstance(exc.__cause__, WorldIntegrityError):
+            parser.exit(2, f"Worldpack integrity error: {exc}\n")
         parser.error(str(exc))
     status = "unchanged" if result["unchanged"] else "imported"
     print(f"Worldpack {status}: {result['world_id']} (sha256={result['sha256']})")
