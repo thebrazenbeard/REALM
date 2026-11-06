@@ -42,6 +42,7 @@ import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.input.PasswordVisualTransformation
+import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.ui.unit.sp
@@ -162,7 +163,9 @@ private fun RealmTerminalScreen() {
                 OutlinedTextField(player, { player = it }, label = { Text("Player") }, modifier = Modifier.weight(0.75f))
             }
             OutlinedTextField(token, { token = it }, label = { Text("Host-issued player token (never saved)") },
-                visualTransformation = PasswordVisualTransformation(), modifier = Modifier.fillMaxWidth())
+                visualTransformation = PasswordVisualTransformation(),
+                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password),
+                modifier = Modifier.fillMaxWidth())
         }
         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
             Button(onClick = {
@@ -240,7 +243,10 @@ private fun RealmTerminalScreen() {
             label = { Text(if (awaitingLocalToken) "Local token (not saved)" else "Command") },
             visualTransformation = if (awaitingLocalToken) PasswordVisualTransformation()
                 else androidx.compose.ui.text.input.VisualTransformation.None,
-            keyboardOptions = KeyboardOptions(imeAction = ImeAction.Send),
+            keyboardOptions = KeyboardOptions(
+                imeAction = ImeAction.Send,
+                keyboardType = if (awaitingLocalToken) KeyboardType.Password else KeyboardType.Text,
+            ),
             keyboardActions = KeyboardActions(onSend = { send() }),
             modifier = Modifier.fillMaxWidth(),
         )

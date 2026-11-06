@@ -27,20 +27,33 @@ token, private fiction, or world authority is embedded in the app.
   transport mode. Android backups are disabled. Terminal content is in-memory,
   bounded and not persisted; local Telnet input is never echoed to transcript.
 
-## $0 local build
+## $0 local build — reproducible offline qualification
 
-1. Install the free Android Studio, Android SDK Platform 36 and JDK 17 on an
-   authorized development machine. Open the `clients/android` folder.
-2. Allow Gradle to resolve the documented public Android/Compose/Kotlin
-   artifacts; the project does not bundle a Gradle wrapper JAR or binaries.
-3. Run `:app:testDebugUnitTest` and `:app:assembleDebug` in Android Studio (or
-   `gradle :app:testDebugUnitTest :app:assembleDebug` if a suitable Gradle
-   executable is already installed).
-4. Inspect the local result under `app/build/outputs/apk/debug/`; record its
-   SHA-256 and source Git head before any physical-device testing.
+1. On an authorized build machine, provision **already downloaded and
+   provenance-checked** JDK 17+, Android SDK Platform 36, Android SDK Build
+   Tools 35.0.0, and Gradle **8.13.x**. Android Gradle Plugin 8.13.2, Kotlin
+   2.2.21, Compose libraries and all transitive dependencies must likewise
+   already exist in the Gradle cache. Nothing is downloaded by the script.
+   The project deliberately does not bundle a Gradle wrapper executable/JAR.
+2. Set `ANDROID_HOME` (or `ANDROID_SDK_ROOT`) to the installed Android SDK;
+   put `java`, `javac`, `gradle` and `python` on `PATH`.
+3. Run `python scripts/build_offline.py --preflight`, then
+   `python scripts/build_offline.py` from `clients/android`. The script runs
+   `gradle --offline --no-daemon --no-watch-fs :app:testDebugUnitTest
+   :app:assembleDebug` and disables Java toolchain auto-download.
+4. Only on success, the script prints the actual
+   `app/build/outputs/apk/debug/app-debug.apk` path, SHA-256 and source head.
+   This qualifies only a local debug build plus unit tests—*not* device
+   security, remote TLS routing or player acceptance.
 
-This environment did **not** have an Android SDK, Gradle or Kotlin compiler,
-so no APK or Android unit-test pass is claimed by the source-only commit.
+Gradle's `--offline` disables dependency resolution over the network; it is
+not an operating-system network sandbox for arbitrary plugins. For formal
+network-denied build evidence, execute on a host with outbound networking
+disabled. Do not add a wrapper bootstrap, public CI minutes or artifact
+downloads without reviewing provenance, package size, costs and rights first.
+
+The inspected environment did **not** have a complete Android SDK, Gradle or
+Kotlin compiler (nor `javac`), so no APK or Android unit-test pass is claimed.
 The pure-Kotlin JUnit tests are written but require the actual Android toolchain
 to execute.
 
