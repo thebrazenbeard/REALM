@@ -90,7 +90,9 @@
         const terrain = tile ? tile.terrain.toLowerCase() : "unknown";
         cell.className = "map-cell" + (TERRAIN_CLASSES.has(terrain) ? ` map-${terrain}` : "") +
           (marker ? " map-marker" : "") + (isPlayer ? " map-player" : "");
-        cell.textContent = isPlayer ? "@" : (marker ? (MARKER_GLYPHS[marker] || "*") : (tile ? tile.glyph : " "));
+        cell.textContent = isPlayer ? "@" : (marker ? (
+          Object.prototype.hasOwnProperty.call(MARKER_GLYPHS, marker) ? MARKER_GLYPHS[marker] : "*"
+        ) : (tile ? tile.glyph : " "));
         cell.setAttribute("role", "gridcell");
         cell.setAttribute("aria-label", `${x},${y}: ${isPlayer ? "your position" : marker || (tile ? terrain : "unexplored")}`);
         row.append(cell);
@@ -111,6 +113,7 @@
 
   function setUnavailable(elements, message = "No host map available.") {
     elements.grid.replaceChildren();
+    elements.grid.setAttribute("aria-label", "No host map available");
     elements.space.textContent = "Unknown location";
     elements.position.textContent = "—";
     elements.status.textContent = "MAP UNAVAILABLE";
