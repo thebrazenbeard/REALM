@@ -69,8 +69,12 @@ optional local model (untrusted suggestion)     deterministic planner (fallback)
 
 The scheduler is a **single active host writer per world**. A logical tick is
 `(world_instance_id, tick_seq, scheduler_version, ruleset_version)`, not
-`time.time()` or a model's estimate of elapsed time. Persist its cursor in the
-world DB. Wall time is metadata only, not a source of nondeterministic game
+`time.time()` or a model's estimate of elapsed time. Persist two separate
+watermarks: `planned_through` (all intent rows durably allocated through this
+tick) and `finalized_through` (all intents for every tick through this tick
+have terminal dispositions). `finalized_through` advances **contiguously**;
+it cannot skip an incomplete earlier tick even when later ticks are done.
+Wall time is metadata only, not a source of nondeterministic game
 outcomes. Existing `Engine._event` does stamp real UTC time; deterministic
 fixture comparisons must explicitly exclude that metadata or introduce a
 separate logical occurrence field. A host-controlled cadence may be
@@ -80,36 +84,65 @@ explicit paused/skipped-tick record.
 Proposed host transaction and recovery rules:
 
 1. Acquire a validated single-scheduler lease/ownership fence bound to the
-   world instance and epoch before work. SQLite write locking alone is **not**
-   a leader election protocol. Startup must fail closed if competing host
-   ownership cannot be established. No cross-machine shared-folder SQLite
-   authority is presumed safe.
+   world instance, scheduler owner and monotonically increasing epoch before
+   work. SQLite write locking alone is **not** a leader election protocol.
+   Startup must fail closed if competing host ownership cannot be established.
+   **Critically, lease prechecking in the coordinator is insufficient:** the
+   current `Engine.act` has no scheduler-fence argument or in-transaction
+   comparison. The future fenced commit API **must check `(world_id, owner,
+   epoch, lease_validity)` inside the very same `BEGIN IMMEDIATE` transaction
+   that applies the game action and receipt**. If a newer owner stole the
+   lease, the old owner cannot commit—even if it checked the lease milliseconds
+   earlier. No cross-machine shared-folder SQLite authority is presumed safe.
 2. In a short DB transaction, snapshot the authoritative room, participant,
    permission and drive versions; calculate bounded eligible residents in
-   deterministic order; durably record `tick_seq` and immutable intent IDs.
-   No external model call may hold a SQLite write lock.
+   deterministic order; durably allocate immutable intent IDs in state
+   `PLANNED`, then advance `planned_through`. No external model call may hold
+   a SQLite write lock. The initial plan binds actor, world, tick, ruleset,
+   model/strategy revision, observation snapshot and host-owned action ID.
 3. Produce proposals outside the transaction from a deterministic fallback or
-   an optional time-limited model. Seed any stochastic deterministic planner
-   from a persisted stable seed plus tick/resident IDs (never Python's
-   randomized `hash()`). Model text may vary; **only committed host effects**
-   are authoritative and replayable.
+   an optional time-limited model. Seed any deterministic planner from a
+   persisted stable seed plus tick/resident IDs (never Python's randomized
+   `hash()`). **Before any effect attempt**, durably transition the intent to
+   `PROPOSED` with the exact, bounded proposal bytes, encoding, hash and
+   validator/strategy versions. A model's unpersisted partial answer is not
+   evidence of an accepted proposal. If a process crashes while an intent is
+   still `PLANNED`, **never regenerate stochastic output and pretend it is the
+   same intent**: terminate as `provider-error`/`no-proposal` with no action,
+   or replay only a specifically proven deterministic, pinned planner under
+   a separately versioned policy. A stochastic retry, if wanted, needs a
+   **new** intent ID and authorization/quota decision.
 4. Validate the exact intent against current state and policy immediately
    before commit. Changed room, permissions, target ownership, epoch or
    state version invalidates the proposal. Reject stale intent; do not silently
    reinterpret it as another action.
-5. Commit through the Engine's transactional command path using a host-derived,
-   immutable `(actor, action_id)`. Existing receipts deduplicate identical
-   actions; a mismatched retry must fail, including after process restart.
-   Record a durable tick disposition (`committed`, `rejected`, `expired`,
-   `no-op`, `provider-error`) so the coordinator cannot regenerate a *different*
-   action under the same intent ID.
-6. Advance the durable tick cursor **only after** all required intents have
-   terminal dispositions. Recovery must resume outstanding intents with their
-   original IDs and proposals, not recompute a new plan. Prefer an atomic
-   coordinator/Engine write path for cursor and effect. Where existing
-   `Engine.act` creates a separate transaction, the design must demonstrate
-   crash-safe reconciliation using its action receipt before declaring the
-   tick complete.
+5. Transition `PROPOSED → APPLYING` durably before effect application and
+   commit via a **new fenced Engine transaction path**, using the host-derived,
+   immutable `(actor, action_id)` plus exact recorded proposal bytes/hash.
+   The fence, state-version revalidation, action effect and action receipt
+   must execute under one database write transaction; an unfenced call to
+   current `Engine.act` is **not a substitute**. Existing receipts illustrate
+   deduplication, but this future path must preserve it while adding fencing.
+6. Transition `APPLYING → TERMINAL` with a durable disposition (`committed`,
+   `rejected`, `expired`, `no-op`, `provider-error`) and effect receipt link.
+   At recovery, an `APPLYING` row must be reconciled by checking the *exact*
+   actor/action ID, command, hash, epoch and authoritative Engine receipt: if
+   already committed, finalize without reapplying; if absent, revalidate and
+   apply only the **identical persisted** proposal under a valid new fence,
+   or terminate rejected. Any disagreement fails closed for review.
+7. Advance `finalized_through` only across a continuous prefix of ticks whose
+   every intent is `TERMINAL`, including explicit no-action dispositions.
+   Reconciliation must survive crashes between Engine effect, disposition and
+   cursor advancement. Where the future API cannot atomically combine all
+   three, receipt-driven recovery must prove equivalent outcomes with fault
+   injection; the present `Engine.act` does **not** yet satisfy this contract.
+
+Allowed durable intent transitions are `PLANNED → PROPOSED(bytes/hash) →
+APPLYING → TERMINAL`; `PLANNED → TERMINAL(no-proposal)` and `PROPOSED →
+TERMINAL(rejected/expired)` are explicit fail-closed exits. Do not collapse
+"planned" with "proposed", or use a completed later tick to hide an unresolved
+earlier one. Model text may vary; **only committed host effects** are
+authoritative and replayable.
 
 Keep concurrency budgets small and explicit: maximum residents per tick,
 proposals per resident, prompt/output bytes, model wall-clock timeout, SQLite
@@ -144,16 +177,26 @@ as a verified runtime property.
 
 Use two distinct layers:
 
-- **Immutable source reference:** canonical `events.id` plus DB/world identity,
+- **Source event reference:** canonical `events.id` plus DB/world identity,
   event kind, observed actor, room, ruleset and observation/visibility version.
-  Store the provenance and the resident's observation entitlement at the time
-  of capture. An NPC must not learn events from another room merely because a
-  global event table contains them.
+  A **host-issued, event-time observation grant** must prove that this specific
+  resident was entitled to learn that specific fact when it happened, under
+  then-current room, sensory, relationship, privacy and consent rules. Neither
+  `events(room_id=...)` nor the engine's `history` text is an observation-grant
+  database: a resident arriving later must not inherit earlier local secrets.
+  The current events table lacks grants; replay or reconstruction from room
+  membership alone cannot repair their absence. No historical memory is
+  backfilled without explicit evidence of event-time entitlement.
 - **Derived memory:** bounded per-resident episodic records citing one or
   more eligible events, optional confidence/summary, and retention policy.
-  Retrieval filters by resident/world/visibility and returns source IDs with
-  snippets; summaries are search aids, never ledger replacements or proof of
-  knowledge. Missing/revoked source means do not assert the remembered fact.
+  Retrieval filters by resident/world, **issued observation grants and their
+  current revocation/retention state**, then returns source IDs with snippets;
+  summaries are search aids, never ledger replacements or proof of knowledge.
+  Consent revocation, player deletion/retention expiry or stricter privacy
+  policy may remove a memory from future NPC retrieval even if the append-only
+  game event remains for legitimate audit/gameplay. Do not treat an old grant
+  as perpetual consent to disclose a private chat. Missing/revoked source or
+  grant means do not assert the remembered fact.
 
 Explicitly separate direct observation, attributed speech, rumor, inference
 and model-generated embellishment. A player saying "I killed the king" is
@@ -220,29 +263,48 @@ Persist world ID, schema/ruleset versions and provenance relationships, and
 enforce foreign keys, uniqueness, bounded payload sizes and scoped deletion.
 Avoid a database table whose content directly encodes executable model output.
 
-Any migration must use the engine's guarded schema/worldpack checks,
-prefer a new scratch database for qualification, reject ambiguous legacy
-schemas, and have a measured rollback/backup strategy for owner data. Never
-automatically rewrite existing player worlds on package import or process
-startup. A self-hosted server can operate with its model adapter entirely
-disabled and all optional worldpacks absent.
+**First-time worldpack import currently enforces an exact SQLite schema
+fingerprint.** For a not-yet-imported world, `import_worldpack` checks
+`_schema_snapshot(db) == _pristine_schema(...)`, including the optional
+existing `player_credentials` schema. Adding any simulation table **before
+first import** would cause an otherwise pristine demo import to be rejected.
+An already imported worldpack with the **same semantic hash** is an
+idempotent early return *before* that fingerprint check, so later optional
+simulation tables do not by themselves break same-hash re-import. A different
+hash is still rejected. This distinction is intentional protection, not a
+reason to weaken first-import checks to a permissive subset. Choose and test
+a versioned, explicit path:
+import a worldpack into a pristine supported engine schema **first**, then
+apply the opt-in living-world migration; or update the canonical pristine
+fingerprint/schema-version contract and corresponding importer tests
+atomically. The two versions must never silently treat extra SQLite objects
+as safe. Preserve `world_id`, `worldpack_sha256`, existing credentials, ledger
+rows and receipts; reject unknown schema versions and ambiguous legacy DBs.
+
+Any migration must use these guarded schema/worldpack checks, prefer a fresh
+scratch DB for qualification, and have a measured rollback/backup strategy
+for owner data. Never automatically rewrite existing player worlds on package
+import or process startup. A self-hosted server can operate with its model
+adapter entirely disabled and all optional worldpacks absent.
 
 ## 8. Falsification and acceptance matrix (all **UNEXECUTED**)
 
 | Gate | Required hostile test | Passing evidence |
 | --- | --- | --- |
-| T1 ownership | Launch two coordinators against one world; race/fail lease epoch. | Exactly one eligible writer; stale owner cannot advance a tick. |
-| T2 restart | Kill coordinator before intent, after intent, after Engine commit, before cursor advance. | No duplicated effect, changed replay action, lost receipt or skipped intention. |
+| T1 ownership | Launch two coordinators against one world; precheck epoch, then steal lease immediately before the old owner enters Engine commit. | Atomic in-`Engine.act`-equivalent fence rejects old epoch with **zero** effect/receipt; exactly one eligible writer. |
+| T2 restart | Crash during model output before `PROPOSED`, after proposal persistence, after `APPLYING`, after Engine effect, before terminal/cursor advancement. | Exact stored proposal/hash replayed or fail-closed no-proposal; no stochastic regeneration, duplicate effect, changed replay action or lost receipt. |
+| T2b watermark | Finalize tick 12 while tick 11 is incomplete; restart and repair tick 11. | `planned_through` can exceed `finalized_through`; no holes in finalized range; advancement only after tick 11 terminal. |
 | T3 clocks | Pause host for hours; modify wall clock forward/back; resume. | Bounded deterministic catch-up and no uncontrolled wall-clock action flood. |
 | T4 determinism | Replay a pinned seed/ruleset/world event fixture with models disabled. | Identical ordered intents, drive transitions, action receipts and canonical game-state hash excluding real-time metadata. |
 | T5 model adversary | Inject actor/SQL/approval metadata, prompt injections and oversized/slow output. | Strict parse failure/no privileges; bounded timeout/no world mutation. |
 | T6 stale observation | Have a human move or take target while NPC inference is pending. | Old proposal rejected against fresh state; no retargeting/duplicate take. |
-| T7 memory boundaries | Put secrets/chat in other room/world; generate rumors and fake model summaries. | No invisible facts in NPC recall; speech not promoted to event truth; citations check out. |
+| T7 memory boundaries | Put secrets/chat in other room/world, move an NPC into the room later, then revoke observation consent; generate rumors and fake model summaries. | Event-time grant required; no retrospective room-history visibility; revoked private recall denied; speech not promoted to event truth. |
 | T8 world isolation | Clone seed into two DBs, same resident names/action IDs and different events. | No cross-world state, memory, faction or receipt leakage. |
 | T9 factions | Concurrent resource claims, rank escalation and hostile NPC expulsion proposal. | Single serialized resource outcome; unauthorized rank/expulsion denied. |
 | T10 irrevocable | Model suggests permanent death, territory destruction or economy mint. | Default-deny with audit; no ledger/economy mutation. |
 | T11 $0 fallback | Remove model runtime/network, exhaust time/CPU/RAM budget. | Deterministic host continues safely or pauses explicitly; no cloud request/spend. |
 | T12 two clients | Two actual clients watch one NPC commit, reconnect over missed events. | Same authoritative event IDs/room views; no invented client or NPC effect. |
+| T13 schema | Import worldpack before and after proposed schema migration in fresh/legacy DBs; alter one constraint or insert an unknown table. | Supported versioned order succeeds without weakening exact fingerprint; unsupported/mutated schema is rejected with no content loss. |
 
 Tests must record exact source revision, Python/SQLite version, ruleset and
 fixture hashes, DB-before/after hashes or canonical SQL snapshots, command,
