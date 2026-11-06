@@ -132,3 +132,19 @@ missing-map recovery after travel, local token DOM clearing, and denial of
 cleartext non-loopback endpoints. These tests exercise the actual `docs/app.js`
 source inside a controlled simulated DOM and HTTP fetch; they are **not** a
 Chromium/Firefox run and do not prove compatibility with a live REALM server.
+
+### Live Python gateway protocol test
+
+When the Python gateway/geography integration has been assembled in this same
+checkout, `node --test tests/browser/test-client.cjs` also starts an ephemeral,
+**loopback-only** Python REALM server against a temporary SQLite database. It
+builds one explicitly authored **generic** 3×2 map, then drives the actual
+browser controller's join, map, movement, disconnect, and wrong-token paths
+through real HTTP requests. The subprocess is terminated and temporary data
+is removed after the test. If gateway source is not present on a browser-only
+stacked branch, this specific integration case is explicitly **skipped**.
+
+Executed separately against REALM map-gateway Draft PR #12 (`41b064209...`):
+**13/13 Node tests passed** (including live Python gateway). This is stronger
+than independent mocks but **still not a Chromium/Firefox rendering test**, nor
+production authentication, remote HTTPS qualification, deployment or publication.
