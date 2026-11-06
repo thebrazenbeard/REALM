@@ -17,7 +17,7 @@ commands. None of those layers depends on a particular fantasy setting.
 | Dynamic drives and goals | **Planned:** persistent, versioned state per NPC and deterministic drive updates | Tests for replay/restart, bounded priorities, conflict handling |
 | Deep memory | **Planned:** scoped episodic facts anchored to source events; semantic summaries as derived hints | Retention, trust/provenance, retrieval isolation, hallucination rejection |
 | Real-time evolving world | **Planned:** host-owned ticks and durable simulation transitions | Backfill/cursor safety, restart, pressure limits, event delivery |
-| Android client | **Separate idea lane:** [issue #18](https://github.com/thebrazenbeard/REALM/issues/18) | Native client, remote protocol, Patrick's physical phone tests |
+| Android client | **Separate source scaffold (not built):** [clients/android](../clients/android/README.md), [issue #18](https://github.com/thebrazenbeard/REALM/issues/18) | Verified APK build, qualified remote HTTPS host, Patrick's physical-phone tests |
 
 ## Agent action contract
 
@@ -41,7 +41,7 @@ performed something is not evidence that the host saved or executed it.
 - `worlds/flagship/siltglass-reach/`: optional original story data; no code
   imports from the engine or automatic injection into other people's worlds.
 - User worldpacks: loaded only by an explicit host import into a fresh database.
-- `clients/android/` (future): presentation and transport, never authoritative
+- `clients/android/` (source scaffold): presentation and transport, never authoritative
   gameplay state or copied fictional canon.
 - Local GGUF weights (optional): host-managed external files, never bundled in
   this source repository or required to boot a deterministic world.

@@ -57,6 +57,9 @@ The current integration candidate supports:
   display. GitHub Pages does not run the game server.
 - A separately gated loopback-only Telnet adapter (`TERMINAL.md`). Its local
   token is not the HTTP player identity system.
+- A **separate Android client source scaffold**, [REALM Terminal](clients/android/README.md):
+  HTTPS-first profiles, inert ANSI text, and loopback-only Telnet test mode.
+  There is no built APK, qualified phone connection, or Android test run yet.
 
 **Not implemented or qualified:** public TLS hosting, rate limits, public
 account registration, expiring sessions, fog of war, AI/NPC co-player loops,
