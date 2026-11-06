@@ -84,4 +84,13 @@ test("unavailable map explicitly clears the previous world snapshot", () => {
   assert.equal(els.grid.children.length, 0);
   assert.equal(els.note.textContent, "Host does not offer a map route.");
   assert.equal(els.status.textContent, "MAP UNAVAILABLE");
+  assert.equal(els.grid.attributes["aria-label"], "No host map available");
+});
+
+test("unknown marker kinds cannot inherit Object prototype names", () => {
+  const doc = { createElement: element, createDocumentFragment: element };
+  const els = { grid: element(), space: element(), position: element(), status: element(), note: element(), legend: element() };
+  const data = fixture(); data.markers[0].kind = "constructor";
+  map.renderMap(doc, els, data);
+  assert.equal(els.grid.children[0].children[0].children[2].textContent, "*");
 });
