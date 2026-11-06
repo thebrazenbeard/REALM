@@ -70,7 +70,9 @@ class _TelnetFilter:
             elif self.state == "subneg_iac":
                 if byte == SE:
                     self.state = "data"
-                elif byte != IAC:
+                else:
+                    # RFC 855: IAC IAC encodes one parameter byte. A later
+                    # SE without a fresh IAC is not a subnegotiation terminator.
                     self.state = "subneg"
         return bytes(body), bytes(reply)
 

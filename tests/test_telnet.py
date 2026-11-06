@@ -1,6 +1,7 @@
 """Socket-level qualification of the local-only terminal adapter."""
 
 import socket
+from contextlib import closing
 import sys
 import tempfile
 import threading
@@ -27,6 +28,23 @@ class TelnetFilterTests(unittest.TestCase):
         filt = _TelnetFilter()
         self.assertEqual((b"a", b""), filt.feed(b"a\xff\xfa\x18abc\xff"))
         self.assertEqual((b"bc", b""), filt.feed(b"\xf0bc"))
+
+    def test_escaped_iac_inside_subnegotiation_cannot_end_it_early(self):
+        # RFC 855: IAC IAC is a single escaped 0xff parameter byte;
+        # only a separate *unescaped* IAC SE terminates subnegotiation.
+        injected = (b"\xff\xfa\x01\xff\xff\xf0say SMUGGLED\r\n"
+                    b"\xff\xf0say CLEAN\r\n")
+        for cut in range(1, len(injected)):
+            with self.subTest(split=cut):
+                filt = _TelnetFilter()
+                body_a, reply_a = filt.feed(injected[:cut])
+                body_b, reply_b = filt.feed(injected[cut:])
+                self.assertEqual(b"say CLEAN\r\n", body_a + body_b)
+                self.assertEqual(b"", reply_a + reply_b)
+        bytewise = _TelnetFilter()
+        self.assertEqual(
+            b"say CLEAN\r\n", b"".join(bytewise.feed(bytes([byte]))[0] for byte in injected),
+        )
 
 
 class TerminalServerTests(unittest.TestCase):
@@ -110,6 +128,24 @@ class TerminalServerTests(unittest.TestCase):
         self.receive_until(conn, b"REALM> ")
         conn.sendall(b"\xff\xfd\x03look\r\x00")
         self.assertIn("The Atrium", self.receive_until(conn, b"REALM> "))
+
+    def test_telnet_subnegotiation_payload_cannot_become_player_command(self):
+        conn = self.login("Alice")
+        # The attempted say command is inside SB payload despite the escaped
+        # IAC IAC SE bytes. Only the command after genuine IAC SE may execute.
+        conn.sendall(b"\xff\xfa\x01\xff")
+        conn.sendall(b"\xff\xf0say SMUGGLED\r\n")
+        conn.sendall(b"\xff\xf0say CLEAN\r\n")
+        response = self.receive_until(conn, b"REALM> ")
+        self.assertIn("You say: CLEAN", response)
+        self.assertNotIn("SMUGGLED", response)
+        with closing(self.engine._connect()) as db:
+            say = db.execute(
+                "SELECT payload_json FROM events WHERE actor='Alice' AND kind='say' ORDER BY id"
+            ).fetchall()
+        self.assertEqual(1, len(say))
+        self.assertIn("CLEAN", say[0]["payload_json"])
+        self.assertNotIn("SMUGGLED", say[0]["payload_json"])
 
     def test_invalid_name_and_oversized_input(self):
         conn = self.connect()
