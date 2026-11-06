@@ -8,7 +8,9 @@ names are **optional content**, not part of REALM's generic architecture.
 The entry point `scripts/run_siltglass_npc_duet.py`:
 
 1. Checks both previously downloaded **off-Git** GGUF file sizes and SHA-256
-   against the pinned research record. It never downloads anything.
+   against the pinned research record. It also requires a **host-approved
+   exact SHA-256 for `llama-server.exe`**, rejecting unknown binaries even if
+   they have the correct filename. Neither models nor executables download.
 2. Requires an **entirely new**, user-selected SQLite database path outside
    the checkout. Never overwrites or reuses an existing save or identity.
 3. Imports only the optional, validated Siltglass Reach worldpack and reserves
@@ -23,6 +25,11 @@ The entry point `scripts/run_siltglass_npc_duet.py`:
    so loopback responses cannot send prompts to an external endpoint. The
    JSON response must identify the exact selected local model path. No
    console output becomes NPC speech.
+   Before every process launch, the executable's canonical resolved path and
+   SHA-256 are checked again, as are the model bytes; direct adapter use
+   cannot skip those checks. Symlink and junction path indirections fail
+   closed. **This does not eliminate a same-host path-replacement race**
+   between the last hash and the operating system's process-file open.
    The Soup06 role uses `--reasoning off` and its raw TONE/FACT/OUT prompt.
    The API may consume a configured full-stop delimiter; the host restores
    only that verified `.` for one-line speech. At most four turns are allowed.
@@ -37,6 +44,7 @@ From an up-to-date source checkout on Windows Lappy, choose a **fresh path**:
 py -3 .\scripts\run_siltglass_npc_duet.py `
   --db 'D:\VERA\realm-worlds\siltglass-reach\npc-duet-unique-trial.sqlite3' `
   --llama-server 'C:\path\to\your\llama-server.exe' `
+  --llama-server-sha256 '<host-approved-64-hex-SHA256>' `
   --stealth-model 'D:\VERA\models\realm-npc\stealth-rifle-Q4_K_M.gguf' `
   --soup-model 'D:\VERA\models\realm-npc\npc-voice-soup06.Q5_K_M.gguf' `
   --session local_trial_01 `
@@ -49,7 +57,15 @@ for every fresh experiment. The script refuses existing DBs, including
 partially completed ones, because a live model timeout or unexpected text
 must never trigger blind re-execution against saved state.
 Replace the `llama-server.exe` placeholder with the actual executable on your
-own host; do not commit home-directory paths or private local configuration.
+own host; obtain the expected SHA-256 from a reviewed, trusted installation
+record and compare it to `Get-FileHash -LiteralPath '<full executable path>'
+-Algorithm SHA256` before the run. **Merely hashing an untrusted download
+does not authenticate its publisher or establish release provenance.** Do
+not commit home-directory paths or private local configuration.
+
+This strict-pin change does not install a new `llama-server.exe` or invent
+its digest; the operator must supply the exact approved value. Existing
+scripts without `--llama-server-sha256` now fail closed until updated.
 
 For source-only regression with no models or downloads:
 
@@ -74,6 +90,16 @@ python -m unittest discover -s tests -q
   during each model turn and is explicitly terminated afterward. No game
   Telnet/HTTP listener is started, no phone connects, no shared account is
   provisioned, and no endpoint is exposed through Tailscale or the Internet.
+- A free ephemeral TCP port is selected then released before child bind.
+  A **local same-host process** could theoretically race to occupy that port
+  and spoof `/health` and `/completion` with the expected model path string.
+  The parent PID and model path response checks do not cryptographically bind
+  the HTTP listener to that PID. Hosts should be locally trusted for this
+  proof; stronger IPC/owner-PID binding is a separate qualification task.
+- Windows reparse points, ACL changes, filesystem replacement and process
+  creation have OS-specific race windows. SHA-256 and path checks reduce
+  accidental/unauthorized binary substitution; they are not an execute-by-
+  immutable-file-handle guarantee. Do not run on a hostile shared host.
 - Partial failure can leave an honestly partial database with some committed
   speech, not a magically rolled-back conversation. Inspect before deciding
   whether to preserve it; don't just rerun a new session blindly.
