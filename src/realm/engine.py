@@ -102,6 +102,10 @@ def _pristine_schema(extra_sql: str = "") -> dict[str, tuple[str, str, str | Non
         return _schema_snapshot(db)
 
 
+class WorldIntegrityError(ValueError):
+    """Existing world data/schema is damaged; startup must not auto-repair."""
+
+
 class Engine:
     """One database file is one isolated REALM instance.
 
@@ -157,7 +161,7 @@ class Engine:
                     if existing_schema.get(name) != definition
                 ]
                 if changed_core:
-                    raise ValueError(
+                    raise WorldIntegrityError(
                         "Bound world integrity failure: missing or modified core SQLite "
                         "schema objects: " + ", ".join(sorted(changed_core))
                     )
@@ -182,7 +186,7 @@ class Engine:
                     "SELECT EXISTS(SELECT 1 FROM sqlite_sequence)"
                 ).fetchone()[0]
                 if has_metadata or has_history or has_past_ids:
-                    raise ValueError(
+                    raise WorldIntegrityError(
                         "World integrity failure: missing all rooms in a previously "
                         "initialized or bound world; refusing automatic demo reseed"
                     )
