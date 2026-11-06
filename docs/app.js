@@ -39,6 +39,7 @@
   const MAX_FEED_ITEMS = 160;
   let requestSerial = 0;
   let current = null; // In-memory only: no session, endpoint, or token storage.
+  let connecting = null; // Prevent overlapping joins while current is still null.
 
   function setNote(message, error = false) {
     ui.note.textContent = message;
@@ -120,7 +121,7 @@
         body: options.body ? JSON.stringify(options.body) : undefined,
         credentials: "omit",
         cache: "no-store",
-        signal: options.signal,
+        signal: options.signal || session.abortController.signal,
       });
     } catch {
       throw new Error("The host could not be reached. Check its address, HTTPS, CORS origin, and network access.");
@@ -144,12 +145,18 @@
 
   function stopSession({ note } = {}) {
     if (current) {
+      if (connecting === current) connecting = null;
       clearInterval(current.timer);
+      // Cancel any in-flight room, map, feed, or command response belonging to
+      // this session, and release its credential before a future reconnect.
+      current.abortController.abort();
+      current.token = "";
       current = null;
     }
     // Drop the only DOM copy of the access token on disconnect.
     ui.accessToken.value = "";
     setConnectionState(false);
+    ui.connect.textContent = "Connect";
     ui.worldName.textContent = "Unconnected";
     ui.player.textContent = "None";
     ui.worldState.textContent = "Not loaded";
@@ -228,7 +235,7 @@
 
   async function connect(event) {
     event.preventDefault();
-    if (current) return;
+    if (current || connecting) return;
     if (!ui.connectionForm.reportValidity()) return;
     const player = ui.playerName.value.trim();
     const token = ui.accessToken.value.trim();
@@ -241,8 +248,9 @@
     ui.connect.disabled = true;
     ui.connect.textContent = "Connecting…";
     setNote("Contacting the host…");
-    const session = { base, token, player, cursor: 0, polling: false, failures: 0,
+    const session = { base, token, player, abortController: new AbortController(), cursor: 0, polling: false, failures: 0,
       mapUnsupported: false, mapPolling: false, mapUpdated: 0, timer: null };
+    connecting = session;
     try {
       const health = await request(session, "/api/v1/health", { unauthenticated: true });
       if (health.ok !== true || typeof health.world_id !== "string") throw new Error("The endpoint is not a compatible REALM gateway.");
@@ -260,16 +268,25 @@
       setNote("Connected. Your browser token is held in memory only and will be cleared when you disconnect.");
       appendFeed({ label: "HOST / JOIN", message: typeof joined.text === "string" ? joined.text : "Connected to host.", icon: "✦" });
       try { await refreshRoom(session); }
-      catch (error) { appendFeed({ category: "error", label: "ROOM UPDATE", message: error.message, icon: "!" }); }
+      catch (error) {
+        if (current === session) appendFeed({ category: "error", label: "ROOM UPDATE", message: error.message, icon: "!" });
+      }
+      if (current !== session) return;
       await refreshMap(session);
+      if (current !== session) return;
       session.timer = setInterval(() => poll(session), POLL_DELAY_MS);
       ui.commandInput.focus();
     } catch (error) {
       stopSession({ note: "Connection failed: " + error.message });
       ui.note.classList.add("is-error");
     } finally {
-      ui.connect.textContent = "Connect";
-      if (!current) ui.connect.disabled = false;
+      // A disconnected attempt may finish after a newer connection starts.
+      // Its finally block must not change the new attempt's controls.
+      if (connecting === session) {
+        connecting = null;
+        ui.connect.textContent = "Connect";
+        if (!current) ui.connect.disabled = false;
+      }
     }
   }
 
@@ -294,8 +311,12 @@
         return;
       }
       try { await refreshRoom(session); }
-      catch (error) { appendFeed({ category: "error", label: "ROOM UPDATE", message: error.message, icon: "!" }); }
+      catch (error) {
+        if (current === session) appendFeed({ category: "error", label: "ROOM UPDATE", message: error.message, icon: "!" });
+      }
+      if (current !== session) return;
       await poll(session);
+      if (current !== session) return;
       await refreshMap(session);
     } catch (error) {
       if (current === session) appendFeed({ category: "error", label: "COMMAND REJECTED", message: error.message, icon: "!" });

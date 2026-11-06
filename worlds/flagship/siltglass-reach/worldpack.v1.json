@@ -1,0 +1,202 @@
+{
+  "schema": "realm.worldpack.v1",
+  "world_id": "siltglass-reach",
+  "name": "Siltglass Reach",
+  "start_room": "tidegate",
+  "rooms": [
+    {
+      "id": "tidegate",
+      "name": "The Tidegate",
+      "description": "Three brass lines mark the highest river levels anyone remembers, but a fourth has been cut above them. A public slate asks travelers to report changed paths before entering the Reach. The lantern-lit jetty lies east; the riverfront tavern is south.",
+      "exits": {"east": "lantern_jetty", "south": "knot_tavern"}
+    },
+    {
+      "id": "lantern_jetty",
+      "name": "Lantern Jetty",
+      "description": "Mooring posts lean over water that flashes like broken glass when a boat passes. Two benches face opposite shores, as though their owners disagreed about which bank counted as home. The net yard is east and the cargo office south.",
+      "exits": {"west": "tidegate", "east": "net_yard", "south": "cargo_ledger"}
+    },
+    {
+      "id": "net_yard",
+      "name": "The Net Yard",
+      "description": "Fisherfolk have hung empty nets across frames to dry, each tagged with the day it was last safe to cross the channel. A chalked warning points toward the spillway, while a rhythmic hammer carries up from the smithy.",
+      "exits": {"west": "lantern_jetty", "east": "old_spillway", "south": "coop_smithy"}
+    },
+    {
+      "id": "old_spillway",
+      "name": "Old Spillway",
+      "description": "The spillway has been dry for years. Beneath its worn measuring stones stands a narrow arch whose far side shows a different slope of hillside. It is a fixed passage for this demonstration: use 'go archway' to reach the distant fault arch.",
+      "exits": {"west": "net_yard", "south": "quarantine_steps", "archway": "fault_arch"}
+    },
+    {
+      "id": "knot_tavern",
+      "name": "The Knotted Bell",
+      "description": "A small tavern keeps a river chime beside its hearth. One wall lists missing cargo; the other bears signatures demanding that the crossing remain open. Travelers can speak here, compare stories, or carry a warning south toward the civic quarter.",
+      "exits": {"north": "tidegate", "east": "cargo_ledger", "south": "risen_path"}
+    },
+    {
+      "id": "cargo_ledger",
+      "name": "Cargo Ledger Office",
+      "description": "A weighing scale sits beneath shelves of damp books. The official record gives yesterday's ferry a full load, but a scorched receipt on the floor records less. Neither document can explain where the missing weight went.",
+      "exits": {"north": "lantern_jetty", "west": "knot_tavern", "east": "coop_smithy"}
+    },
+    {
+      "id": "coop_smithy",
+      "name": "Common Forge",
+      "description": "The forge belongs to the quay workers collectively, and its tools carry more than one maker's mark. A spare metal bracket rests near a damaged warning-bell frame. It might be a useful prop when discussing repairs, though the engine does not install parts.",
+      "exits": {"north": "net_yard", "west": "cargo_ledger", "east": "quarantine_steps"}
+    },
+    {
+      "id": "quarantine_steps",
+      "name": "Quarantine Steps",
+      "description": "Blue warning stakes divide the public stair from a narrow ramp covered in pale dust. No one agrees whether the dust is dangerous or merely unfamiliar. A loose hazard flag could help another explorer mark a route without claiming to have tested it.",
+      "exits": {"north": "old_spillway", "west": "coop_smithy", "south": "archive_lobby"}
+    },
+    {
+      "id": "risen_path",
+      "name": "The Risen Path",
+      "description": "Old flood stones now sit well above the waterline. A notice from the Channel Guild calls the elevated path essential trade access; another from the Crossing Committee asks for an inspection before another caravan passes.",
+      "exits": {"north": "knot_tavern", "east": "second_bell", "south": "market_crossing"}
+    },
+    {
+      "id": "second_bell",
+      "name": "The Second Bell",
+      "description": "Across the square from the riverfront tavern stands a plain meeting house with an unstruck brass bell. Its noticeboard asks for independent accounts, not rumors. Nothing will ring automatically; players can stage the disagreement through conversation.",
+      "exits": {"west": "risen_path", "east": "testimony_court", "south": "glass_kiln"}
+    },
+    {
+      "id": "testimony_court",
+      "name": "Testimony Court",
+      "description": "A ring of low seats faces a blank stone lectern. The court's former seal lies chipped beside it, and several witness marks conflict about when the passage first changed. No verdict has been programmed; visitors may argue the evidence themselves.",
+      "exits": {"west": "second_bell", "east": "archive_lobby", "south": "refuge_hall"}
+    },
+    {
+      "id": "archive_lobby",
+      "name": "Archive Lobby",
+      "description": "Three hand-drawn route charts disagree on the same short crossing. The oldest chart is dated after one of the newer ones, but its ink has weathered more. A stair north leads back to the sealed quay, and the wind bridge is south.",
+      "exits": {"north": "quarantine_steps", "west": "testimony_court", "south": "wind_bridge"}
+    },
+    {
+      "id": "market_crossing",
+      "name": "Market Crossing",
+      "description": "Crates form informal lanes between repair stalls and travelers' benches. Prices have been rubbed away and rewritten daily, each new number a record of the long detour. The glass kiln is east, and the Risen Path climbs north.",
+      "exits": {"north": "risen_path", "east": "glass_kiln"}
+    },
+    {
+      "id": "glass_kiln",
+      "name": "Siltglass Kiln",
+      "description": "Artisans fire river sand into cloudy panes that hold a different tint against every window. A narrow path runs south toward the pale grove, where a pattern in the soil resembles the cracks in the kiln's cooling tiles.",
+      "exits": {"north": "second_bell", "west": "market_crossing", "east": "refuge_hall", "south": "lichen_grove"}
+    },
+    {
+      "id": "refuge_hall",
+      "name": "Refuge Hall",
+      "description": "Rows of folded blankets and clean buckets wait under a roof repaired with mismatched timber. A duty chart has empty spaces beside each warning route. Players can arrange a watch here, but no autonomous inhabitants are simulated.",
+      "exits": {"north": "testimony_court", "west": "glass_kiln", "east": "wind_bridge"}
+    },
+    {
+      "id": "wind_bridge",
+      "name": "Wind Bridge",
+      "description": "Thin cables hum above a marsh of reeds. The far rail is newly mended, yet the measurements carved into its posts do not agree with the archive. The route south reaches the watch stand; the archive is north across the stone lane.",
+      "exits": {"north": "archive_lobby", "west": "refuge_hall", "south": "rangers_stand"}
+    },
+    {
+      "id": "boundary_cairn",
+      "name": "Boundary Cairn",
+      "description": "Unmatched stones form a careful pile at the last maintained trail. One stone has a date; another only a question mark. The path east threads through the lichen grove, and the cut quarry lies below to the south.",
+      "exits": {"east": "lichen_grove", "south": "quarry_cut"}
+    },
+    {
+      "id": "lichen_grove",
+      "name": "Pale Lichen Grove",
+      "description": "A chalk-white growth softens the shapes of roots and fallen trunks without hiding them completely. A pressed sample lies by a survey peg. The forge smoke is faint to the north, while a well can be reached through the trees southward.",
+      "exits": {"north": "glass_kiln", "west": "boundary_cairn", "east": "sick_orchard", "south": "thread_well"}
+    },
+    {
+      "id": "sick_orchard",
+      "name": "The Fallow Orchard",
+      "description": "The trees leaf out at different hours, and no fruit has set on the eastern row. A survey board records observations, not a diagnosis. No infection or damage mechanic is active here; the uncertainty is a story prompt for explorers.",
+      "exits": {"west": "lichen_grove", "east": "rangers_stand", "south": "old_cistern"}
+    },
+    {
+      "id": "rangers_stand",
+      "name": "Ranger's Stand",
+      "description": "A modest platform overlooks the marsh, marked by colored strips showing three proposed safe routes. None is labeled certain. The northern bridge leads toward town, while the southern descent reaches the fault arch.",
+      "exits": {"north": "wind_bridge", "west": "sick_orchard", "south": "fault_arch"}
+    },
+    {
+      "id": "quarry_cut",
+      "name": "Quarry Cut",
+      "description": "Old tool marks vanish beneath a seam of glossy stone. A fractured tile has been set aside for inspection. The quarry has no working machinery or combat encounter; it is a place to compare physical clues with the town's written records.",
+      "exits": {"north": "boundary_cairn", "east": "thread_well"}
+    },
+    {
+      "id": "thread_well",
+      "name": "The Thread Well",
+      "description": "A cord stretched across the well mouth measures the wind, not the water. Its knots have shifted since the last survey, though no one has recorded who retied them. The old cistern is east; the grove rises north.",
+      "exits": {"north": "lichen_grove", "west": "quarry_cut", "east": "old_cistern"}
+    },
+    {
+      "id": "old_cistern",
+      "name": "Old Cistern",
+      "description": "The stone basin holds a single still pool despite a cracked roof and no visible inflow. Faint marks on the wall match a tile from the quarry, but not the scale recorded at the harbor. A low passage continues east.",
+      "exits": {"north": "sick_orchard", "west": "thread_well", "east": "fault_arch"}
+    },
+    {
+      "id": "fault_arch",
+      "name": "The Fault Arch",
+      "description": "A freestanding arch frames the old spillway instead of the hillside behind it. Its stones are ordinary enough to touch; its alignment is not. For this playable version the route is a stable, two-way exit: 'go archway' returns to the spillway.",
+      "exits": {"north": "rangers_stand", "west": "old_cistern", "archway": "old_spillway"}
+    }
+  ],
+  "items": [
+    {
+      "id": "charred_receipt",
+      "name": "Charred cargo receipt",
+      "description": "A surviving tally of crates loaded on a day when the official ledger records a different number. It proves only that the accounts conflict.",
+      "room": "cargo_ledger"
+    },
+    {
+      "id": "saltglass_lens",
+      "name": "Saltglass lens",
+      "description": "A cloudy handheld lens made from river sand. It bends a straight line into two, whether by flaw or design.",
+      "room": "old_spillway"
+    },
+    {
+      "id": "river_chime",
+      "name": "River chime",
+      "description": "A small brass chime with one repaired clapper. It is portable evidence of a warning system, not a working alarm command.",
+      "room": "knot_tavern"
+    },
+    {
+      "id": "chipped_seal",
+      "name": "Chipped court seal",
+      "description": "The broken edge of a civic stamp. Its mark appears on some route notices but not others; ownership is uncertain.",
+      "room": "testimony_court"
+    },
+    {
+      "id": "repair_bracket",
+      "name": "Repair bracket",
+      "description": "A cold-forged metal brace with two unused rivet holes. It can be carried, discussed, and dropped; installing it is not implemented.",
+      "room": "coop_smithy"
+    },
+    {
+      "id": "hazard_flag",
+      "name": "Blue hazard flag",
+      "description": "A folded cloth marker for an unverified route. Carrying it does not create world warnings or change traversal rules.",
+      "room": "quarantine_steps"
+    },
+    {
+      "id": "pressed_lichen",
+      "name": "Pressed lichen sample",
+      "description": "A dry pale sample between two scraps of clean paper. No disease or alchemy effect is encoded in the item.",
+      "room": "lichen_grove"
+    },
+    {
+      "id": "fractured_tile",
+      "name": "Fractured quarry tile",
+      "description": "A palm-sized tile with a crack pattern like the cistern markings. Its significance is an open question for the players.",
+      "room": "quarry_cut"
+    }
+  ]
+}

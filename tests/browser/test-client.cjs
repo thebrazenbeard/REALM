@@ -46,13 +46,14 @@ function worldMap() {
   };
 }
 
-function instantiate({ missingMap = false, mapOnMove = false, rejectUnauthorized = false, fetchImpl = null } = {}) {
+function instantiate({ missingMap = false, mapOnMove = false, rejectUnauthorized = false, fetchImpl = null, mapGate = null, roomGate = null, joinGate = null } = {}) {
   const elements = new Map();
   const get = (id) => {
     if (!elements.has(id)) elements.set(id, new Element());
     return elements.get(id);
   };
   const requests = [];
+  const timers = [];
   let mapAvailable = !missingMap;
   const document = {
     getElementById: get,
@@ -71,6 +72,9 @@ function instantiate({ missingMap = false, mapOnMove = false, rejectUnauthorized
   const mockFetch = async (url, options) => {
     requests.push({ url, options });
     const route = new URL(url).pathname;
+    if (route === "/api/v1/map" && mapGate) await mapGate();
+    if (route === "/api/v1/room" && roomGate) await roomGate();
+    if (route === "/api/v1/join" && joinGate) await joinGate();
     if (rejectUnauthorized && route === "/api/v1/join") {
       return { ok: false, status: 401, json: async () => ({ error: "Player token mismatch" }) };
     }
@@ -85,11 +89,12 @@ function instantiate({ missingMap = false, mapOnMove = false, rejectUnauthorized
   const window = { location: { protocol: "http:" }, RealmMap };
   vm.runInNewContext(clientSource, {
     document, window, URL, fetch, console,
-    setInterval: () => 1, clearInterval: () => {},
-    crypto: require("node:crypto").webcrypto,
+    setInterval: (fn, delay) => { timers.push({ fn, delay }); return timers.length; },
+    clearInterval: () => {},
+    crypto: require("node:crypto").webcrypto, AbortController,
   }, { filename: "docs/app.js" });
   const event = { preventDefault() {} };
-  return { get, requests, connect: () => get("connection-form").events.submit(event),
+  return { get, requests, timers, connect: () => get("connection-form").events.submit(event),
     disconnect: () => get("disconnect-button").events.click(),
     send: () => get("command-form").events.submit(event) };
 }
@@ -135,6 +140,133 @@ test("moving from unmapped to mapped territory refreshes map after initial 404",
   client.get("command-input").value = "go north";
   await client.send();
   assert.equal(client.get("map-status").textContent, "LIVE HOST MAP · 2×2");
+});
+
+test("disconnect during initial map fetch does not leave an orphan polling timer", async () => {
+  let releaseMap;
+  let reachedMap;
+  const enteredMap = new Promise((resolve) => { reachedMap = resolve; });
+  const pendingMap = new Promise((resolve) => { releaseMap = resolve; });
+  const client = instantiate({ mapGate: () => { reachedMap(); return pendingMap; } });
+  client.get("host-url").value = "http://localhost:8765";
+  client.get("player-name").value = "Explorer";
+  client.get("access-token").value = "secret-token";
+  const connecting = client.connect();
+  await enteredMap;
+  assert.equal(client.get("disconnect-button").disabled, false);
+  client.disconnect();
+  const mapRequest = client.requests.find(({ url }) => url.includes("/api/v1/map"));
+  assert.equal(mapRequest.options.signal?.aborted, true, "disconnect should abort in-flight host requests");
+  releaseMap();
+  await connecting;
+  assert.equal(client.timers.length, 0, "disconnected session must not install a recurring poller");
+  assert.equal(client.get("world-name").textContent, "Unconnected");
+});
+
+test("late room failure from an old connection cannot corrupt a rejoined transcript", async () => {
+  let releaseOldRoom, reachedOldRoom;
+  const enteredOldRoom = new Promise((resolve) => { reachedOldRoom = resolve; });
+  const oldRoom = new Promise((_, reject) => { releaseOldRoom = reject; });
+  let heldFirstRoom = false;
+  const client = instantiate({ roomGate: () => {
+    if (heldFirstRoom) return;
+    heldFirstRoom = true;
+    reachedOldRoom();
+    return oldRoom;
+  } });
+  client.get("host-url").value = "http://localhost:8765";
+  client.get("player-name").value = "Explorer";
+  client.get("access-token").value = "first-token";
+  const oldConnection = client.connect();
+  await enteredOldRoom;
+  client.disconnect();
+
+  client.get("access-token").value = "second-token";
+  await client.connect();
+  releaseOldRoom(new Error("stale room response"));
+  await oldConnection;
+  assert.equal(client.get("world-name").textContent, "test-world");
+  assert.equal(client.get("connection-status").textContent, "Connected — receiving host state");
+  const transcript = client.get("feed").children.map((item) => item.children[1].children[0].textContent);
+  assert.deepEqual(transcript, ["HOST / JOIN"], "old room failure must not appear in new session transcript");
+});
+
+test("late command room refresh failure cannot contaminate a rejoined transcript", async () => {
+  let releaseOldRoom, reachedOldRoom;
+  const enteredOldRoom = new Promise((resolve) => { reachedOldRoom = resolve; });
+  const pendingOldRoom = new Promise((_, reject) => { releaseOldRoom = reject; });
+  let roomRequests = 0;
+  const client = instantiate({ roomGate: () => {
+    roomRequests++;
+    if (roomRequests === 2) { reachedOldRoom(); return pendingOldRoom; }
+  } });
+  client.get("host-url").value = "http://localhost:8765";
+  client.get("player-name").value = "Explorer";
+  client.get("access-token").value = "first-token";
+  await client.connect();
+  client.get("command-input").value = "look";
+  const sending = client.send();
+  await enteredOldRoom;
+  client.disconnect();
+  client.get("access-token").value = "second-token";
+  await client.connect();
+  releaseOldRoom(new Error("stale command room response"));
+  await sending;
+  const transcript = client.get("feed").children.map((item) => item.children[1].children[0].textContent);
+  assert.deepEqual(transcript, ["HOST / JOIN"], "an old command completion must not write to a new transcript");
+});
+
+test("a duplicate connection submit cannot race the first in-flight join", async () => {
+  let releaseFirstJoin, reachedFirstJoin;
+  const enteredJoin = new Promise((resolve) => { reachedFirstJoin = resolve; });
+  const pendingJoin = new Promise((resolve) => { releaseFirstJoin = resolve; });
+  let firstJoin = true;
+  const client = instantiate({ joinGate: () => {
+    if (!firstJoin) return;
+    firstJoin = false;
+    reachedFirstJoin();
+    return pendingJoin;
+  } });
+  client.get("host-url").value = "http://localhost:8765";
+  client.get("player-name").value = "Explorer";
+  client.get("access-token").value = "secret-token";
+  const connecting = client.connect();
+  await enteredJoin;
+  const secondSubmit = client.connect();
+  releaseFirstJoin();
+  await Promise.all([connecting, secondSubmit]);
+  const joins = client.requests.filter(({ url }) => url.includes("/api/v1/join"));
+  assert.equal(joins.length, 1, "only one join must be in flight per browser connection");
+  assert.equal(client.get("connection-status").textContent, "Connected — receiving host state");
+});
+
+test("a completed old connection cannot re-enable controls during a newer join", async () => {
+  let releaseOldRoom, reachedOldRoom, releaseNewJoin, reachedNewJoin;
+  const oldRoomEntered = new Promise((resolve) => { reachedOldRoom = resolve; });
+  const oldRoom = new Promise((_, reject) => { releaseOldRoom = reject; });
+  const newJoinEntered = new Promise((resolve) => { reachedNewJoin = resolve; });
+  const newJoin = new Promise((resolve) => { releaseNewJoin = resolve; });
+  let roomCalls = 0, joinCalls = 0;
+  const client = instantiate({
+    roomGate: () => { if (++roomCalls === 1) { reachedOldRoom(); return oldRoom; } },
+    joinGate: () => { if (++joinCalls === 2) { reachedNewJoin(); return newJoin; } },
+  });
+  client.get("host-url").value = "http://localhost:8765";
+  client.get("player-name").value = "Explorer";
+  client.get("access-token").value = "first-token";
+  const first = client.connect();
+  await oldRoomEntered;
+  client.disconnect();
+  client.get("access-token").value = "second-token";
+  const second = client.connect();
+  await newJoinEntered;
+  releaseOldRoom(new Error("old room request failed"));
+  await first;
+  assert.equal(client.get("connect-button").disabled, true);
+  assert.equal(client.get("connect-button").textContent, "Connecting…");
+  releaseNewJoin();
+  await second;
+  assert.equal(client.get("connection-status").textContent, "Connected — receiving host state");
 });
 
 test("a mismatched player token never reaches a joined session", async () => {
