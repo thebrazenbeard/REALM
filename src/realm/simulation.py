@@ -22,6 +22,7 @@ import uuid
 from contextlib import closing
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Mapping
 
 from .actor_memory import ActorMemory
 from .engine import Engine, _PLAYER_RE
@@ -66,6 +67,7 @@ CREATE TABLE IF NOT EXISTS simulation_intents (
     actor TEXT NOT NULL REFERENCES simulation_drives(actor),
     action_id TEXT NOT NULL,
     expected_room TEXT NOT NULL REFERENCES rooms(id),
+    required_listener TEXT REFERENCES players(id),
     drive_revision INTEGER NOT NULL CHECK(drive_revision>=0),
     command TEXT NOT NULL,
     proposal_sha256 TEXT NOT NULL,
@@ -98,9 +100,36 @@ class TickOutcome:
     response: str
 
 
+@dataclass(frozen=True)
+class NPCProposalSnapshot:
+    """Host-read snapshot; not a grant of authority to the provider."""
+
+    actor: str
+    persona: str
+    room_id: str
+    room_name: str
+    room_description: str
+    curiosity: int
+    duty: int
+    drive_revision: int
+    world_instance_id: str
+    next_tick_seq: int
+
+
+@dataclass(frozen=True)
+class HostProposedAction:
+    """Typed untrusted payload bound to a host-selected identity and receipt."""
+
+    snapshot: NPCProposalSnapshot
+    proposal: Mapping[str, object]
+    action_id: str
+    required_listener: str | None = None
+
+
 def _digest_proposal(*, instance_id: str, tick_seq: int, actor: str,
-                     expected_room: str, drive_revision: int, command: str) -> str:
-    canonical = json.dumps({
+                     expected_room: str, drive_revision: int, command: str,
+                     required_listener: str | None = None) -> str:
+    payload = {
         "instance_id": instance_id,
         "tick_seq": tick_seq,
         "actor": actor,
@@ -108,7 +137,10 @@ def _digest_proposal(*, instance_id: str, tick_seq: int, actor: str,
         "drive_revision": drive_revision,
         "command": command,
         "ruleset_version": RULESET_VERSION,
-    }, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+    }
+    if required_listener is not None:
+        payload["required_listener"] = required_listener
+    canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
@@ -279,38 +311,130 @@ class SimulationClock:
                 (name, curiosity, duty),
             )
 
-    def plan_next_tick(self) -> int:
-        """Persist one bounded deterministic proposal per NPC before effects."""
+    def snapshot_npc_actor(self, actor: str) -> NPCProposalSnapshot:
+        """Read host facts for a provider prompt; never authorize from this read."""
+        if not isinstance(actor, str) or not _PLAYER_RE.fullmatch(actor):
+            raise ValueError("NPC actor name is invalid")
+        with closing(self.engine._connect()) as db:
+            control = self._control(db)
+            row = db.execute(
+                "SELECT p.id,p.room_id,r.name AS room_name,r.description AS room_description,"
+                "n.persona,d.curiosity,d.duty,d.revision "
+                "FROM simulation_drives d JOIN players p ON p.id=d.actor "
+                "JOIN npc_actor_registry n ON n.actor=p.id "
+                "JOIN rooms r ON r.id=p.room_id WHERE p.id=? COLLATE NOCASE",
+                (actor,),
+            ).fetchone()
+            if row is None or row["id"] != actor:
+                raise ValueError("Actor is not an exact host-registered simulation NPC")
+            return NPCProposalSnapshot(
+                actor=row["id"], persona=row["persona"], room_id=row["room_id"],
+                room_name=row["room_name"], room_description=row["room_description"],
+                curiosity=row["curiosity"], duty=row["duty"], drive_revision=row["revision"],
+                world_instance_id=control["instance_id"],
+                next_tick_seq=control["planned_through"] + 1,
+            )
+
+    def plan_next_tick(self, *, host_actions: tuple[HostProposedAction, ...] | None = None) -> int:
+        """Persist bounded proposals before effects, never model-chosen authority.
+
+        With no host actions, preserve the deterministic model-disabled tick.
+        Otherwise trusted host code binds one or more untrusted `say` payloads
+        to exact NPC/room/drive snapshots and host-owned action receipts.
+        Slow provider inference must occur before this method, outside locks.
+        """
+        if host_actions is not None:
+            if (not isinstance(host_actions, tuple) or not 1 <= len(host_actions) <= MAX_RESIDENTS
+                    or any(not isinstance(action, HostProposedAction)
+                           or not isinstance(action.snapshot, NPCProposalSnapshot)
+                           for action in host_actions)):
+                raise ValueError("Host actions must be a bounded tuple of typed proposals")
+            names = [action.snapshot.actor for action in host_actions]
+            if any(not isinstance(name, str) for name in names) or len(set(names)) != len(names):
+                raise ValueError("Host may propose only once per distinct actor per tick")
         with closing(self.engine._connect()) as db, db:
             db.execute("BEGIN IMMEDIATE")
             control = self._fence(db)
             if control["planned_through"] != control["finalized_through"]:
                 raise ValueError("Finish or reject the existing tick before planning another")
-            residents = db.execute(
+            all_residents = db.execute(
                 "SELECT d.actor,d.curiosity,d.duty,d.revision,p.room_id FROM simulation_drives d "
                 "JOIN players p ON p.id=d.actor ORDER BY d.actor COLLATE NOCASE"
             ).fetchall()
-            if len(residents) > MAX_RESIDENTS:
+            if len(all_residents) > MAX_RESIDENTS:
                 raise ValueError("Phase-one simulation resident cap exceeded")
+            roster = {row["actor"]: row for row in all_residents}
+            if host_actions is None:
+                residents = all_residents
+                authorized = {}
+            else:
+                if any(name not in roster for name in names):
+                    raise ValueError("Host proposal actor is not a registered simulation resident")
+                residents = [roster[name] for name in names]
+                authorized = {action.snapshot.actor: action for action in host_actions}
             tick = control["planned_through"] + 1
+            # Check the full proposed batch under one writer lock BEFORE any
+            # tick/intent row is created; a stale or forged model output cannot
+            # leave a partially planned simulation tick.
+            checked: dict[str, tuple[str, str, str | None]] = {}
+            for row in residents:
+                if host_actions is None:
+                    command = _CURIOSITY_SPEECH if row["curiosity"] >= row["duty"] else _DUTY_SPEECH
+                    action_id = f"sim:{control['instance_id']}:{tick}:{row['actor']}"
+                    listener = None
+                else:
+                    action = authorized[row["actor"]]
+                    snap = action.snapshot
+                    if (snap.actor != row["actor"] or snap.room_id != row["room_id"]
+                            or snap.drive_revision != row["revision"]
+                            or snap.curiosity != row["curiosity"] or snap.duty != row["duty"]
+                            or snap.world_instance_id != control["instance_id"]
+                            or snap.next_tick_seq != tick):
+                        raise ValueError("Model proposal snapshot became stale before host planning")
+                    # Provider never supplies `action_id`, `actor`, `listener`,
+                    # `world_id` or privileges: they are host action fields.
+                    command = ResidentController(
+                        self.engine, row["actor"], allowed_verbs=frozenset({"say"}),
+                    ).validate(action.proposal).command
+                    action_id = action.action_id
+                    listener = action.required_listener
+                    if not isinstance(action_id, str) or not 1 <= len(action_id) <= 128:
+                        raise ValueError("Host action IDs must be 1–128 characters")
+                    if listener is not None:
+                        if (not isinstance(listener, str) or not _PLAYER_RE.fullmatch(listener)
+                                or listener.casefold() == row["actor"].casefold()):
+                            raise ValueError("Required listener must be a distinct host NPC")
+                        peer = db.execute(
+                            "SELECT p.id,p.room_id FROM players p "
+                            "JOIN simulation_drives d ON d.actor=p.id "
+                            "JOIN npc_actor_registry n ON n.actor=p.id "
+                            "WHERE p.id=? COLLATE NOCASE", (listener,),
+                        ).fetchone()
+                        if peer is None or peer["id"] != listener or peer["room_id"] != row["room_id"]:
+                            raise ValueError("Required listener moved or is not registered with this room")
+                    if db.execute(
+                        "SELECT 1 FROM action_receipts WHERE actor=? AND action_id=?",
+                        (row["actor"], action_id),
+                    ).fetchone():
+                        raise SimulationIntegrityError("Host action ID is already committed elsewhere")
+                checked[row["actor"]] = (command, action_id, listener)
             status = "proposed" if residents else "terminal"
             db.execute(
                 "INSERT INTO simulation_ticks(tick_seq,ruleset_version,resident_count,status) VALUES (?,?,?,?)",
                 (tick, RULESET_VERSION, len(residents), status),
             )
             for row in residents:
-                command = _CURIOSITY_SPEECH if row["curiosity"] >= row["duty"] else _DUTY_SPEECH
-                action_id = f"sim:{control['instance_id']}:{tick}:{row['actor']}"
+                command, action_id, listener = checked[row["actor"]]
                 digest = _digest_proposal(
                     instance_id=control["instance_id"], tick_seq=tick, actor=row["actor"],
                     expected_room=row["room_id"], drive_revision=row["revision"],
-                    command=command,
+                    command=command, required_listener=listener,
                 )
                 db.execute(
                     "INSERT INTO simulation_intents "
-                    "(tick_seq,actor,action_id,expected_room,drive_revision,command,proposal_sha256,status) "
-                    "VALUES (?,?,?,?,?,?,?,'proposed')",
-                    (tick, row["actor"], action_id, row["room_id"], row["revision"], command, digest),
+                    "(tick_seq,actor,action_id,expected_room,required_listener,drive_revision,command,proposal_sha256,status) "
+                    "VALUES (?,?,?,?,?,?,?,?,'proposed')",
+                    (tick, row["actor"], action_id, row["room_id"], listener, row["revision"], command, digest),
                 )
             db.execute(
                 "UPDATE simulation_control SET planned_through=?,finalized_through=? WHERE singleton=1",
@@ -407,7 +531,7 @@ class SimulationClock:
                 digest = _digest_proposal(
                     instance_id=control["instance_id"], tick_seq=tick, actor=row["actor"],
                     expected_room=row["expected_room"], drive_revision=row["drive_revision"],
-                    command=row["command"],
+                    command=row["command"], required_listener=row["required_listener"],
                 )
                 if digest != row["proposal_sha256"]:
                     raise SimulationIntegrityError("Persisted proposal checksum does not match")
@@ -426,8 +550,17 @@ class SimulationClock:
                 valid = (player is not None and player["id"] == row["actor"]
                          and player["room_id"] == row["expected_room"]
                          and drives is not None and drives["revision"] == row["drive_revision"])
+                if valid and row["required_listener"] is not None:
+                    peer = db.execute(
+                        "SELECT p.id,p.room_id FROM players p "
+                        "JOIN simulation_drives d ON d.actor=p.id "
+                        "JOIN npc_actor_registry n ON n.actor=p.id "
+                        "WHERE p.id=? COLLATE NOCASE", (row["required_listener"],),
+                    ).fetchone()
+                    valid = (peer is not None and peer["id"] == row["required_listener"]
+                             and peer["room_id"] == row["expected_room"])
                 if not valid:
-                    response, status = "Stale room or drive revision; proposal rejected.", "rejected"
+                    response, status = "Stale room, listener or drive revision; proposal rejected.", "rejected"
                 else:
                     preexisting = db.execute(
                         "SELECT 1 FROM action_receipts WHERE actor=? AND action_id=?",
