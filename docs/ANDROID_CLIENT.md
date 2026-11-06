@@ -1,9 +1,11 @@
 # REALM Android client — native terminal design and acceptance gate
 
-**Status:** proposed, not implemented. [Issue #18](https://github.com/thebrazenbeard/REALM/issues/18)
-is a client-only research/build lane. This document describes a possible $0,
-locally built APK; it is not evidence that an APK exists, a remote host is
-reachable, or Patrick's phone has been tested.
+**Status:** native Kotlin source scaffold in [`clients/android/`](../clients/android/README.md),
+**not built or installed**. [Issue #18](https://github.com/thebrazenbeard/REALM/issues/18)
+is an independent client-only build lane. The source currently includes a
+bounded raw Telnet *local-only* compatibility adapter and an HTTPS-first v1
+gateway adapter. This is **not** evidence of an APK, a reachable remote REALM
+host, or a test on Patrick's physical phone.
 
 REALM means **Roleplaying Engine for Autonomous Living MUDs**. Its eventual
 neural residents, drives, memory, and simulation happen on the authoritative
@@ -25,7 +27,8 @@ Reference: [Compose lists](https://developer.android.com/develop/ui/compose/list
 [text input](https://developer.android.com/develop/ui/compose/text/user-input),
 and [accessibility semantics](https://developer.android.com/develop/ui/compose/accessibility/semantics).
 
-Proposed standalone client module, **not present today**:
+Proposed long-term client module boundaries (the current source scaffold is
+smaller, inside `clients/android/app/`):
 
 ```text
 clients/android/
