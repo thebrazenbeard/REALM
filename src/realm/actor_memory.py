@@ -346,6 +346,7 @@ class ActorMemory:
                     "world_id": self.world_id,
                     "observer": actor,
                     "source_event_id": row["id"],
+                    "source_actor": row["actor"],
                     "room_id": row["room_id"],
                     "kind": row["kind"],
                     "source_text": description,
