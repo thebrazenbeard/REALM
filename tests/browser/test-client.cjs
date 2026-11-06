@@ -1,7 +1,9 @@
 "use strict";
 
 const assert = require("node:assert/strict");
+const { spawn } = require("node:child_process");
 const fs = require("node:fs");
+const os = require("node:os");
 const path = require("node:path");
 const test = require("node:test");
 const vm = require("node:vm");
@@ -44,7 +46,7 @@ function worldMap() {
   };
 }
 
-function instantiate({ missingMap = false, mapOnMove = false, rejectUnauthorized = false } = {}) {
+function instantiate({ missingMap = false, mapOnMove = false, rejectUnauthorized = false, fetchImpl = null } = {}) {
   const elements = new Map();
   const get = (id) => {
     if (!elements.has(id)) elements.set(id, new Element());
@@ -66,7 +68,7 @@ function instantiate({ missingMap = false, mapOnMove = false, rejectUnauthorized
     "/api/v1/feed": { cursor: 0, events: [] },
     "/api/v1/command": { text: "You move north", cursor: 0 },
   };
-  const fetch = async (url, options) => {
+  const mockFetch = async (url, options) => {
     requests.push({ url, options });
     const route = new URL(url).pathname;
     if (rejectUnauthorized && route === "/api/v1/join") {
@@ -79,6 +81,7 @@ function instantiate({ missingMap = false, mapOnMove = false, rejectUnauthorized
     assert.ok(route in responses, "unexpected route " + route);
     return { ok: true, status: 200, json: async () => responses[route] };
   };
+  const fetch = fetchImpl || mockFetch;
   const window = { location: { protocol: "http:" }, RealmMap };
   vm.runInNewContext(clientSource, {
     document, window, URL, fetch, console,
@@ -153,4 +156,61 @@ test("refuses cleartext remote worlds before sending any bearer token", async ()
   await client.connect();
   assert.equal(client.requests.length, 0);
   assert.match(client.get("connection-note").textContent, /HTTP is permitted only for loopback/);
+});
+
+const gatewayRoot = process.env.REALM_LIVE_GATEWAY_ROOT || path.join(__dirname, "../..");
+const gatewaySource = path.join(gatewayRoot, "src/realm/gateway.py");
+
+test("live Python gateway: browser join, authored map, movement, and token rejection", {
+  skip: !fs.existsSync(gatewaySource) && "Gateway not present on this stacked browser-only branch",
+}, async (t) => {
+  const temp = fs.mkdtempSync(path.join(os.tmpdir(), "realm-browser-gateway-"));
+  const db = path.join(temp, "world.sqlite3");
+  const token = "local-protocol-test-token";
+  const fixture = path.join(__dirname, "live-gateway-fixture.py");
+  const child = spawn(process.env.REALM_PYTHON || "python", [fixture, db, token], {
+    cwd: gatewayRoot,
+    env: { ...process.env, PYTHONPATH: path.join(gatewayRoot, "src") },
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  t.after(() => {
+    child.kill();
+    fs.rmSync(temp, { recursive: true, force: true });
+  });
+  let stderr = "";
+  child.stderr.on("data", (data) => { stderr += data.toString(); });
+  const port = await new Promise((resolve, reject) => {
+    const timeout = setTimeout(() => reject(new Error("Gateway startup timed out: " + stderr)), 9000);
+    child.once("exit", (code) => { clearTimeout(timeout); reject(new Error(`Gateway exited ${code}: ${stderr}`)); });
+    child.stdout.on("data", (data) => {
+      const match = data.toString().match(/READY (\d+)/);
+      if (match) { clearTimeout(timeout); resolve(Number(match[1])); }
+    });
+  });
+  const base = `http://127.0.0.1:${port}`;
+  const liveFetch = (url, options) => globalThis.fetch(url, {
+    ...options,
+    headers: { ...options.headers, Origin: "http://127.0.0.1:8000" },
+  });
+  const client = instantiate({ fetchImpl: liveFetch });
+  client.get("host-url").value = base;
+  client.get("player-name").value = "Explorer";
+  client.get("access-token").value = token;
+  await client.connect();
+  assert.equal(client.get("world-name").textContent, "browser-integration-test");
+  assert.equal(client.get("map-status").textContent, "LIVE HOST MAP · 3×2");
+  assert.equal(client.get("map-position").textContent, "@ 0,0");
+  client.get("command-input").value = "north";
+  await client.send();
+  assert.equal(client.get("map-position").textContent, "@ 2,0");
+  assert.equal(client.get("command-input").value, "");
+  client.disconnect();
+  assert.equal(client.get("map-status").textContent, "MAP UNAVAILABLE");
+  const intruder = instantiate({ fetchImpl: liveFetch });
+  intruder.get("host-url").value = base;
+  intruder.get("player-name").value = "Explorer";
+  intruder.get("access-token").value = "incorrect-token";
+  await intruder.connect();
+  assert.equal(intruder.get("world-name").textContent, "Unconnected");
+  assert.match(intruder.get("connection-note").textContent, /401/);
 });
