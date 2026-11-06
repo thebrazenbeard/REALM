@@ -4,7 +4,9 @@ import socket
 import sys
 import tempfile
 import threading
+import time
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
@@ -67,6 +69,14 @@ class TerminalServerTests(unittest.TestCase):
         self.receive_until(conn, b"REALM> ")
         return conn
 
+    def wait_for_inactive_name(self, name):
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline:
+            if not self.server.is_name_active(name):
+                return
+            time.sleep(0.01)
+        self.fail(f"Name {name!r} was not released after disconnect")
+
     def test_loopback_only_and_denies_unknown_token(self):
         self.assertEqual("127.0.0.1", self.server.server_address[0])
         conn = self.connect()
@@ -111,6 +121,55 @@ class TerminalServerTests(unittest.TestCase):
         other = self.login("Eve")
         other.sendall(b"x" * 513 + b"\r\n")
         self.assertIn("Input rejected", self.receive_until(other, b"Input rejected"))
+        self.wait_for_inactive_name("EVE")
+        self.assertIsNotNone(self.login("Eve"))
+
+    def test_casefolded_name_is_exclusive_until_quit(self):
+        alice = self.login("Alice")
+        self.assertTrue(self.server.is_name_active("ALICE"))
+        other = self.connect()
+        self.receive_until(other, b"Token: ")
+        other.sendall(b"test-secret\r\n")
+        self.receive_until(other, b"Name: ")
+        other.sendall(b"aLiCe\r\n")
+        self.assertIn("already connected", self.receive_until(other, b"already connected"))
+        self.assertEqual(b"", other.recv(1024))
+        alice.sendall(b"quit\r\n")
+        self.receive_until(alice, b"position is saved")
+        self.wait_for_inactive_name("Alice")
+        rejoined = self.login("aLiCe")
+        rejoined.sendall(b"where\r\n")
+        self.assertIn("The Atrium", self.receive_until(rejoined, b"REALM> "))
+
+    def test_abrupt_disconnect_releases_name(self):
+        player = self.login("Vince")
+        self.assertTrue(self.server.is_name_active("vince"))
+        player.shutdown(socket.SHUT_RDWR)
+        player.close()
+        self.wait_for_inactive_name("VINCE")
+        rejoined = self.login("Vince")
+        rejoined.sendall(b"look\r\n")
+        self.assertIn("The Atrium", self.receive_until(rejoined, b"REALM> "))
+
+    def test_two_socket_clients_compete_for_one_persistent_item(self):
+        alice = self.login("Alice")
+        bob = self.login("Bob")
+        barrier = threading.Barrier(2)
+
+        def attempt_take(conn):
+            barrier.wait(timeout=2)
+            conn.sendall(b"take token\r\n")
+            return self.receive_until(conn, b"REALM> ")
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            responses = list(pool.map(attempt_take, (alice, bob)))
+        self.assertEqual(1, sum("You take Brass token." in reply for reply in responses))
+        self.assertEqual(1, sum("That item is not here." in reply for reply in responses))
+        alice.sendall(b"inventory\r\n")
+        a_inventory = self.receive_until(alice, b"REALM> ")
+        bob.sendall(b"inventory\r\n")
+        b_inventory = self.receive_until(bob, b"REALM> ")
+        self.assertEqual(1, sum("Brass token" in inv for inv in (a_inventory, b_inventory)))
 
 
 if __name__ == "__main__":
