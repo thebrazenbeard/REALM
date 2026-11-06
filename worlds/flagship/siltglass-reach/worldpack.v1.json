@@ -197,6 +197,42 @@
       "name": "Fractured quarry tile",
       "description": "A palm-sized tile with a crack pattern like the cistern markings. Its significance is an open question for the players.",
       "room": "quarry_cut"
+    },
+    {
+      "id": "crossing_token",
+      "name": "Notched crossing token",
+      "description": "A brass ferry chit stamped with two different dates. The stewards disagree about whether it pays for one passage or records a cancelled crossing; the engine treats it as an ordinary portable item.",
+      "room": "lantern_jetty"
+    },
+    {
+      "id": "mended_net_tag",
+      "name": "Mender's net tag",
+      "description": "A wood tag tied with three repair knots and signed by the night crew. It identifies a disputed net delivery but grants no guild membership, trade privilege or scripted reward.",
+      "room": "net_yard"
+    },
+    {
+      "id": "market_counter",
+      "name": "Chalk market counter",
+      "description": "A polished slate chip used by stallholders to count promised sacks of grain. The marks can support barter stories, but there is no currency balance, shopkeeper AI or automatic sale.",
+      "room": "market_crossing"
+    },
+    {
+      "id": "weather_log_leaf",
+      "name": "Survey weather leaf",
+      "description": "A waterproof page listing four incompatible wind readings from one morning. Its blank reverse invites another witness to add a report in speech; no weather state changes when it is carried.",
+      "room": "rangers_stand"
+    },
+    {
+      "id": "refuge_claim_slip",
+      "name": "Refuge claim slip",
+      "description": "A hand-numbered slip promises shelter to a traveler whose name has washed away. It is evidence of an unmet obligation, not a redeemable ration, player identity or permission to enter a private room.",
+      "room": "refuge_hall"
+    },
+    {
+      "id": "waymark_chalk",
+      "name": "Blue waymark chalk",
+      "description": "A stub of mineral-blue chalk used for marking surveyed paths. Players may carry and discuss it, but the engine does not let an item paint a wall, create an exit or alter travel safety.",
+      "room": "boundary_cairn"
     }
   ]
 }
