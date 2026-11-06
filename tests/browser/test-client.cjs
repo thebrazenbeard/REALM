@@ -179,15 +179,15 @@ test("live Python gateway: browser join, authored map, movement, and token rejec
   });
   let stderr = "";
   child.stderr.on("data", (data) => { stderr += data.toString(); });
-  const port = await new Promise((resolve, reject) => {
+  const ready = await new Promise((resolve, reject) => {
     const timeout = setTimeout(() => reject(new Error("Gateway startup timed out: " + stderr)), 9000);
     child.once("exit", (code) => { clearTimeout(timeout); reject(new Error(`Gateway exited ${code}: ${stderr}`)); });
     child.stdout.on("data", (data) => {
-      const match = data.toString().match(/READY (\d+)/);
-      if (match) { clearTimeout(timeout); resolve(Number(match[1])); }
+      const match = data.toString().match(/READY (\d+) ([A-Za-z0-9_-]+) ([A-Za-z0-9_-]+) (legacy|player)/);
+      if (match) { clearTimeout(timeout); resolve({ port: Number(match[1]), playerToken: match[2], otherToken: match[3], mode: match[4] }); }
     });
   });
-  const base = `http://127.0.0.1:${port}`;
+  const base = `http://127.0.0.1:${ready.port}`;
   const liveFetch = (url, options) => globalThis.fetch(url, {
     ...options,
     headers: { ...options.headers, Origin: "http://127.0.0.1:8000" },
@@ -195,7 +195,7 @@ test("live Python gateway: browser join, authored map, movement, and token rejec
   const client = instantiate({ fetchImpl: liveFetch });
   client.get("host-url").value = base;
   client.get("player-name").value = "Explorer";
-  client.get("access-token").value = token;
+  client.get("access-token").value = ready.playerToken;
   await client.connect();
   assert.equal(client.get("world-name").textContent, "browser-integration-test");
   assert.equal(client.get("map-status").textContent, "LIVE HOST MAP · 3×2");
@@ -213,4 +213,13 @@ test("live Python gateway: browser join, authored map, movement, and token rejec
   await intruder.connect();
   assert.equal(intruder.get("world-name").textContent, "Unconnected");
   assert.match(intruder.get("connection-note").textContent, /401/);
+  if (ready.mode === "player") {
+    const wrongActor = instantiate({ fetchImpl: liveFetch });
+    wrongActor.get("host-url").value = base;
+    wrongActor.get("player-name").value = "Explorer";
+    wrongActor.get("access-token").value = ready.otherToken;
+    await wrongActor.connect();
+    assert.equal(wrongActor.get("world-name").textContent, "Unconnected");
+    assert.match(wrongActor.get("connection-note").textContent, /403/);
+  }
 });
