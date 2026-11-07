@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import os
+from contextlib import closing
 from pathlib import Path
 import sqlite3
 import subprocess
@@ -79,7 +80,7 @@ class RealmPluginLauncherTests(unittest.TestCase):
         return result, replies
 
     def count_events(self, actor, kind):
-        with sqlite3.connect(self.path) as db:
+        with closing(sqlite3.connect(self.path)) as db:
             return db.execute(
                 "SELECT COUNT(*) FROM events WHERE actor=? AND kind=?",
                 (actor, kind)).fetchone()[0]
@@ -154,7 +155,7 @@ class RealmPluginLauncherTests(unittest.TestCase):
         self.assertEqual([], replies)
         self.assertIn("requires an existing bound world", process.stderr)
         self.assertEqual(0, self.count_events("Moss", "move"))
-        with sqlite3.connect(self.path) as db:
+        with closing(sqlite3.connect(self.path)) as db:
             self.assertEqual("sandbox", db.execute(
                 "SELECT value FROM world_meta WHERE key='world_id'").fetchone()[0])
 

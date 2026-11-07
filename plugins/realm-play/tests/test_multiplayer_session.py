@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import os
+from contextlib import closing
 from pathlib import Path
 import sqlite3
 import subprocess
@@ -119,7 +120,7 @@ class TwoPlayerSessionTests(unittest.TestCase):
         return replies
 
     def _count(self, table: str, kind: str | None = None) -> int:
-        with sqlite3.connect(self.database) as database:
+        with closing(sqlite3.connect(self.database)) as database:
             if kind is None:
                 return int(database.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0])
             return int(database.execute(
@@ -177,7 +178,7 @@ class TwoPlayerSessionTests(unittest.TestCase):
         self.assertEqual(8, self._count("events", "move"))
         self.assertEqual(8, self._count("events", "leave"))
         self.assertEqual(5, self._count("events", "say"))
-        with sqlite3.connect(self.database) as database:
+        with closing(sqlite3.connect(self.database)) as database:
             position = dict(database.execute("SELECT id,room_id FROM players").fetchall())
             self.assertEqual({"Moss": "atrium", "Ember": "atrium"}, position)
             held_by, room_id = database.execute(
