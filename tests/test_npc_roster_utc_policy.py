@@ -588,6 +588,53 @@ class RosterUtcTests(unittest.TestCase):
             "UPDATE events SET payload_json='{}' WHERE kind='gather';"
         )
 
+    def test_postverify_extra_gather_event_cannot_be_inserted(self):
+        self._postverify_material_trigger(
+            """INSERT INTO events(occurred_at,actor,room_id,kind,payload_json)
+               VALUES('2026-11-07T21:00:00+00:00','Ada','atrium','gather',
+                      '{"material":"gold","amount":1}');"""
+        )
+
+    def test_postverify_foreign_room_gather_cannot_be_inserted(self):
+        self._postverify_material_trigger(
+            """INSERT INTO events(occurred_at,actor,room_id,kind,payload_json)
+               VALUES('2026-11-07T21:00:00+00:00','Cora','workshop','gather',
+                      '{"material":"gold","amount":1}');"""
+        )
+
+    def test_postverify_ungranted_material_pouch_cannot_be_inserted(self):
+        self._postverify_material_trigger(
+            "INSERT INTO material_pouches(actor,material,quantity) "
+            "VALUES('Cora','gold',99);"
+        )
+
+    def test_postverify_ungranted_gather_node_cannot_be_inserted(self):
+        self._postverify_material_trigger(
+            "INSERT INTO gathering_nodes(room_id,material,remaining,batch_yield) "
+            "VALUES('atrium','gold',99,1);"
+        )
+
+    def test_postverify_unrelated_say_event_is_permitted(self):
+        plan = self.proposal()
+        policy, mac = self.grant(plan)
+        with closing(sqlite3.connect(self.dbpath)) as db, db:
+            db.execute("""
+                CREATE TRIGGER main.benign_say_after_clock_ack
+                AFTER UPDATE OF processed_utc ON clock_events
+                WHEN NEW.event_id='roster_test_1'
+                BEGIN
+                    INSERT INTO events(occurred_at,actor,room_id,kind,payload_json)
+                    VALUES('2026-11-07T21:00:00+00:00','Cora','atrium','say',
+                           '{"text":"hi"}');
+                END
+            """)
+        self.assertEqual(self.run_grant(policy, mac).executed, 2)
+        self.assertEqual(self.counts(), (2, 2, 0))
+        with closing(sqlite3.connect(self.dbpath)) as db:
+            self.assertEqual(db.execute(
+                "SELECT COUNT(*) FROM events WHERE kind='say'"
+            ).fetchone()[0], 1)
+
 
 if __name__ == "__main__":
     unittest.main()
