@@ -13,6 +13,8 @@ from datetime import datetime, timezone
 from functools import lru_cache
 from pathlib import Path
 
+from .sqlite_runtime import wal_reset_fix_present
+
 
 _DIRECTIONS = {"n": "north", "s": "south", "e": "east", "w": "west", "u": "up", "d": "down"}
 _LONG_DIRECTIONS = frozenset(_DIRECTIONS.values())
@@ -98,6 +100,44 @@ _EVENT_DELIVERY_DDL = (
 _EVENT_DELIVERY_SCHEMA_SQL = ";\n".join(_EVENT_DELIVERY_DDL) + ";"
 _EVENT_DELIVERY_VERSION_KEY = "event_delivery_schema_version"
 _EVENT_DELIVERY_VERSION = "realm.event_delivery.v1"
+_TRANSPORT_AUTH_MODE_KEY = "transport_auth_mode"
+_TRANSPORT_AUTH_MODES = frozenset({"shared-token-demo", "player-bearer-http"})
+
+
+def _claim_transport_auth_mode(db: sqlite3.Connection, mode: str) -> None:
+    """Fence incompatible local adapters in the caller's writer transaction.
+
+    A shared-secret Telnet identity is not a player-bound HTTP identity. The
+    durable claim deliberately survives disconnect/server restart. Switching
+    an already-played world between modes needs an explicit offline migration.
+    """
+    if mode not in _TRANSPORT_AUTH_MODES:
+        raise ValueError("Unsupported world transport authentication mode")
+    existing = db.execute(
+        "SELECT value FROM world_meta WHERE key=?", (_TRANSPORT_AUTH_MODE_KEY,)
+    ).fetchone()
+    if existing is not None and existing[0] != mode:
+        raise ValueError(
+            "World transport authentication conflict: cannot mix shared-token "
+            "Telnet identities with player-bound HTTP credentials"
+        )
+    if existing is None:
+        # Older HTTP worlds might predate this marker, or a local operator
+        # might accidentally delete it. Never let the shared-token adapter
+        # acquire a world already carrying the HTTP credential table. This
+        # remains best-effort in-file damage detection, not immutable custody.
+        if mode == "shared-token-demo" and db.execute(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master "
+            "WHERE type='table' AND name='player_credentials')"
+        ).fetchone()[0]:
+            raise ValueError(
+                "World transport authentication conflict: player-bound "
+                "HTTP credential state already exists"
+            )
+        db.execute(
+            "INSERT INTO world_meta(key,value) VALUES(?,?)",
+            (_TRANSPORT_AUTH_MODE_KEY, mode),
+        )
 
 
 @contextmanager
@@ -291,7 +331,15 @@ class Engine:
             # A process may have initialized this file after our pre-open
             # existence check. In that case honor its selected journal.
             new_empty_world = self._new_database and not has_schema
-            desired = self._requested_journal_mode or ("WAL" if new_empty_world else current)
+            safe_wal_runtime = wal_reset_fix_present(sqlite3.sqlite_version_info)
+            desired = self._requested_journal_mode or (
+                ("WAL" if safe_wal_runtime else "DELETE") if new_empty_world else current
+            )
+            if desired == "WAL" and not safe_wal_runtime:
+                raise RuntimeError(
+                    "Loaded SQLite WAL-reset version gate failed; use an updated "
+                    "SQLite runtime for existing WAL worlds, or DELETE for a fresh world"
+                )
             if current != desired:
                 if not new_empty_world:
                     raise ValueError(
@@ -330,6 +378,22 @@ class Engine:
             ).fetchone()[0]
             existing_schema = _schema_snapshot(db)
             expected_core = _pristine_schema()
+            # A bound/claimed world must not execute unreviewed SQL triggers
+            # or views. An attacker with local DB write access could install a
+            # grant-deleting trigger while leaving all expected tables intact.
+            # Legitimate extension *tables/indexes* remain allowed.
+            if has_world_metadata_table and db.execute(
+                "SELECT EXISTS(SELECT 1 FROM world_meta)"
+            ).fetchone()[0]:
+                executable_extras = sorted(
+                    name for name, definition in existing_schema.items()
+                    if definition[0] in {"trigger", "view"}
+                )
+                if executable_extras:
+                    raise WorldIntegrityError(
+                        "Bound world integrity failure: unexpected trigger/view "
+                        "schema objects: " + ", ".join(executable_extras)
+                    )
             expected_extension = {
                 name: definition
                 for name, definition in _pristine_schema(_EVENT_DELIVERY_SCHEMA_SQL).items()
@@ -421,12 +485,14 @@ class Engine:
     def _event(self, db: sqlite3.Connection, actor: str, room: str, kind: str, payload: dict) -> int:
         return _append_event_with_deliveries(db, actor, room, kind, payload)
 
-    def join(self, name: str) -> str:
+    def join(self, name: str, *, transport_auth_mode: str | None = None) -> str:
         if not _PLAYER_RE.fullmatch(name):
             raise ValueError("Player name must start with a letter, use only letters, digits, '_' or '-', and be <=24 characters")
         with closing(self._connect()) as db, db:
             # Serialize first-time joins so two clients cannot race on one name.
             db.execute("BEGIN IMMEDIATE")
+            if transport_auth_mode is not None:
+                _claim_transport_auth_mode(db, transport_auth_mode)
             player = db.execute("SELECT id,room_id FROM players WHERE id=?", (name,)).fetchone()
             if player is None:
                 configured = db.execute("SELECT value FROM world_meta WHERE key='start_room'").fetchone()
@@ -448,7 +514,10 @@ class Engine:
             parts.append("Items: " + ", ".join(item[0] for item in items))
         return "\n".join(parts)
 
-    def act(self, name: str, raw_command: str, *, action_id: str | None = None) -> str:
+    def act(
+        self, name: str, raw_command: str, *, action_id: str | None = None,
+        transport_auth_mode: str | None = None,
+    ) -> str:
         """Perform one action atomically; optional keys make retries idempotent.
 
         Action IDs are scoped to an actor and MUST be unique per logical command.
@@ -474,6 +543,8 @@ class Engine:
         with closing(self._connect()) as db, db:
             # Serialize competing actions such as two players taking one object.
             db.execute("BEGIN IMMEDIATE")
+            if transport_auth_mode is not None:
+                _claim_transport_auth_mode(db, transport_auth_mode)
             player = db.execute("SELECT id,room_id FROM players WHERE id=?", (name,)).fetchone()
             if player is None:
                 raise ValueError("Join this REALM before issuing commands")
