@@ -9,7 +9,7 @@ import json
 import re
 import sys
 from pathlib import Path
-from urllib.parse import urlsplit
+from urllib.parse import parse_qs, urlsplit
 from urllib.request import Request, urlopen
 
 from research.pr_stack_gate import assess, git, live_tips, validate
@@ -17,6 +17,45 @@ from research.pr_stack_gate import assess, git, live_tips, validate
 REPO = "thebrazenbeard/REALM"
 API = "https://api.github.com/repos/thebrazenbeard/REALM/pulls"
 SHA = re.compile(r"^[0-9a-f]{40}$")
+_LINK = re.compile(r'^\s*<([^<>]+)>\s*;\s*rel="(next|prev|first|last)"\s*$')
+
+
+def has_next_page(link_header: str, current_page: int) -> bool:
+    """Read canonical Link pagination evidence, including on short pages."""
+    if not isinstance(link_header, str):
+        raise ValueError("malformed GitHub pagination Link header")
+    if not link_header.strip():
+        return False
+    root = urlsplit(API)
+    seen = set()
+    has_next = False
+    for raw in link_header.split(","):
+        match = _LINK.fullmatch(raw)
+        if match is None:
+            raise ValueError("malformed GitHub pagination Link entry")
+        href, relation = match.groups()
+        if relation in seen:
+            raise ValueError("duplicate GitHub pagination relation")
+        seen.add(relation)
+        target = urlsplit(href)
+        if (target.scheme != root.scheme or target.netloc != root.netloc
+                or target.path != root.path or target.username is not None
+                or target.password is not None or target.port is not None
+                or target.fragment):
+            raise ValueError("foreign GitHub pagination URL")
+        query = parse_qs(target.query, keep_blank_values=True)
+        if (set(query) != {"state", "per_page", "page"}
+                or query["state"] != ["open"]
+                or query["per_page"] != ["100"]
+                or len(query["page"]) != 1
+                or not query["page"][0].isdecimal()
+                or int(query["page"][0]) < 1):
+            raise ValueError("unexpected GitHub pagination query")
+        if relation == "next":
+            if int(query["page"][0]) != current_page + 1:
+                raise ValueError("cyclic/skipped GitHub pagination page")
+            has_next = True
+    return has_next
 
 
 def canonical_origin(value: str) -> bool:
@@ -78,6 +117,8 @@ def assess_live(manifest: dict, observed: dict[int, dict]):
             "manifest_count": len(expected), "findings": findings}
 def fetch_live_open_prs(api: str = API):
     """Query the canonical public HTTPS API, fail closed on errors or truncation."""
+    if api != API:
+        raise ValueError("noncanonical GitHub API endpoint")
     observed = {}
     for page in range(1, 11):
         uri = f"{api}?state=open&per_page=100&page={page}"
@@ -86,6 +127,7 @@ def fetch_live_open_prs(api: str = API):
         with urlopen(req, timeout=15) as response:
             if response.status != 200:
                 raise RuntimeError(f"GitHub API HTTP {response.status}")
+            further = has_next_page(response.headers.get("Link", ""), page)
             payload = json.load(response)
         if not isinstance(payload, list):
             raise ValueError("GitHub API did not return PR list")
@@ -95,7 +137,7 @@ def fetch_live_open_prs(api: str = API):
             if number in observed:
                 raise ValueError("duplicate GitHub PR in API pages")
             observed[number] = pr
-        if len(payload) < 100:
+        if len(payload) < 100 and not further:
             return observed
     raise RuntimeError("GitHub open-PR pagination cap exceeded")
 
