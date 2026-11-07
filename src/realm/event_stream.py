@@ -85,6 +85,11 @@ class FeedWaitHandler(GatewayHandler):
             return
         if not self._player_matches(claimed, principal):
             return
+        # A cursor from another world (or an invented far-future ID) must not
+        # silently starve this session forever; each world has its own ID space.
+        if after > self.server.gateway.cursor():
+            self._send(400, {"ok": False, "error": "Cursor exceeds this world's event head"})
+            return
         if not self.server.feed_slots.acquire(blocking=False):
             self._send(429, {"ok": False, "error": "Feed waiter limit reached"})
             return

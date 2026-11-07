@@ -36,7 +36,8 @@ an active service from another thread.
 - Header: `Authorization: Bearer <host-issued-player-token>`
 - Optional `player` must match the authenticated player. It never selects the
   principal. No world name can be selected via request parameters.
-- `after` defaults to 0; nonnegative 64-bit signed integer.
+- `after` defaults to 0; nonnegative 64-bit signed integer, no larger than
+  the current world event head. Future/foreign cursors fail with HTTP 400.
 - `wait_ms` defaults to 1000; valid 0 through 5000 (5-second server cap).
 - Response is the same `{ok, events, cursor}` shape as `GET /api/v1/feed`.
   IDs are monotonically increasing within one SQLite world. The `at` event

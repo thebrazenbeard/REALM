@@ -197,6 +197,11 @@ class FeedWaitTests(unittest.TestCase):
         self.assertEqual(400, status)
         self.assertEqual(before, self.gateway.cursor())
 
+    def test_future_cursor_is_rejected_instead_of_starving(self):
+        status, result = self.send(self.url(after=self.gateway.cursor() + 1000))
+        self.assertEqual(400, status)
+        self.assertFalse(result["ok"])
+
     def test_rotated_token_is_rejected_without_wait(self):
         previous = self.tokens["Patrick"]
         current = self.gateway.credentials.rotate("Patrick")
