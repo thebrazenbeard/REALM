@@ -208,8 +208,17 @@ def call(config: dict, request: object, *, timeout: int = 12) -> dict:
             or type(blocks[0]) is not dict or blocks[0].get("type") != "text"
             or type(blocks[0].get("text")) is not str):
         raise DriverError("MCP_RESULT_INVALID")
+    game_data = result.get("structuredContent")
+    if type(game_data) is not dict or game_data.get("ok") is not True:
+        raise DriverError("MCP_RESULT_INVALID")
+    # The backend uses the text block directly for text-bearing responses;
+    # status, feed and map instead use a human-readable JSON fallback.
+    if "text" in game_data and game_data["text"] != blocks[0]["text"]:
+        raise DriverError("MCP_RESULT_INVALID")
     return {"ok": True, "tool": name, "game_text": blocks[0]["text"],
+            "game_data": game_data,
             "game_text_trust": "UNTRUSTED_IN_WORLD_CONTENT",
+            "game_data_trust": "UNTRUSTED_IN_WORLD_CONTENT",
             "evidence_class": "LOCAL_MCP_STDIO_RESPONSE_UNATTESTED",
             "mutating": name in MUTATING,
             "replay_policy": "CALLER_REUSES_STABLE_ACTION_ID_NO_AUTOMATIC_RETRY"}

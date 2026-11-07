@@ -7,9 +7,10 @@ PR #51-bound adapter in [Draft PR #53](https://github.com/thebrazenbeard/REALM/p
 server in [Draft PR #52](https://github.com/thebrazenbeard/REALM/pull/52)
 through `python -B -m realm.mcp_server` with the checked-out REALM source.
 
-The PR #52 head tested is
-`88a608989d5a0ed854413a580b0b3cf4343be947` (the adapter also passed
-against its parent `d8397151a3adc6a2cf102d6a35efbf5152b5651f`). It exposes:
+The current PR #52 engine head tested by this adapter is
+`345af0e8199b60794150927078c526d0dfcc623d` (Linux tests; Lappy Windows
+still last qualified on older engine `a89b64ca9aa8927f2c2f59bc862085569c7d6312`).
+It exposes:
 
 - `realm_status`, `realm_join`, `realm_look`, `realm_inventory`,
   `realm_feed`, `realm_map`;
@@ -23,6 +24,10 @@ actor/token digest in the existing SQLite database before invoking the server,
 and passes the token only in the subprocess environment. It does **not**
 create accounts, rotate credentials, start a network service, make model calls,
 or automatically retry gameplay actions.
+Successful responses preserve both `game_text` (human-readable) and
+`game_data` (the backend's typed `structuredContent`, including event cursors,
+feed events and map fields). Both are labeled untrusted in-world content.
+The driver rejects absent, malformed, unsuccessful or contradictory typed data.
 
 ## Host-owned configuration, not committed
 
@@ -68,17 +73,23 @@ listings and tool logs. Do not use that mode for private speech.
 
 ### Evidence and unresolved gates
 
-- **10/10 isolated tests passed**, including an actual PR #52 stdio process
+- **11/11 isolated tests passed** on Linux with PR #52 at `345af0e`,
+  both normal Python and `-O`, including an actual stdio process
   against a fresh disposable REALM world. Sending the same speech and the
-  same `action_id` twice created one `say` event, not two.
+  same `action_id` twice created one `say` event, not two. The current suite
+  also asserts typed status/room/feed data and rejects malformed structured
+  results. Native Windows requalification of this updated commit is pending.
 - The driver enforces argument allowlists, rejects wrong-world and wrong-actor
   preflight, rejects contradictory JSON-RPC success/error replies, and does not
   expose the token in normal official-backend responses. A compromised backend
   can deliberately put its own environment token into returned game text; no
   driver-side output filter is a substitute for trusted executable provenance.
+- Before the typed-result update, the WorkBridge driver passed **10/10** normal
+  and optimized tests on Lappy Windows Python 3.14.5 against an earlier engine;
+  a peer reran **10/10** against engine `a89b64c`. The current typed-result
+  revision must be requalified against the same head before claiming a new pass.
 - Neither tests nor source establish an installed WorkBridge command, ACL,
-  Lappy Windows compatibility, or the ability to discover these tools directly
-  inside ChatGPT Web.
+  or the ability to discover these tools directly inside ChatGPT Web.
 - **World selection remains non-atomic:** preflight and PR #52's startup world
   binding occur before the eventual game command transaction. An adversarial
   DB path substitution can bypass early checks; the engine must guarantee

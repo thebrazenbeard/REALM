@@ -34,7 +34,8 @@ for line in sys.stdin:
                 "world_id": os.environ["REALM_WORLD_ID"],
                 "db": os.environ["REALM_DB_PATH"],
                 "digest": hashlib.sha256(os.environ["REALM_PLAYER_TOKEN"].encode()).hexdigest()}) + "\\n")
-        data = {"isError": False, "content": [{"type":"text", "text":"Ancient gate, covered in vines."}]}
+        data = {"isError": False, "content": [{"type":"text", "text":"Ancient gate, covered in vines."}],
+                "structuredContent": {"ok": True, "text":"Ancient gate, covered in vines.", "cursor": 17}}
     print(json.dumps({"jsonrpc":"2.0", "id": ident, "result": data}), flush=True)
 '''
 
@@ -77,6 +78,8 @@ class WorkBridgeMCP52Tests(unittest.TestCase):
         result = call(config_from_file(self.configfile), {"tool":"realm_look", "arguments":{}})
         self.assertTrue(result["ok"])
         self.assertEqual(result["game_text_trust"], "UNTRUSTED_IN_WORLD_CONTENT")
+        self.assertEqual(result["game_data_trust"], "UNTRUSTED_IN_WORLD_CONTENT")
+        self.assertEqual(result["game_data"]["cursor"], 17)
         self.assertEqual(len(self.calls()), 1)
         self.assertEqual(self.calls()[0]["digest"], hashlib.sha256(self.token.encode()).hexdigest())
         self.assertEqual(self.calls()[0]["world_id"], "testing")
@@ -166,6 +169,25 @@ class WorkBridgeMCP52Tests(unittest.TestCase):
             call(config_from_file(self.configfile), {"tool": "realm_say",
                  "arguments": {"message": "Hello", "action_id": "one"}})
         self.assertEqual(cm.exception.code, "MCP_OUTCOME_INDETERMINATE")
+
+    def test_missing_or_invalid_structured_game_data_is_rejected(self):
+        for replacement in (None, [], {"ok": False}, {"ok": True, "text": "contradiction"}):
+            with self.subTest(replacement=replacement):
+                # A superficially successful prose block must not silently
+                # stand in for the authoritative typed game result.
+                self.server.write_text(
+                    'import json, sys\n'
+                    'for line in sys.stdin:\n'
+                    ' row=json.loads(line)\n'
+                    ' result={"content":[{"type":"text","text":"Ancient gate, covered in vines."}],"isError":False}\n'
+                    f' if row["method"]=="tools/call": result["structuredContent"]={replacement!r}\n'
+                    ' if row["method"]=="initialize": result={"serverInfo":{"name":"realm-local"}}\n'
+                    ' if row["method"]=="tools/list": result={"tools":[{"name":"realm_look"}]}\n'
+                    ' print(json.dumps({"jsonrpc":"2.0","id":row["id"],"result":result}),flush=True)\n',
+                    encoding="utf-8")
+                with self.assertRaises(DriverError) as cm:
+                    call(config_from_file(self.configfile), {"tool":"realm_look", "arguments":{}})
+                self.assertEqual(cm.exception.code, "MCP_RESULT_INVALID")
 
 
 if __name__ == "__main__":
