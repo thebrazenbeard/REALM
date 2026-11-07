@@ -27,6 +27,14 @@ transaction, call `ledger.apply_in_transaction(db, ...)` with that SAME DB
 connection. Do not call `.apply()` from inside a clock tick: it would try
 another writer connection. A nested savepoint rolls back state **and** receipt
 even if the enclosing host catches a late SQL error and commits.
+For a newly committed atmosphere action, a final same-transaction readback
+requires the exact `main.atm_state` version/snapshot and `main.atm_receipts`
+command/result to match the requested operation after SQLite INSERT triggers.
+Post-write deletion or rewrite of either effect fails closed and rolls back the
+nested action; unrelated host audit rows remain permitted. This is an
+**action-end** guard, not a guarantee that an enclosing host transaction cannot
+subsequently mutate or roll back rows. A host composing additional effects must
+revalidate its final full transaction before acknowledging the larger tick.
 
 - Exact action-ID repeats return their original JSON result; command changes
   at the same ID fail closed. Fresh stale versions reject. Cross-file and
@@ -53,5 +61,5 @@ even if the enclosing host catches a late SQL error and commits.
 
 Acceptance: disposable-world restart/conservation, concurrent competing hatch
 actions, hostile operator/cross-world/connection errors, breach exposures,
-receipt fail/partial trigger rollback, malformed state and repeated actions.
+receipt fail/partial/late-trigger rollback, malformed state and repeated actions.
 No live VN2 world was modified by this draft.
