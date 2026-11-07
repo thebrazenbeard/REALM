@@ -1,10 +1,21 @@
 """Hostile tests: live GitHub must bind real source, not a cached manifest."""
 import copy
+import io
+import json
 import unittest
 from unittest.mock import patch
 
-from research.pr_stack_live import (canonical_origin, assess_live,
+from research.pr_stack_live import (API, canonical_origin, assess_live,
+                                    fetch_live_open_prs, has_next_page,
                                     validate_live_pr, verify_origin)
+
+
+
+class _Response(io.BytesIO):
+    def __init__(self, value, link=""):
+        super().__init__(json.dumps(value).encode("utf-8"))
+        self.status = 200
+        self.headers = {"Link": link}
 
 
 class PRStackLiveTest(unittest.TestCase):
@@ -82,6 +93,55 @@ class PRStackLiveTest(unittest.TestCase):
         with patch("research.pr_stack_live.git", return_value=(2, "", "origin missing")):
             with self.assertRaises(RuntimeError):
                 verify_origin("unused")
+
+    def test_short_page_link_next_must_be_fetched(self):
+        # Reproduction for PR103's earlier false PASS with short 27-item page.
+        later = copy.deepcopy(self.live[61])
+        later["number"] = 92
+        link = f'<{API}?state=open&per_page=100&page=2>; rel="next"'
+        with patch("research.pr_stack_live.urlopen",
+                   side_effect=[_Response([self.live[61]], link),
+                                _Response([later])]) as lookup:
+            observed = fetch_live_open_prs()
+        self.assertEqual(lookup.call_count, 2)
+        self.assertEqual(set(observed), {61, 92})
+        self.assertIn("UNTRACKED_OPEN_PR:92",
+                      assess_live(self.snapshot, observed)["findings"])
+
+    def test_malformed_or_cyclic_pagination_fail_closed(self):
+        bad = (
+            f'<{API}?state=open&per_page=100&page=1>; rel="next"',
+            '<https://evil.invalid/pulls?state=open&per_page=100&page=2>; rel="next"',
+            f'<{API}?state=open&per_page=100&page=3>; rel="next"',
+            f'<{API}?state=open&per_page=100&page=2>; rel="next", '
+            f'<{API}?state=open&per_page=100&page=2>; rel="next"',
+            'not-a-link',
+        )
+        for header in bad:
+            with self.subTest(header=header):
+                with self.assertRaises(ValueError):
+                    has_next_page(header, 1)
+
+    def test_short_page_duplicate_across_pages_rejected(self):
+        link = f'<{API}?state=open&per_page=100&page=2>; rel="next"'
+        with patch("research.pr_stack_live.urlopen",
+                   side_effect=[_Response([self.live[61]], link),
+                                _Response([self.live[61]])]):
+            with self.assertRaises(ValueError):
+                fetch_live_open_prs()
+
+    def test_full_page_must_probe_next_page_and_noncanonical_api_refused(self):
+        rows = []
+        for n in range(61, 161):
+            value = copy.deepcopy(self.live[61])
+            value["number"] = n
+            rows.append(value)
+        with patch("research.pr_stack_live.urlopen",
+                   side_effect=[_Response(rows), _Response([])]) as lookup:
+            self.assertEqual(len(fetch_live_open_prs()), 100)
+        self.assertEqual(lookup.call_count, 2)
+        with self.assertRaises(ValueError):
+            fetch_live_open_prs("https://evil.invalid/pulls")
 
 
 if __name__ == "__main__":

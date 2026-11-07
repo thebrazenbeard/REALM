@@ -12,6 +12,11 @@ The wrapper checks:
 - Effective `origin` is exactly canonical HTTPS `github.com/thebrazenbeard/REALM[.git]`, not a lookalike, SSH or a user-info URL.
 - Canonical public GitHub REST open-PR metadata: number, open, draft, exact
   base and head repo/ref/SHA; malformed/unavailable API state yields UNVERIFIED.
+- Canonical GitHub `Link: rel="next"` pagination is followed even if the
+  preceding page contains fewer than 100 records. Foreign, cyclic, skipped,
+  malformed and duplicated Link relations fail closed. A missing Link header
+  on a dishonest truncated upstream response cannot be independently detected
+  by this source-only check; its output remains evidence, not authority.
 - Every manifest PR must match. Newly opened PRs numbered within the snapshot's
   bounded sequence (PR #61+) yield `UNTRACKED_OPEN_PR` and HOLD.
 - Exact live git branch tips and ancestry are still checked by the PR #93 gate.
