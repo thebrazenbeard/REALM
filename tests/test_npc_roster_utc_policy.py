@@ -358,5 +358,77 @@ class RosterUtcTests(unittest.TestCase):
         self.assertIsNone(self.clock.lookup("roster_test_1").processed_at)
 
 
+    def test_all_wait_foreign_world_forgery_never_acks_roster(self):
+        """A callback's structurally valid empty answer is not a signed run."""
+        from dataclasses import replace
+        from realm.npc_roster_utc_policy import NpcRosterGatherResult
+        plan = self.proposal()
+        self.grant(plan)
+        spoof = replace(
+            plan, world_id="foreign_spoof",
+            assignments=tuple(replace(a, site=None, expected_units=0,
+                                      expected_utility=0) for a in plan.assignments),
+            total_expected_units=0, total_expected_utility=0,
+        )
+        outcome = NpcRosterGatherResult(
+            event_id="roster_test_1", proposal=spoof, executed=0,
+            waiting=len(spoof.assignments), responses=(),
+        )
+        with self.assertRaises(ValueError):
+            self.clock.tick(NOW, lambda db, event: outcome)
+        self.assertEqual(self.counts(), (0, 0, 6))
+        self.assertIsNone(self.clock.lookup("roster_test_1").processed_at)
+
+    def test_fake_actor_receipts_without_signed_host_execution_never_ack(self):
+        """Matching actor receipts alone cannot substitute for host execution."""
+        from realm.npc_roster_utc_policy import NpcRosterGatherResult
+        plan = self.proposal()
+        self.grant(plan)
+        actions = tuple(a for a in plan.assignments if a.site is not None)
+        fabricated = NpcRosterGatherResult(
+            "roster_test_1", plan, len(actions), len(plan.assignments) - len(actions),
+            tuple("synthetic" for _ in actions),
+        )
+        def inject_fake_receipts(db, event):
+            for assignment in actions:
+                action_id = "npcR_" + hashlib.sha256(
+                    f"{event.event_id}|{assignment.actor}".encode()
+                ).hexdigest()[:50]
+                db.execute(
+                    "INSERT INTO main.action_receipts(actor,action_id,command,response) "
+                    "VALUES(?,?,?,?)",
+                    (assignment.actor, action_id, "gather " + assignment.site.material,
+                     "synthetic"),
+                )
+            return fabricated
+        with self.assertRaises(ValueError):
+            self.clock.tick(NOW, inject_fake_receipts)
+        self.assertEqual(self.counts(), (0, 0, 6))
+        self.assertIsNone(self.clock.lookup("roster_test_1").processed_at)
+
+    def test_legitimate_execution_with_forged_world_result_never_ack(self):
+        from dataclasses import replace
+        from realm.npc_roster_utc_policy import perform_host_roster_gather_in_transaction
+        plan = self.proposal()
+        policy, mac = self.grant(plan)
+        def tamper_result(db, event):
+            real = perform_host_roster_gather_in_transaction(
+                db, event, engine=self.engine, crafting=self.crafting,
+                policy=policy, host_key=HOST_KEY, grant_mac_hex=mac, now_utc=NOW,
+            )
+            return replace(real, proposal=replace(real.proposal, world_id="foreign"))
+        with self.assertRaises(ValueError):
+            self.clock.tick(NOW, tamper_result)
+        self.assertEqual(self.counts(), (0, 0, 6))
+        self.assertIsNone(self.clock.lookup("roster_test_1").processed_at)
+
+    def test_unrelated_generic_clock_handler_still_acknowledges(self):
+        self.clock.schedule("generic_1", due_at=NOW, kind="ordinary", payload={})
+        processed = self.clock.tick(NOW, lambda db, event: None)
+        self.assertEqual(len(processed), 1)
+        self.assertIsNotNone(self.clock.lookup("generic_1").processed_at)
+        self.assertEqual(self.clock.tick(NOW, lambda db, event: None), [])
+
+
 if __name__ == "__main__":
     unittest.main()

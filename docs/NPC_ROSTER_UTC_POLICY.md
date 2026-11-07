@@ -26,14 +26,21 @@ back together. Nested savepoint also rolls back partial writes on caught faults.
 - No NPC autonomy, player consent, private lore/canon release or VN2 deployment.
 - Host permit keys do not grant Patrick owner/release authority.
 - SQLite snapshot rollback needs a separate protected external witness.
-- For `npc_roster_gather`, the clock now requires a matching
-  `NpcRosterGatherResult` and verifies executed/WAIT counts plus each exact
-  actor/action receipt **inside the same writer transaction** before acknowledging
-  the clock event. Swallowed handler failures and fabricated/no-receipt outcomes
-  abort the entire tick batch; valid WAIT entries in mixed rosters remain permitted.
-  The current allocation planner rejects zero harvestable sites, so an all-WAIT
-  plan is not currently executable through the proposal interface.
+- For `npc_roster_gather`, the clock requires a matching
+  `NpcRosterGatherResult`, executed/WAIT counts, exact actor/action receipts,
+  world/policy/UTC binding and a same-writer `npc_roster_utc_attestations`
+  row. The host-permitted executor writes that receipt only after checking the
+  signed grant, full proposal, stock and action results, then seals the exact
+  outcome digest with a distinct HMAC execution domain. The clock checks the
+  receipt's recorded digest, not the private host key; arbitrary malicious
+  host code with database write access is outside this trust boundary.
+  Failed/missing or forged results roll back the entire tick batch, including
+  any tentative actor effects or extra receipts. A partial WAIT roster is valid;
+  all-WAIT is denied because the present planner requires harvestable stock.
   Host code should still propagate failures rather than concealing them.
+- After upgrading existing worlds, the trusted host must rerun opt-in
+  `WorldClock.enable()` to create the additive attestation table before using
+  roster ticks. No automatic world installation or migration occurs in this Draft.
 - This is an accidental host-integration safeguard, not a replacement for
   host permit issuance, owner consent, or a protected external witness.
 - Welfare allocation is not Nash equilibrium or actor-fair; WAIT-order skew
