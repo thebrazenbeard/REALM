@@ -99,6 +99,11 @@ def _medical_sidecar_bound(path: str | Path, *, world_id: str,
                         "policy_hash": policy.policy_hash}
             if len(rows) != len(expected) or dict(rows) != expected:
                 raise ValueError("medical sidecar world/policy mismatch")
+            # The DDL signature alone cannot prove existing rows obey FKs:
+            # foreign_keys may have been OFF when older rows were written.
+            # This is a read-only review scan, NOT cross-file authority.
+            if db.execute("PRAGMA main.foreign_key_check").fetchone() is not None:
+                raise ValueError("medical sidecar referential integrity violation")
     except sqlite3.Error as exc:
         raise ValueError("medical sidecar cannot be read safely") from exc
 
