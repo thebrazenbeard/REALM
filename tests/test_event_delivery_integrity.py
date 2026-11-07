@@ -53,6 +53,17 @@ class EventDeliveryIntegrityTests(unittest.TestCase):
         with self.assertRaisesRegex(WorldIntegrityError, "(?i)delivery|integrity"):
             Engine(self.db_path)
 
+    def test_bound_world_rejects_hidden_grant_sabotage_trigger(self):
+        with sqlite3.connect(self.db_path) as db:
+            db.execute("""CREATE TRIGGER sabotage_grants AFTER INSERT ON event_deliveries
+                BEGIN DELETE FROM event_deliveries
+                WHERE recipient=NEW.recipient AND seq=NEW.seq; END""")
+            before = db.execute("SELECT COUNT(*) FROM events").fetchone()[0]
+        with self.assertRaisesRegex(WorldIntegrityError, "(?i)trigger|integrity"):
+            Engine(self.db_path)
+        with sqlite3.connect(self.db_path) as db:
+            self.assertEqual(before, db.execute("SELECT COUNT(*) FROM events").fetchone()[0])
+
     def test_delivery_schema_marker_is_written_only_when_event_grant_commits(self):
         with sqlite3.connect(self.db_path) as db:
             marker = db.execute(
