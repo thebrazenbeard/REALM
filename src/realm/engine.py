@@ -199,6 +199,15 @@ class Engine:
         This is local action deduplication, not network authentication.
         """
         command = raw_command.strip()
+        # Blank/quit shortcuts return before the normal action transaction.
+        # Scoped HTTP calls still need the same-world writer authority check:
+        # otherwise a revoke after the handler's check gets HTTP 200.
+        if writer_guard is not None and (
+            not command or command.partition(" ")[0].casefold() in {"quit", "exit"}
+        ):
+            with closing(self._connect()) as db, db:
+                db.execute("BEGIN IMMEDIATE")
+                writer_guard(db)
         if not command:
             return "Enter a command. Type 'help' for options."
         verb, _, arg = command.partition(" ")

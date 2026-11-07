@@ -61,8 +61,11 @@ under the actual world SQLite `BEGIN IMMEDIATE` writer transaction, immediately
 before any join, core Engine action, or Crafting effect. A concurrent host
 rotation/revocation against the **same world database** therefore serializes
 before or after the complete gameplay write; it cannot win between the final
-credential check and the checked effect. Legacy local host-trusted APIs are
-unchanged, and legacy unscoped HTTP credentials retain their existing contract.
+credential check and the checked effect. Even no-effect core shortcuts (blank,
+`quit`, `exit`) must pass the in-writer scoped check before HTTP can return
+success; this closes a previously observed 200-after-revocation race for them.
+Legacy local host-trusted APIs are unchanged, and legacy unscoped HTTP
+credentials retain their existing contract.
 
 This does **not** qualify PR86 ship commands, future action adapters that omit
 the writer guard, external services or separate-database writers, or any

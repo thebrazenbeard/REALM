@@ -532,6 +532,73 @@ class ScopedCredentialTests(unittest.TestCase):
                 "SELECT COUNT(*) FROM main.events WHERE actor='Alice' AND kind='say'"
             ).fetchone()[0])
 
+    def test_revoked_scoped_shortcuts_must_enter_writer_guard(self):
+        gateway = Gateway(
+            Path(self.tmp.name) / "shortcut.sqlite3", world_id="sandbox",
+            scoped_credentials=True,
+            scoped_guard_path=Path(self.tmp.name) / "shortcut.anchor",
+        )
+        token = gateway.scoped_credentials.provision("Alice")
+        gateway.join_remote("Alice", token)
+        self.assertTrue(gateway.scoped_credentials.revoke("Alice"))
+        for command in ("", "  ", "quit", "exit", " QUIT "):
+            with self.subTest(command=repr(command)):
+                with self.assertRaises(PermissionError):
+                    gateway.command_remote("Alice", command, None, token)
+
+    def test_http_shortcut_revocation_after_last_check_returns_401(self):
+        gateway = Gateway(
+            Path(self.tmp.name) / "http-shortcut.sqlite3", world_id="sandbox",
+            scoped_credentials=True,
+            scoped_guard_path=Path(self.tmp.name) / "http-shortcut.anchor",
+        )
+        token = gateway.scoped_credentials.provision("Alice")
+        gateway.join_remote("Alice", token)
+        paused, release = threading.Event(), threading.Event()
+        original = gateway.command_remote
+
+        def delayed(*args, **kwargs):
+            paused.set()
+            if not release.wait(5):
+                raise RuntimeError("Synthetic HTTP dispatch pause timed out")
+            return original(*args, **kwargs)
+
+        gateway.command_remote = delayed
+        server = GatewayServer(gateway, (), port=0)
+        server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+        server_thread.start()
+        self.addCleanup(lambda: (
+            server.shutdown(), server.server_close(), server_thread.join(timeout=3)
+        ))
+        result = {}
+        def send():
+            connection = http.client.HTTPConnection(
+                "127.0.0.1", server.server_port, timeout=6
+            )
+            try:
+                connection.request(
+                    "POST", "/api/v1/command",
+                    body=json.dumps({"player": "Alice", "command": "quit"}).encode(),
+                    headers={
+                        "Authorization": "Bearer " + token,
+                        "Content-Type": "application/json",
+                    },
+                )
+                response = connection.getresponse()
+                result["status"] = response.status
+                response.read()
+            finally:
+                connection.close()
+
+        client = threading.Thread(target=send, daemon=True)
+        client.start()
+        self.assertTrue(paused.wait(4), "HTTP dispatch never passed precheck")
+        self.assertTrue(gateway.scoped_credentials.revoke("Alice"))
+        release.set()
+        client.join(timeout=6)
+        self.assertFalse(client.is_alive())
+        self.assertEqual(401, result.get("status"))
+
 
 if __name__ == "__main__":
     unittest.main()
