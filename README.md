@@ -37,8 +37,8 @@ The current integration candidate supports:
 
 - Separate persistent worlds: each SQLite file is a world, seeded with three deliberately **noncanonical demo rooms**. The loopback gateway persists its `world_id` binding and rejects an attempt to relabel an existing database (see `docs/GATEWAY_PROTOCOL.md` for legacy adoption).
 - Player names and persistent positions across restarts. Presence is their **last saved location**, not proof they are currently online.
-- Room descriptions and exits; movement; item take/drop/inventory (with transaction-level contention); player presence and shared room history.
-- Durable player speech, readable by others with `listen`/`history`.
+- Room descriptions and exits; movement; item take/drop/inventory (with transaction-level contention); persisted room positions and event-time-granted room history.
+- Durable player speech, readable through `listen`/`history` only by actors granted event-time room delivery (not retroactively by later arrival).
 - Append-only application event records for joins, movement and speech.
 - API-level optional action IDs for replay-safe mutation retries; duplicate IDs for different commands are rejected.
 - One terminal client per player, using the same database path, with stdlib-only runtime dependencies.
@@ -112,6 +112,34 @@ node --test tests/browser/test-map.cjs tests/browser/test-client.cjs
 ```
 
 On Windows PowerShell use `$env:PYTHONPATH = 'src'` before running `python -m realm`.
+
+### SQLite journal and runtime qualification
+
+New worlds use SQLite WAL by default. The programmatic `Engine(path,
+journal_mode="DELETE")` option can create a **fresh** rollback-journal world for
+disposable local testing. Reopening that database with `Engine(path)` retains
+its existing journal instead of silently converting it back to WAL. Explicit
+mode changes on an existing world are rejected; changing a played world's
+journal mode requires an offline, separately reviewed migration with a verified
+backup. Initial journal selection and schema creation are serialized by a
+local OS lock using a persistent `*.sqlite3.init.lock` sidecar. Keep that
+sidecar in place: deleting it while processes are running defeats the startup
+lock. Active SQLite worlds belong on host-local storage, not network shares.
+The existing CLI/gateway do not provide an online journal migration.
+
+Before considering a **durable, concurrently accessed WAL world** for production,
+run the read-only loaded-library check:
+
+```bash
+PYTHONPATH=src python -m realm.sqlite_runtime
+```
+
+Exit `0` means the loaded library's version is in a release line carrying
+SQLite's documented 2026 WAL-reset fix; exit `2` means it is not. The command
+prints the actual linked SQLite version and source ID. Passing the version
+check **does not** replace concurrency, consistency, restart and online-backup
+qualification. The vendor calls the bug rare, not an emergency; it has not
+been observed in REALM. See [official SQLite WAL guidance](https://sqlite.org/wal.html#walresetbug).
 
 To create your **own** world, start with the guarded offline builder in
 [`WORLDPACKS.md`](WORLDPACKS.md). To try the separate, original 24-room flagship
