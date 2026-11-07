@@ -40,11 +40,12 @@ the output if source content is unpublished, proprietary, personal, or otherwise
 restricted.** This module does not read Wreckforge sources autonomously.
 
 Input constraints: 1 MiB maximum source bytes; no .zip generic ingestion or
-PDF, no wildcard/directory crawl; DOCX uses only word/document.xml, checks
-archive member count/duplicate names/paths/compression ratio/size, disallows XML DOCTYPE/ENTITY,
-and parses text without executing instructions found in it. Labeled candidate
-count and repeated evidence are bounded. Plain-file reads may change between
-stat/read; the output always hashes the bytes actually read, not the filename.
+PDF, no wildcard/directory crawl; DOCX uses only UTF-8 word/document.xml,
+checks archive member count/duplicate names/paths/compression ratio/size, rejects
+UTF-16/other XML encodings, and disallows XML DOCTYPE/ENTITY in decoded text
+before parsing. It does not execute instructions found in the source. Labeled
+candidate count and repeated evidence are bounded. Plain-file reads may change
+between stat/read; the output always hashes the bytes actually read, not the filename.
 
 Before any eventual gameplay import, a separate system must provide reviewed
 source binding, rights/owner release, conflict adjudication, navigation and

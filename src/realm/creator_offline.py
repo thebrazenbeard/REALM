@@ -70,12 +70,27 @@ def _docx_paragraphs(source: bytes) -> list[str]:
                 raise CandidateError("DOCX document XML is oversized")
     except BadZipFile as exc:
         raise CandidateError("Invalid DOCX archive") from exc
-    upper = xml.upper()
-    if b"<!DOCTYPE" in upper or b"<!ENTITY" in upper:
+    # Decode before scanning: a raw ASCII-byte check misses UTF-16 DTDs.
+    # DOCX review intentionally supports UTF-8 XML only; other encodings
+    # must be explicitly reviewed before becoming an input capability.
+    try:
+        xml_text = xml.decode("utf-8-sig")
+    except UnicodeDecodeError as exc:
+        raise CandidateError("DOCX document XML must be UTF-8") from exc
+    if "\x00" in xml_text:
+        raise CandidateError("DOCX document XML contains NUL or unsupported encoding")
+    header = xml_text.lstrip()
+    if header.startswith("<?xml"):
+        declaration = header.split("?>", 1)[0]
+        encoding = re.search(r"\bencoding\s*=\s*(['\"])(.*?)\1", declaration, re.IGNORECASE)
+        if encoding and encoding.group(2).casefold().replace("_", "-") not in {"utf-8", "utf8"}:
+            raise CandidateError("DOCX document XML encoding must be UTF-8")
+    upper = xml_text.upper()
+    if "<!DOCTYPE" in upper or "<!ENTITY" in upper:
         raise CandidateError("DOCX XML declarations are not accepted")
     try:
-        root = ET.fromstring(xml)
-    except ET.ParseError as exc:
+        root = ET.fromstring(xml_text)
+    except (ET.ParseError, ValueError) as exc:
         raise CandidateError("Invalid DOCX document XML") from exc
     return [
         "".join(span.text or "" for span in paragraph.iter(W_T))

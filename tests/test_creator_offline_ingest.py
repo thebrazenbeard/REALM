@@ -103,6 +103,43 @@ class CreatorOfflineTests(unittest.TestCase):
         with self.assertRaises(CandidateError):
             preview_source(self.file("entity.docx", buffer.getvalue()))
 
+    def test_rejects_utf16_xml_entity_encoding_bypass(self):
+        # Raw-byte ASCII scanners miss DTD declarations separated by NULs.
+        for codec in ("utf-16", "utf-16-le", "utf-16-be"):
+            xml = ('<?xml version="1.0" encoding="UTF-16"?>'
+                   '<!DOCTYPE w:document [<!ENTITY spoof "Planet: Forged">]>'
+                   '<w:document xmlns:w="http://schemas.openxmlformats.org/'
+                   'wordprocessingml/2006/main"><w:body><w:p><w:r>'
+                   '<w:t>&spoof;</w:t></w:r></w:p></w:body></w:document>')
+            buffer = io.BytesIO()
+            with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as archive:
+                archive.writestr("word/document.xml", xml.encode(codec))
+            with self.subTest(codec=codec):
+                with self.assertRaises(CandidateError):
+                    preview_source(self.file("encoded.docx", buffer.getvalue()))
+
+    def test_rejects_mismatched_xml_encoding_declaration(self):
+        xml = ('<?xml version="1.0" encoding="ISO-8859-1"?>'
+               '<w:document xmlns:w="http://schemas.openxmlformats.org/'
+               'wordprocessingml/2006/main"><w:body><w:p><w:r>'
+               '<w:t>Planet: Forged</w:t></w:r></w:p></w:body></w:document>')
+        buffer = io.BytesIO()
+        with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as archive:
+            archive.writestr("word/document.xml", xml.encode("ascii"))
+        with self.assertRaises(CandidateError):
+            preview_source(self.file("wrong-encoding.docx", buffer.getvalue()))
+
+    def test_rejects_encoding_hidden_after_long_xml_declaration(self):
+        xml = ('<?xml version="1.0" ' + ' ' * 650 + ' encoding="ISO-8859-1"?>'
+               '<w:document xmlns:w="http://schemas.openxmlformats.org/'
+               'wordprocessingml/2006/main"><w:body><w:p><w:r>'
+               '<w:t>Planet: ExtendedHeader</w:t></w:r></w:p></w:body></w:document>')
+        buffer = io.BytesIO()
+        with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as archive:
+            archive.writestr("word/document.xml", xml.encode("utf-8"))
+        with self.assertRaises(CandidateError):
+            preview_source(self.file("long-header.docx", buffer.getvalue()))
+
     def test_rejects_zip_bomb_ratio(self):
         data = docx_blob(["Planet: " + "A" * 120000])
         with self.assertRaises(CandidateError):
