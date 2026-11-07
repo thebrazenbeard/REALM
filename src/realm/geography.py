@@ -40,6 +40,7 @@ _TERRAIN = {
 }
 _MAX_DIMENSION = 256
 _MAX_VIEWPORT = 32
+_MAX_SQLITE_EPOCH = (1 << 63) - 1
 
 
 class MapUnavailable(LookupError):
@@ -455,28 +456,73 @@ class Geography:
 
     def arrive(self, ship_id: str, *, now: int | None = None,
                action_id: str | None = None) -> dict:
-        """Host tick/admin call. No autonomous simulation loop is implied."""
+        """Standalone host tick/admin call. No autonomous loop is implied."""
         at = int(time.time()) if now is None else now
-        if type(at) is not int or at < 0:
-            raise ValueError("Time must be a nonnegative integer")
+        if type(at) is not int or not 0 <= at <= _MAX_SQLITE_EPOCH:
+            raise ValueError("Time must be a nonnegative integer fitting SQLite signed 64-bit")
         with self._connect() as db:
             db.execute("BEGIN IMMEDIATE")
-            ship = db.execute("SELECT * FROM geo_ships WHERE id=?", (ship_id,)).fetchone()
-            if ship is None:
-                raise ValueError("Unknown ship")
-            command = "arrive"
-            receipt = self._receipt(db, ship_id, "system", action_id, command)
-            if receipt is not None:
-                return receipt
-            if ship["destination"] is None:
-                raise ValueError("Ship is already docked")
-            if at < ship["arrival_at"]:
-                raise ValueError("Ship has not reached its destination")
-            db.execute("UPDATE geo_ships SET planet_id=?,destination=NULL,arrival_at=NULL WHERE id=?",
-                       (ship["destination"], ship_id))
-            payload = {"from": ship["planet_id"], "to": ship["destination"]}
-            db.execute("INSERT INTO geo_ship_events(occurred_at,ship_id,actor,kind,payload_json) VALUES(?,?,?,?,?)",
-                       (at, ship_id, "system", "arrive", json.dumps(payload, sort_keys=True)))
-            response = {"ship": ship_id, "state": "docked", "planet": ship["destination"]}
-            self._store_receipt(db, ship_id, "system", action_id, command, response)
+            return self._arrive_on_connection(db, ship_id, at, action_id)
+
+    def arrive_in_transaction(self, db: sqlite3.Connection, ship_id: str, *,
+                              now: int, action_id: str) -> dict:
+        """Host-only clock adapter: use the caller's SAME world transaction.
+
+        No new connection, outer BEGIN, COMMIT or outer ROLLBACK occurs.
+        A nested SQLite SAVEPOINT makes this method exception-atomic even
+        when its host caller catches an error and commits other work.
+        WorldClock.tick passes its write-transaction connection to the trusted
+        callback, which must supply the host-authorized ship, UTC epoch second
+        and stable event ID as action_id. This method neither schedules a
+        departure's arrival nor authenticates a remote caller.
+        """
+        if not isinstance(db, sqlite3.Connection):
+            raise TypeError("Expected an SQLite connection")
+        if not db.in_transaction:
+            raise RuntimeError("Existing SQLite transaction required")
+        main_file = next(
+            (row[2] for row in db.execute("PRAGMA database_list") if row[1] == "main"),
+            None,
+        )
+        if not main_file or Path(main_file).resolve() != self.db_path.resolve():
+            raise ValueError("Connection points to a different world database")
+        if db.row_factory is not sqlite3.Row:
+            raise ValueError("Connection must use sqlite3.Row row_factory")
+        if db.execute("PRAGMA foreign_keys").fetchone()[0] != 1:
+            raise RuntimeError("Shared arrival requires enabled foreign keys")
+        if type(now) is not int or not 0 <= now <= _MAX_SQLITE_EPOCH:
+            raise ValueError("Time must be a nonnegative integer fitting SQLite signed 64-bit")
+        if action_id is None:
+            raise ValueError("Shared arrival requires stable action_id")
+        db.execute("SAVEPOINT realm_ship_arrival")
+        try:
+            response = self._arrive_on_connection(db, ship_id, now, action_id)
+        except BaseException:
+            db.execute("ROLLBACK TO SAVEPOINT realm_ship_arrival")
+            db.execute("RELEASE SAVEPOINT realm_ship_arrival")
+            raise
+        else:
+            db.execute("RELEASE SAVEPOINT realm_ship_arrival")
             return response
+
+    def _arrive_on_connection(self, db: sqlite3.Connection, ship_id: str,
+                              at: int, action_id: str | None) -> dict:
+        ship = db.execute("SELECT * FROM geo_ships WHERE id=?", (ship_id,)).fetchone()
+        if ship is None:
+            raise ValueError("Unknown ship")
+        command = "arrive"
+        receipt = self._receipt(db, ship_id, "system", action_id, command)
+        if receipt is not None:
+            return receipt
+        if ship["destination"] is None:
+            raise ValueError("Ship is already docked")
+        if at < ship["arrival_at"]:
+            raise ValueError("Ship has not reached its destination")
+        db.execute("UPDATE geo_ships SET planet_id=?,destination=NULL,arrival_at=NULL WHERE id=?",
+                   (ship["destination"], ship_id))
+        payload = {"from": ship["planet_id"], "to": ship["destination"]}
+        db.execute("INSERT INTO geo_ship_events(occurred_at,ship_id,actor,kind,payload_json) VALUES(?,?,?,?,?)",
+                   (at, ship_id, "system", "arrive", json.dumps(payload, sort_keys=True)))
+        response = {"ship": ship_id, "state": "docked", "planet": ship["destination"]}
+        self._store_receipt(db, ship_id, "system", action_id, command, response)
+        return response
