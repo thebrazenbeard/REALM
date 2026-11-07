@@ -194,6 +194,66 @@ class ClockGameplayTests(unittest.TestCase):
                 "SELECT count(*) FROM events WHERE kind='gather'"
             ).fetchone()[0])
 
+    def test_temp_receipt_shadow_cannot_forge_processed_clock_action(self):
+        self.clock.schedule("npc_action", due_at=BASE, kind="host_action",
+                            payload={"actor": "BotA", "command": "north"})
+
+        def poisoned(db, event):
+            db.execute("CREATE TEMP TABLE action_receipts(actor TEXT, action_id TEXT, command TEXT, response TEXT)")
+            db.execute("INSERT INTO temp.action_receipts VALUES ('BotA','npc_action','north','FAKE_REPLAY')")
+            self._apply(db, "BotA", "north", event.event_id)
+
+        with self.assertRaisesRegex(RuntimeError, "TEMP"):
+            self.clock.tick(BASE, poisoned)
+        self.assertIsNone(self.clock.lookup("npc_action").processed_at)
+        with closing(self._connection()) as db:
+            self.assertEqual("atrium", db.execute(
+                "SELECT room_id FROM main.players WHERE id='BotA'").fetchone()[0])
+            self.assertEqual(0, db.execute(
+                "SELECT count(*) FROM main.action_receipts WHERE actor='BotA'"
+            ).fetchone()[0])
+
+    def test_temp_actor_shadow_cannot_inject_ghost_player_and_receipt(self):
+        self.clock.schedule("ghost_action", due_at=BASE, kind="host_action", payload={})
+
+        def poisoned(db, event):
+            db.execute("CREATE TEMP TABLE players(id TEXT, room_id TEXT)")
+            db.execute("INSERT INTO temp.players VALUES ('Ghost','atrium')")
+            self._apply(db, "Ghost", "north", event.event_id)
+
+        with self.assertRaisesRegex(RuntimeError, "TEMP"):
+            self.clock.tick(BASE, poisoned)
+        self.assertIsNone(self.clock.lookup("ghost_action").processed_at)
+        with closing(self._connection()) as db:
+            self.assertEqual(0, db.execute(
+                "SELECT count(*) FROM main.action_receipts WHERE actor='Ghost'"
+            ).fetchone()[0])
+            self.assertEqual(0, db.execute(
+                "SELECT count(*) FROM main.events WHERE actor='Ghost'"
+            ).fetchone()[0])
+
+    def test_temp_stock_shadow_cannot_grant_resources_without_decrement(self):
+        self.clock.schedule("stock_action", due_at=BASE, kind="host_action", payload={})
+
+        def poisoned(db, event):
+            db.execute("CREATE TEMP TABLE gathering_nodes(room_id TEXT, material TEXT, remaining INT, batch_yield INT)")
+            db.execute("INSERT INTO temp.gathering_nodes VALUES ('atrium','iron',9999,100)")
+            self._apply(db, "BotA", "gather iron", event.event_id)
+
+        with self.assertRaisesRegex(RuntimeError, "TEMP"):
+            self.clock.tick(BASE, poisoned)
+        self.assertIsNone(self.clock.lookup("stock_action").processed_at)
+        with closing(self._connection()) as db:
+            self.assertEqual(6, db.execute(
+                "SELECT remaining FROM main.gathering_nodes WHERE material='iron'"
+            ).fetchone()[0])
+            self.assertEqual(0, db.execute(
+                "SELECT count(*) FROM main.material_pouches"
+            ).fetchone()[0])
+            self.assertEqual(0, db.execute(
+                "SELECT count(*) FROM main.action_receipts"
+            ).fetchone()[0])
+
 
 if __name__ == "__main__":
     unittest.main()

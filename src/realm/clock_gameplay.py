@@ -41,10 +41,20 @@ def _guard_connection(db: sqlite3.Connection, engine: Engine, crafting: Crafting
         raise ValueError("Connection must use sqlite3.Row row_factory")
     if db.execute("PRAGMA foreign_keys").fetchone()[0] != 1:
         raise RuntimeError("Shared gameplay requires enabled foreign keys")
+    # SQLite resolves unqualified object names from TEMP before main.
+    # The legacy Engine/Crafting transition helpers intentionally use bare
+    # table names, so do not run them with ANY user-created TEMP objects.
+    # This also refuses TEMP triggers/views that could intercept reads/writes.
     if db.execute(
-        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='world_meta'"
+        "SELECT name FROM sqlite_temp_master "
+        "WHERE type IN ('table','view','trigger','index') "
+        "AND name NOT LIKE 'sqlite_%' LIMIT 1"
+    ).fetchone() is not None:
+        raise RuntimeError("TEMP schema objects cannot shadow authoritative gameplay")
+    if db.execute(
+        "SELECT 1 FROM main.sqlite_master WHERE type='table' AND name='world_meta'"
     ).fetchone() is None or db.execute(
-        "SELECT 1 FROM world_meta WHERE key='world_id' AND length(value)>0"
+        "SELECT 1 FROM main.world_meta WHERE key='world_id' AND length(value)>0"
     ).fetchone() is None:
         raise RuntimeError("Gameplay requires a bound world")
 
@@ -86,14 +96,14 @@ def perform_in_transaction(
     db.execute("SAVEPOINT realm_clock_gameplay")
     try:
         player = db.execute(
-            "SELECT id,room_id FROM players WHERE id=? COLLATE NOCASE",
+            "SELECT id,room_id FROM main.players WHERE id=? COLLATE NOCASE",
             (actor,),
         ).fetchone()
         if player is None:
             raise ValueError("Join this REALM before issuing commands")
         actual_actor, room = player["id"], player["room_id"]
         previous = db.execute(
-            "SELECT command,response FROM action_receipts WHERE actor=? AND action_id=?",
+            "SELECT command,response FROM main.action_receipts WHERE actor=? AND action_id=?",
             (actual_actor, action_id),
         ).fetchone()
         if previous is not None:
@@ -108,7 +118,7 @@ def perform_in_transaction(
             else:
                 response = crafting._make(db, actual_actor, room, verb, arg)
             db.execute(
-                "INSERT INTO action_receipts(actor,action_id,command,response) VALUES(?,?,?,?)",
+                "INSERT INTO main.action_receipts(actor,action_id,command,response) VALUES(?,?,?,?)",
                 (actual_actor, action_id, command, response),
             )
     except BaseException:
