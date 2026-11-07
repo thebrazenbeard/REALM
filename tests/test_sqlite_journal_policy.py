@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import sqlite3
+from unittest.mock import patch
 import os
 import subprocess
 import sys
@@ -31,6 +32,24 @@ class SQLiteJournalPolicyTests(unittest.TestCase):
 
     def test_new_world_defaults_to_wal(self):
         Engine(self.db)
+        self.assertEqual("WAL", journal_mode(self.db))
+
+    def test_known_unsafe_loaded_sqlite_defaults_new_world_to_delete(self):
+        with patch("realm.engine.wal_reset_fix_present", return_value=False):
+            Engine(self.db)
+        self.assertEqual("DELETE", journal_mode(self.db))
+
+    def test_known_unsafe_loaded_sqlite_rejects_explicit_wal(self):
+        with patch("realm.engine.wal_reset_fix_present", return_value=False):
+            with self.assertRaisesRegex(RuntimeError, "(?i)WAL|SQLite"):
+                Engine(self.db, journal_mode="WAL")
+        self.assertNotEqual("WAL", journal_mode(self.db))
+
+    def test_known_unsafe_loaded_sqlite_refuses_existing_wal_without_conversion(self):
+        Engine(self.db)
+        with patch("realm.engine.wal_reset_fix_present", return_value=False):
+            with self.assertRaisesRegex(RuntimeError, "(?i)WAL|SQLite"):
+                Engine(self.db)
         self.assertEqual("WAL", journal_mode(self.db))
 
     def test_opt_in_delete_mode_survives_reopen_and_actions(self):
