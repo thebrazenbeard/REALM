@@ -538,6 +538,56 @@ class RosterUtcTests(unittest.TestCase):
         self.assertEqual(self.counts(), (0, 0, 6))
         self.assertIsNone(self.clock.lookup("roster_test_1").processed_at)
 
+    def _postverify_material_trigger(self, body):
+        plan = self.proposal()
+        policy, mac = self.grant(plan)
+        with closing(sqlite3.connect(self.dbpath)) as db, db:
+            db.execute(
+                "CREATE TRIGGER main.tamper_roster_materials "
+                "AFTER UPDATE OF processed_utc ON clock_events "
+                "WHEN NEW.event_id='roster_test_1' BEGIN " + body + " END"
+            )
+        with self.assertRaises(ValueError):
+            self.run_grant(policy, mac)
+        self.assertEqual(self.counts(), (0, 0, 6))
+        self.assertIsNone(self.clock.lookup("roster_test_1").processed_at)
+        with closing(sqlite3.connect(self.dbpath)) as db:
+            self.assertEqual(db.execute(
+                "SELECT COALESCE(SUM(quantity),0) FROM material_pouches"
+            ).fetchone()[0], 0)
+        # The rejected tick must be safe to retry once the hostile fixture
+        # is removed, without duplicate receipts or partial stock changes.
+        with closing(sqlite3.connect(self.dbpath)) as db, db:
+            db.execute("DROP TRIGGER main.tamper_roster_materials")
+        self.assertEqual(self.run_grant(policy, mac).executed, 2)
+        self.assertEqual(self.counts(), (2, 2, 0))
+        self.assertEqual(self.clock.tick(
+            NOW, lambda db, event: self.fail("completed roster replayed")
+        ), [])
+
+    def test_postverify_material_pouches_cannot_be_deleted(self):
+        self._postverify_material_trigger("DELETE FROM material_pouches;")
+
+    def test_postverify_gathering_stock_cannot_be_replenished(self):
+        self._postverify_material_trigger(
+            "UPDATE gathering_nodes SET remaining=3;"
+        )
+
+    def test_postverify_gather_events_cannot_be_deleted(self):
+        self._postverify_material_trigger(
+            "DELETE FROM events WHERE kind='gather';"
+        )
+
+    def test_postverify_material_pouch_cannot_be_inflated(self):
+        self._postverify_material_trigger(
+            "UPDATE material_pouches SET quantity=quantity+1;"
+        )
+
+    def test_postverify_gather_event_cannot_be_rewritten(self):
+        self._postverify_material_trigger(
+            "UPDATE events SET payload_json='{}' WHERE kind='gather';"
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
