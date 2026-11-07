@@ -36,6 +36,12 @@ even if the enclosing host catches a late SQL error and commits.
   pressure, hatches, breaches, occupants, and receipts. Restoration rejects
   over-limit *exact* gas inventories even if integer-truncated displayed
   pressure happens to remain at the maximum allowed value.
+- Each host tick now proposes all hatch flows from a frozen initial state,
+  apportions donor gas/oxygen and receiver pressure capacity across simultaneous
+  edges, then commits atomically. Merely renaming a hatch no longer changes
+  physical inventories. The transfer ratio is per *host tick*, not a
+  timestep-independent flow law; no continuous-time, CFD, or real-world
+  decompression fidelity is claimed.
 - Sample equalization, breach, and exposure semantics remain synthetic and
   setting-neutral. A sealed suit is a nominal protective flag, not modeled
   oxygen supply, heat transfer, mass transfer or canonical Wreckforge physics.

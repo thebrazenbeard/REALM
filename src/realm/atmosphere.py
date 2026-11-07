@@ -33,6 +33,26 @@ def _integer(value, name, low, high):
     return value
 
 
+def _cap_flows(flows, role, room_id, capacity, species="gas"):
+    """Conserve integer transfers when an entire room has multiple open edges."""
+    selected = [i for i, flow in enumerate(flows) if flow[role] == room_id]
+    total = sum(flows[i][species] for i in selected)
+    if total <= capacity:
+        return
+    # Largest-remainder apportionment conserves exactly and is independent
+    # of user-supplied hatch names for physically distinct endpoints.
+    shares = {i: flows[i][species] * capacity // total for i in selected}
+    leftover = capacity - sum(shares.values())
+    ranking = sorted(selected, key=lambda i: (
+        -(flows[i][species] * capacity % total),
+        flows[i]["endpoints"], flows[i]["name"],
+    ))
+    for i in ranking[:leftover]:
+        shares[i] += 1
+    for i in selected:
+        flows[i][species] = shares[i]
+
+
 class AtmosphereModel:
     """Host-invoked pure in-memory domain layer, not an authentication boundary."""
 
@@ -159,29 +179,62 @@ class AtmosphereModel:
                 raise ValueError("Isothermal kernel rejects mismatched temperatures")
         candidate = deepcopy(self.compartments)
         events = []
-        for name, hatch in sorted(self.hatches.items()):
+        flows = []
+        # Every proposed edge transfer is derived from the SAME pre-tick state;
+        # identifying or renaming hatches cannot alter physical gas inventories.
+        for name, hatch in self.hatches.items():
             if not hatch["open"]:
                 continue
             a, b = candidate[hatch["a"]], candidate[hatch["b"]]
-            if a["temperature_mk"] != b["temperature_mk"]:
-                raise ValueError("Isothermal kernel rejects mismatched temperatures")
             av, bv = a["volume_l"], b["volume_l"]
             pa, pb = a["gas_pa_l"] // av, b["gas_pa_l"] // bv
             if pa == pb:
                 continue
-            source, target = (a, b) if pa > pb else (b, a)
+            source_id, target_id = (
+                (hatch["a"], hatch["b"]) if pa > pb
+                else (hatch["b"], hatch["a"])
+            )
             transfer_to_equalize = abs(pa - pb) * av * bv // (av + bv)
-            # Integer gas inventory cannot express a sub-unit transfer. Forcing
-            # one unit here makes a 1 Pa / 0 Pa pair oscillate forever.
-            transfer = min(source["gas_pa_l"], transfer_to_equalize // 4)
-            if transfer == 0:
+            # Never force sub-integer flow: that oscillates at tiny pressures.
+            transfer = min(candidate[source_id]["gas_pa_l"], transfer_to_equalize // 4)
+            if transfer:
+                flows.append({
+                    "name": name, "source": source_id, "target": target_id,
+                    "gas": transfer,
+                    "endpoints": tuple(sorted((hatch["a"], hatch["b"]))),
+                })
+        flows.sort(key=lambda f: (f["endpoints"], f["name"]))
+        # Simultaneous edges can overdraw a donor or overfill a receiver. Cap
+        # room-wide source and target budgets before applying ANY edge.
+        for room_id, room in sorted(candidate.items()):
+            _cap_flows(flows, "source", room_id, room["gas_pa_l"])
+        for room_id, room in sorted(candidate.items()):
+            capacity = _MAX_PRESSURE * room["volume_l"] - room["gas_pa_l"]
+            _cap_flows(flows, "target", room_id, capacity)
+        # Apportion oxygen per donor as a whole. Per-edge flooring can leave
+        # oxygen in a chamber whose gas was completely drained.
+        for flow in flows:
+            flow["oxygen"] = flow["gas"]
+        for room_id, room in sorted(candidate.items()):
+            sent = sum(f["gas"] for f in flows if f["source"] == room_id)
+            if sent:
+                oxygen_sent = room["oxygen_pa_l"] * sent // room["gas_pa_l"]
+                _cap_flows(flows, "source", room_id, oxygen_sent, species="oxygen")
+        delta = {name: {"gas": 0, "oxygen": 0} for name in candidate}
+        for flow in flows:
+            transfer = flow["gas"]
+            if not transfer:
                 continue
-            oxygen = source["oxygen_pa_l"] * transfer // source["gas_pa_l"]
-            source["gas_pa_l"] -= transfer
-            source["oxygen_pa_l"] -= oxygen
-            target["gas_pa_l"] += transfer
-            target["oxygen_pa_l"] += oxygen
-            events.append({"kind": "equalization", "hatch": name, "gas_pa_l": transfer})
+            oxygen = flow["oxygen"]
+            delta[flow["source"]]["gas"] -= transfer
+            delta[flow["source"]]["oxygen"] -= oxygen
+            delta[flow["target"]]["gas"] += transfer
+            delta[flow["target"]]["oxygen"] += oxygen
+            events.append({"kind": "equalization", "hatch": flow["name"],
+                           "gas_pa_l": transfer})
+        for room_id, changes in delta.items():
+            candidate[room_id]["gas_pa_l"] += changes["gas"]
+            candidate[room_id]["oxygen_pa_l"] += changes["oxygen"]
         for room, rate in sorted(self.breaches.items()):
             c = candidate[room]
             if c["gas_pa_l"] <= 0:
