@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import closing
 import hashlib
 import hmac
 import json
@@ -79,7 +80,7 @@ class ReleaseGateTests(unittest.TestCase):
         self.assertEqual(first["owner_authority"], "HELD_UNVERIFIED")
         again = self.stage()
         self.assertTrue(again["unchanged"])
-        with sqlite3.connect(self.ledger) as db:
+        with closing(sqlite3.connect(self.ledger)) as db, db:
             self.assertEqual(db.execute("SELECT count(*) FROM creator_release_staging").fetchone()[0], 1)
 
     def test_staging_db_handle_closes_for_immediate_unlink_and_reopen(self):
@@ -162,7 +163,7 @@ class ReleaseGateTests(unittest.TestCase):
 
     def test_replay_after_local_ledger_tamper_fails_closed(self):
         self.stage()
-        with sqlite3.connect(self.ledger) as db:
+        with closing(sqlite3.connect(self.ledger)) as db, db:
             db.execute("UPDATE creator_release_staging SET raw_sha256=?", ("0" * 64,))
         with self.assertRaisesRegex(ReleaseGateError, "release_id"):
             self.stage()
@@ -188,7 +189,7 @@ class ReleaseGateTests(unittest.TestCase):
         self.assertEqual(sorted(results), ["rejected", "staged"])
 
     def test_foreign_schema_and_memory_db_rejected(self):
-        with sqlite3.connect(self.ledger) as db:
+        with closing(sqlite3.connect(self.ledger)) as db, db:
             db.execute("CREATE TABLE unrelated (id INTEGER)")
         with self.assertRaisesRegex(ReleaseGateError, "unexpected ledger schema"):
             self.stage()
