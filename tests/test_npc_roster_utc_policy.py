@@ -637,6 +637,210 @@ class RosterUtcTests(unittest.TestCase):
                 "SELECT COUNT(*) FROM events WHERE kind='say'"
             ).fetchone()[0], 1)
 
+    def _postverify_full_ledger_trigger(self, body, *, old_gather=False,
+                                        high_id=False):
+        """Installed MAIN trigger must not turn a false ACK into a commit."""
+        with closing(sqlite3.connect(self.dbpath)) as db, db:
+            if old_gather:
+                db.execute(
+                    "INSERT INTO events(occurred_at,actor,room_id,kind,payload_json) "
+                    "VALUES(?,?,?,?,?)",
+                    ("2026-11-07T20:00:00+00:00", "Ada", "atrium", "gather",
+                     '{"material":"iron","amount":1}'),
+                )
+            if high_id:
+                db.execute(
+                    "INSERT INTO events(id,occurred_at,actor,room_id,kind,payload_json) "
+                    "VALUES(100,'2026-11-07T20:00:00+00:00','Ada','atrium','say','{}')"
+                )
+            before = db.execute("SELECT * FROM events ORDER BY id").fetchall()
+            db.execute(
+                "CREATE TRIGGER main.ledger_attack AFTER UPDATE OF processed_utc "
+                "ON clock_events WHEN NEW.event_id='roster_test_1' "
+                "BEGIN " + body + " END"
+            )
+        plan = self.proposal()
+        policy, mac = self.grant(plan)
+        with self.assertRaises(ValueError):
+            self.run_grant(policy, mac)
+        self.assertEqual(self.counts(), (1 if old_gather else 0, 0, 6))
+        self.assertIsNone(self.clock.lookup("roster_test_1").processed_at)
+        with closing(sqlite3.connect(self.dbpath)) as db:
+            self.assertEqual(db.execute(
+                "SELECT * FROM events ORDER BY id"
+            ).fetchall(), before)
+        with closing(sqlite3.connect(self.dbpath)) as db, db:
+            db.execute("DROP TRIGGER main.ledger_attack")
+        self.assertEqual(self.run_grant(policy, mac).executed, 2)
+        self.assertEqual(self.counts(), (3 if old_gather else 2, 2, 0))
+        self.assertEqual(self.clock.tick(
+            NOW, lambda db, event: self.fail("roster replayed")
+        ), [])
+
+    def test_full_ledger_denies_historical_gather_payload_rewrite(self):
+        self._postverify_full_ledger_trigger(
+            "UPDATE events SET payload_json='{}' WHERE kind='gather' "
+            "AND id=(SELECT MIN(id) FROM events WHERE kind='gather');",
+            old_gather=True,
+        )
+
+    def test_full_ledger_denies_historical_gather_delete(self):
+        self._postverify_full_ledger_trigger(
+            "DELETE FROM events WHERE id=(SELECT MIN(id) FROM events WHERE kind='gather');",
+            old_gather=True,
+        )
+
+    def test_full_ledger_denies_historical_gather_kind_demotion(self):
+        self._postverify_full_ledger_trigger(
+            "UPDATE events SET kind='say' WHERE id=(SELECT MIN(id) FROM events WHERE kind='gather');",
+            old_gather=True,
+        )
+
+    def test_full_ledger_denies_join_kind_promotion(self):
+        self._postverify_full_ledger_trigger(
+            "UPDATE events SET kind='gather' WHERE id=(SELECT MIN(id) FROM events WHERE kind='join');"
+        )
+
+    def test_full_ledger_denies_negative_id_gather_forgery(self):
+        self._postverify_full_ledger_trigger(
+            "INSERT INTO events(id,occurred_at,actor,room_id,kind,payload_json) "
+            "VALUES(-11,'2026-11-07T21:00:00+00:00','Cora','workshop','gather',"
+            "'{\"material\":\"gold\",\"amount\":99}');"
+        )
+
+    def test_full_ledger_denies_zero_id_gather_forgery(self):
+        self._postverify_full_ledger_trigger(
+            "INSERT INTO events(id,occurred_at,actor,room_id,kind,payload_json) "
+            "VALUES(0,'2026-11-07T21:00:00+00:00','Cora','workshop','gather',"
+            "'{\"material\":\"gold\",\"amount\":99}');"
+        )
+
+    def test_full_ledger_denies_positive_id_below_watermark(self):
+        self._postverify_full_ledger_trigger(
+            "INSERT INTO events(id,occurred_at,actor,room_id,kind,payload_json) "
+            "VALUES(50,'2026-11-07T21:00:00+00:00','Cora','workshop','gather',"
+            "'{\"material\":\"gold\",\"amount\":99}');",
+            old_gather=True, high_id=True,
+        )
+
+    def test_full_ledger_denies_historical_timestamp_rewrite(self):
+        self._postverify_full_ledger_trigger(
+            "UPDATE events SET occurred_at='2099-01-01T00:00:00+00:00' "
+            "WHERE id=(SELECT MIN(id) FROM events WHERE kind='gather');",
+            old_gather=True,
+        )
+
+    def test_full_ledger_denies_signed_gather_timestamp_rewrite(self):
+        self._postverify_full_ledger_trigger(
+            "UPDATE events SET occurred_at='2099-01-01T00:00:00+00:00' "
+            "WHERE kind='gather';"
+        )
+
+    def _postverify_other_batch_event(self, hostile_body, *, old_gather=False,
+                                      before_roster=False, expect_rejection=True):
+        from realm.npc_roster_utc_policy import perform_host_roster_gather_in_transaction
+        if old_gather:
+            with closing(sqlite3.connect(self.dbpath)) as db, db:
+                db.execute(
+                    "INSERT INTO events(occurred_at,actor,room_id,kind,payload_json) "
+                    "VALUES('2026-11-07T20:00:00+00:00','Ada','atrium','gather',"
+                    "'{\"material\":\"iron\",\"amount\":1}')"
+                )
+        plan = self.proposal()
+        policy, mac = self.grant(plan)
+        other_id = "aaa_before_roster" if before_roster else "zzz_later_say"
+        self.clock.schedule(other_id, due_at=NOW, kind="say", payload={"test": "other"})
+        with closing(sqlite3.connect(self.dbpath)) as db, db:
+            before = db.execute("SELECT * FROM events ORDER BY id").fetchall()
+            db.execute(
+                "CREATE TRIGGER main.later_batch_attack AFTER UPDATE OF processed_utc "
+                "ON clock_events WHEN NEW.event_id='" + other_id + "' "
+                "BEGIN " + hostile_body + " END"
+            )
+
+        def tick():
+            def handler(db, event):
+                if event.kind == "say":
+                    db.execute(
+                        "INSERT INTO main.events(occurred_at,actor,room_id,kind,payload_json) "
+                        "VALUES('2026-11-07T21:00:00+00:00','Cora','atrium','say','{}')"
+                    )
+                    return None
+                return perform_host_roster_gather_in_transaction(
+                    db, event, engine=self.engine, crafting=self.crafting,
+                    policy=policy, host_key=HOST_KEY, grant_mac_hex=mac,
+                    now_utc=NOW,
+                )
+            return self.clock.tick(NOW, handler)
+
+        if expect_rejection:
+            with self.assertRaises(ValueError):
+                tick()
+            self.assertIsNone(self.clock.lookup("roster_test_1").processed_at)
+            self.assertIsNone(self.clock.lookup(other_id).processed_at)
+            self.assertEqual(self.counts(), (1 if old_gather else 0, 0, 6))
+            with closing(sqlite3.connect(self.dbpath)) as db:
+                self.assertEqual(db.execute(
+                    "SELECT * FROM events ORDER BY id"
+                ).fetchall(), before)
+        else:
+            self.assertEqual(len(tick()), 2)
+            self.assertEqual(self.counts(), (2, 2, 0))
+        with closing(sqlite3.connect(self.dbpath)) as db, db:
+            db.execute("DROP TRIGGER main.later_batch_attack")
+        if expect_rejection:
+            self.assertEqual(len(tick()), 2)
+            self.assertEqual(self.counts(), (3 if old_gather else 2, 2, 0))
+        self.assertEqual(tick(), [])
+
+    def test_full_ledger_denies_late_batch_historical_gather_delete(self):
+        self._postverify_other_batch_event(
+            "DELETE FROM events WHERE id=(SELECT MIN(id) FROM events WHERE kind='gather');",
+            old_gather=True,
+        )
+
+    def test_full_ledger_denies_late_batch_negative_id_forgery(self):
+        self._postverify_other_batch_event(
+            "INSERT INTO events(id,occurred_at,actor,room_id,kind,payload_json) "
+            "VALUES(-12,'2026-11-07T21:00:00+00:00','Cora','workshop','gather',"
+            "'{\"material\":\"gold\",\"amount\":23}');"
+        )
+
+    def test_full_ledger_denies_early_batch_historical_gather_delete(self):
+        self._postverify_other_batch_event(
+            "DELETE FROM events WHERE id=(SELECT MIN(id) FROM events WHERE kind='gather');",
+            old_gather=True, before_roster=True,
+        )
+
+    def test_full_ledger_denies_early_batch_negative_id_forgery(self):
+        self._postverify_other_batch_event(
+            "INSERT INTO events(id,occurred_at,actor,room_id,kind,payload_json) "
+            "VALUES(-13,'2026-11-07T21:00:00+00:00','Cora','workshop','gather',"
+            "'{\"material\":\"gold\",\"amount\":23}');",
+            before_roster=True,
+        )
+
+    def test_full_ledger_denies_early_batch_ungranted_node(self):
+        self._postverify_other_batch_event(
+            "INSERT INTO gathering_nodes(room_id,material,remaining,batch_yield) "
+            "VALUES('atrium','gold',99,1);",
+            before_roster=True,
+        )
+
+    def test_full_ledger_denies_early_batch_ungranted_pouch(self):
+        self._postverify_other_batch_event(
+            "INSERT INTO material_pouches(actor,material,quantity) "
+            "VALUES('Cora','gold',99);",
+            before_roster=True,
+        )
+
+    def test_full_ledger_allows_early_batch_benign_say(self):
+        self._postverify_other_batch_event(
+            "INSERT INTO events(occurred_at,actor,room_id,kind,payload_json) "
+            "VALUES('2026-11-07T21:00:00+00:00','Cora','atrium','say','{}');",
+            before_roster=True, expect_rejection=False,
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
