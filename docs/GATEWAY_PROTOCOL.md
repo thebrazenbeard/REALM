@@ -77,6 +77,11 @@ to avoid rewriting the experimental browser client's routes. The former
 world-wide bearer-token behavior has been retired, not kept as a fallback.
 Clients must replace shared-token configuration with player-specific tokens.
 Future stable external protocols should use explicit `/api/v2` versioning.
+The authenticated gateway also transactionally claims `player-bearer-http`
+for its world database. Standalone shared-token Telnet claims
+`shared-token-demo` on first player join; attempts to mix the two identity
+systems against one world fail closed. These are durable configuration claims,
+not verified human presence, actor-kind ownership, or tamper-proof custody.
 
 For browser requests, Origin must exactly match one explicitly configured
 `--allow-origin`; wildcard CORS is never granted. Responses disable caching.
