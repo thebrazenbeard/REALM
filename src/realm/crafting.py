@@ -16,7 +16,7 @@ import sqlite3
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Mapping
+from typing import Callable, Mapping
 
 from .engine import Engine
 
@@ -151,7 +151,8 @@ class Crafting:
             )
             return True
 
-    def perform(self, actor: str, command: str, *, action_id: str | None = None) -> str | None:
+    def perform(self, actor: str, command: str, *, action_id: str | None = None,
+                writer_guard: Callable[[sqlite3.Connection], None] | None = None) -> str | None:
         """Run one recognized player command; return None for unrelated verbs.
 
         The host must authenticate ``actor`` before calling this method.  Local
@@ -170,6 +171,8 @@ class Crafting:
 
         with self._connect() as db:
             db.execute("BEGIN IMMEDIATE")
+            if writer_guard is not None:
+                writer_guard(db)
             player = db.execute("SELECT id,room_id FROM players WHERE id=? COLLATE NOCASE", (actor,)).fetchone()
             if player is None:
                 raise ValueError("Join this REALM before gathering or crafting")

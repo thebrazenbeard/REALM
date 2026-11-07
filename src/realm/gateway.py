@@ -10,15 +10,18 @@ import argparse
 import json
 import re
 import sqlite3
+from datetime import datetime, timezone
 from contextlib import closing
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from typing import Callable
 from urllib.parse import parse_qs, urlsplit
 
 from .auth import CredentialStore
 from .engine import Engine, _SEED_EXITS, _SEED_ITEMS, _SEED_ROOMS, _pristine_schema, _schema_snapshot
 from .geography import Geography, MapUnavailable
 from .router import CommandRouter
+from .scoped_credentials import CredentialStateError, ScopedCredentialStore
 
 
 MAX_BODY_BYTES = 4096
@@ -37,6 +40,8 @@ class Gateway:
     def __init__(
         self, db_path: str | Path, *, world_id: str = "demo",
         adopt_unbound_world: bool = False,
+        scoped_credentials: bool = False,
+        scoped_guard_path: str | Path | None = None,
     ):
         if not isinstance(world_id, str) or not _WORLD_ID.fullmatch(world_id):
             raise ValueError("world_id must start with a letter and contain 1–64 letters, digits, '_' or '-'")
@@ -45,7 +50,79 @@ class Gateway:
         self.geography = Geography(db_path)
         self.router = CommandRouter(self.engine)
         self.credentials = CredentialStore(self.engine)
+        self.scoped_credentials = (
+            ScopedCredentialStore(self.engine, world_id, guard_path=scoped_guard_path)
+            if scoped_credentials else None
+        )
         self.world_id = world_id
+
+    def authenticate_remote(self, token: str, *, required_capability: str) -> str | None:
+        if self.scoped_credentials is None:
+            return self.credentials.authenticate(token)
+        try:
+            return self.scoped_credentials.authenticate(
+                token, required_capability=required_capability
+            )
+        except CredentialStateError:
+            # A missing witness or clock rollback must fail closed, not expose a traceback.
+            return None
+
+    def _scoped_writer_guard(
+        self, principal: str, token: str, capability: str
+    ) -> Callable[[sqlite3.Connection], None]:
+        """Revalidate under the action writer lock, on the actual world DB."""
+        if self.scoped_credentials is None:
+            raise PermissionError("Scoped world credential required")
+
+        def check(db: sqlite3.Connection) -> None:
+            try:
+                actor = self.scoped_credentials.authenticate_in_writer(
+                    db, token, required_capability=capability
+                )
+            except CredentialStateError as exc:
+                raise PermissionError("Active scoped bearer required") from exc
+            if actor is None or actor.casefold() != principal.casefold():
+                raise PermissionError("Active scoped bearer required")
+
+        return check
+
+    def join_remote(self, player: str, token: str) -> dict:
+        """HTTP-only scoped join: the final check and join share one writer."""
+        if not isinstance(player, str):
+            raise ValueError("Player must be a string")
+        guard = self._scoped_writer_guard(player, token, "world:join")
+        text = self.engine.join(player, writer_guard=guard)
+        return {"ok": True, "text": text, "cursor": self.cursor()}
+
+    def command_remote(self, player: str, command: str, action_id: str | None,
+                       token: str) -> dict:
+        """HTTP-only scoped command. Craft and core paths both check in-writer."""
+        if not isinstance(player, str) or not isinstance(command, str):
+            raise ValueError("Player and command must be strings")
+        if len(command) > 512:
+            raise ValueError("Command is too long")
+        guard = self._scoped_writer_guard(player, token, "command:write")
+        text = self.router.act(player, command, action_id=action_id, writer_guard=guard)
+        return {"ok": True, "text": text, "cursor": self.cursor()}
+
+    def ship_depart_remote(
+        self, token: str, ship_id: str, destination: str, action_id: str,
+    ) -> dict:
+        """Use host UTC and recheck ship:depart inside the ship writer transaction."""
+        if self.scoped_credentials is None:
+            raise PermissionError("Scoped ship credentials are required")
+        if (not isinstance(ship_id, str) or not isinstance(destination, str)
+                or not isinstance(action_id, str)):
+            raise ValueError("Ship ID, destination and stable action ID are required")
+        from .ship_command_auth import AuthenticatedShipCommands
+        from .world_clock import WorldClock
+        pilot = AuthenticatedShipCommands(self, WorldClock(self.engine.db_path))
+        result = pilot.depart(
+            token, ship_id, destination,
+            now=int(datetime.now(timezone.utc).timestamp()),
+            action_id=action_id, scoped=True,
+        )
+        return {"ok": True, **result}
 
     def _bind_world_id(self, world_id: str, *, adopt_unbound_world: bool) -> None:
         """Persist the host's world identity before any gateway can serve it.
@@ -256,7 +333,21 @@ class GatewayHandler(BaseHTTPRequestHandler):
         scheme, separator, presented = auth.partition(" ")
         if separator != " " or scheme.casefold() != "bearer":
             return None
-        return self.server.gateway.credentials.authenticate(presented)
+        path = urlsplit(self.path).path
+        capability = {
+            "/api/v1/join": "world:join",
+            "/api/v1/command": "command:write",
+            "/api/v1/room": "room:read",
+            "/api/v1/map": "map:read",
+            "/api/v1/feed": "feed:read",
+            "/api/v1/feed/wait": "feed:read",
+            "/api/v1/ship/depart": "ship:depart",
+        }.get(path)
+        if capability is None:
+            return None
+        return self.server.gateway.authenticate_remote(
+            presented, required_capability=capability
+        )
 
     def _gate(self, *, public_health: bool = False) -> str | None:
         if not self._origin_ok():
@@ -328,7 +419,7 @@ class GatewayHandler(BaseHTTPRequestHandler):
         principal = self._gate()
         if principal is None:
             return
-        if path not in {"/api/v1/join", "/api/v1/command"}:
+        if path not in {"/api/v1/join", "/api/v1/command", "/api/v1/ship/depart"}:
             self._send(404, {"ok": False, "error": "Unknown endpoint"})
             return
         if self.headers.get("Content-Type", "").split(";", 1)[0].strip().lower() != "application/json":
@@ -345,12 +436,43 @@ class GatewayHandler(BaseHTTPRequestHandler):
                 raise ValueError("Expected a JSON object")
             if not self._player_matches(obj.get("player"), principal):
                 return
-            if path == "/api/v1/join":
+            if self.server.gateway.scoped_credentials is not None:
+                # Recheck after reading slow/streamed bodies. This reduces the
+                # revocation race, but is NOT atomic with the gameplay commit.
+                if self._principal() != principal:
+                    self._send(401, {"ok": False, "error": "Active scoped bearer required"})
+                    return
+            if self.server.gateway.scoped_credentials is not None:
+                # This token is untrusted until revalidated INSIDE the engine's
+                # or crafting's BEGIN IMMEDIATE gameplay transaction.
+                _, _, presented = self.headers.get("Authorization", "").partition(" ")
+                if path == "/api/v1/join":
+                    result = self.server.gateway.join_remote(principal, presented)
+                elif path == "/api/v1/ship/depart":
+                    result = self.server.gateway.ship_depart_remote(
+                        presented, obj.get("ship_id"), obj.get("destination"),
+                        obj.get("action_id"),
+                    )
+                else:
+                    result = self.server.gateway.command_remote(
+                        principal, obj.get("command"), obj.get("action_id"), presented
+                    )
+            elif path == "/api/v1/join":
                 result = self.server.gateway.join(principal)
+            elif path == "/api/v1/ship/depart":
+                raise PermissionError("Scoped ship credentials are required")
             else:
                 result = self.server.gateway.command(
                     principal, obj.get("command"), obj.get("action_id")
                 )
+        except PermissionError:
+            self._send(401, {"ok": False, "error": "Active scoped bearer required"})
+            return
+        except RuntimeError:
+            if path != "/api/v1/ship/depart":
+                raise
+            self._send(409, {"ok": False, "error": "Ship world clock or state not ready"})
+            return
         except (ValueError, json.JSONDecodeError) as error:
             self._send(400, {"ok": False, "error": str(error)})
             return
@@ -366,6 +488,10 @@ def main(argv: list[str] | None = None) -> int:
         help="Explicitly bind an existing pre-identity world database to --world-id (local operator only)",
     )
     parser.add_argument("--port", type=int, default=8768)
+    parser.add_argument(
+        "--scoped-credentials", action="store_true",
+        help="Opt in to bounded world-scoped credentials instead of legacy bearers",
+    )
     parser.add_argument("--demo-crafting", action="store_true", help="Install optional noncanonical gathering and recipe fixtures")
     parser.add_argument(
         "--allow-origin", action="append", default=[], metavar="ORIGIN",
@@ -373,13 +499,23 @@ def main(argv: list[str] | None = None) -> int:
     )
     operator = parser.add_mutually_exclusive_group()
     operator.add_argument("--provision-player", metavar="PLAYER", help="Provision a player token locally, then exit")
+    operator.add_argument("--provision-scoped-player", metavar="PLAYER", help="Host-issue a bounded player bearer, then exit")
     operator.add_argument("--rotate-player", metavar="PLAYER", help="Rotate a player token locally, then exit")
     operator.add_argument("--revoke-player", metavar="PLAYER", help="Revoke a player token locally, then exit")
     args = parser.parse_args(argv)
+    if args.scoped_credentials and (args.provision_player or args.rotate_player or args.revoke_player):
+        parser.error("legacy credential operator commands are unavailable in scoped mode")
+    if args.provision_scoped_player and not args.scoped_credentials:
+        parser.error("--provision-scoped-player requires --scoped-credentials")
     gateway = Gateway(
         args.db, world_id=args.world_id,
         adopt_unbound_world=args.adopt_unbound_world,
+        scoped_credentials=args.scoped_credentials,
     )
+    if args.provision_scoped_player:
+        print(f"New scoped token for {args.provision_scoped_player}: "
+              f"{gateway.scoped_credentials.provision(args.provision_scoped_player)}")
+        return 0
     if args.provision_player:
         print(f"New token for {args.provision_player}: {gateway.credentials.provision(args.provision_player)}")
         return 0

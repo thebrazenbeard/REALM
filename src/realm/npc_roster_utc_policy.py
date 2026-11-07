@@ -7,7 +7,7 @@ No model/network activity, player consent, daemon or canonical release is inferr
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta, timezone
 import hashlib
 import hmac
@@ -116,6 +116,13 @@ class NpcRosterGatherResult:
     executed: int
     waiting: int
     responses: tuple[str, ...]
+
+
+def _roster_result_sha256(result: NpcRosterGatherResult) -> str:
+    """Stable complete result binding; evidence_sha256 alone omits assignments."""
+    canonical = json.dumps(asdict(result), sort_keys=True, separators=(",", ":"),
+                           ensure_ascii=True, allow_nan=False).encode("utf-8")
+    return hashlib.sha256(canonical).hexdigest()
 
 
 def perform_host_roster_gather_in_transaction(
@@ -234,15 +241,30 @@ def perform_host_roster_gather_in_transaction(
             ):
                 raise ValueError("Actual NPC gathered quantity differs from host proposal")
             responses.append(response)
+        result = NpcRosterGatherResult(
+            event_id=event.event_id, proposal=current, executed=len(expected_actions),
+            waiting=len(current.assignments) - len(expected_actions),
+            responses=tuple(responses),
+        )
+        digest = _roster_result_sha256(result)
+        proof = hmac.new(
+            host_key, b"REALM/NPC-ROSTER-EXECUTION/v1\x00"
+            + policy.signing_bytes() + digest.encode("ascii"), hashlib.sha256,
+        ).hexdigest()
+        db.execute(
+            "INSERT INTO main.npc_roster_utc_attestations "
+            "(event_id,world_id,policy_id,due_utc,outcome_sha256,"
+            "grant_mac_hex,execution_mac_hex) VALUES(?,?,?,?,?,?,?)",
+            (event.event_id, policy.world_id, policy.policy_id,
+             _utc(event.due_at).isoformat(timespec="microseconds"),
+             digest, grant_mac_hex, proof),
+        )
     except BaseException:
         db.execute("ROLLBACK TO SAVEPOINT realm_npc_roster")
         db.execute("RELEASE SAVEPOINT realm_npc_roster")
         raise
     db.execute("RELEASE SAVEPOINT realm_npc_roster")
-    return NpcRosterGatherResult(
-        event_id=event.event_id, proposal=current, executed=len(expected_actions),
-        waiting=len(current.assignments) - len(expected_actions), responses=tuple(responses),
-    )
+    return result
 
 
 def make_host_roster_gather_handler(

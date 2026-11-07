@@ -10,6 +10,7 @@ from contextlib import closing
 from datetime import datetime, timezone
 from functools import lru_cache
 from pathlib import Path
+from typing import Callable
 
 
 _DIRECTIONS = {"n": "north", "s": "south", "e": "east", "w": "west", "u": "up", "d": "down"}
@@ -161,12 +162,14 @@ class Engine:
             (self._now(), actor, room, kind, json.dumps(payload, sort_keys=True)),
         )
 
-    def join(self, name: str) -> str:
+    def join(self, name: str, *, writer_guard: Callable[[sqlite3.Connection], None] | None = None) -> str:
         if not _PLAYER_RE.fullmatch(name):
             raise ValueError("Player name must start with a letter, use only letters, digits, '_' or '-', and be <=24 characters")
         with closing(self._connect()) as db, db:
             # Serialize first-time joins so two clients cannot race on one name.
             db.execute("BEGIN IMMEDIATE")
+            if writer_guard is not None:
+                writer_guard(db)
             player = db.execute("SELECT id,room_id FROM players WHERE id=?", (name,)).fetchone()
             if player is None:
                 configured = db.execute("SELECT value FROM world_meta WHERE key='start_room'").fetchone()
@@ -188,13 +191,23 @@ class Engine:
             parts.append("Items: " + ", ".join(item[0] for item in items))
         return "\n".join(parts)
 
-    def act(self, name: str, raw_command: str, *, action_id: str | None = None) -> str:
+    def act(self, name: str, raw_command: str, *, action_id: str | None = None,
+            writer_guard: Callable[[sqlite3.Connection], None] | None = None) -> str:
         """Perform one action atomically; optional keys make retries idempotent.
 
         Action IDs are scoped to an actor and MUST be unique per logical command.
         This is local action deduplication, not network authentication.
         """
         command = raw_command.strip()
+        # Blank/quit shortcuts return before the normal action transaction.
+        # Scoped HTTP calls still need the same-world writer authority check:
+        # otherwise a revoke after the handler's check gets HTTP 200.
+        if writer_guard is not None and (
+            not command or command.partition(" ")[0].casefold() in {"quit", "exit"}
+        ):
+            with closing(self._connect()) as db, db:
+                db.execute("BEGIN IMMEDIATE")
+                writer_guard(db)
         if not command:
             return "Enter a command. Type 'help' for options."
         verb, _, arg = command.partition(" ")
@@ -214,6 +227,8 @@ class Engine:
         with closing(self._connect()) as db, db:
             # Serialize competing actions such as two players taking one object.
             db.execute("BEGIN IMMEDIATE")
+            if writer_guard is not None:
+                writer_guard(db)
             player = db.execute("SELECT id,room_id FROM players WHERE id=?", (name,)).fetchone()
             if player is None:
                 raise ValueError("Join this REALM before issuing commands")

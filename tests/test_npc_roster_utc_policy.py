@@ -69,12 +69,14 @@ class RosterUtcTests(unittest.TestCase):
     def run_grant(self, policy, mac):
         from realm.npc_roster_utc_policy import perform_host_roster_gather_in_transaction
         results = []
-        self.clock.tick(NOW, lambda db, event: results.append(
-            perform_host_roster_gather_in_transaction(
+        def handler(db, event):
+            result = perform_host_roster_gather_in_transaction(
                 db, event, engine=self.engine, crafting=self.crafting,
                 policy=policy, host_key=HOST_KEY, grant_mac_hex=mac, now_utc=NOW,
             )
-        ))
+            results.append(result)
+            return result
+        self.clock.tick(NOW, handler)
         return results[0]
 
     def counts(self):
@@ -244,6 +246,297 @@ class RosterUtcTests(unittest.TestCase):
             else:
                 self.fail("Expected synthetic action fault")
             db.commit()  # Deliberately bad host code must not commit partial roster.
+        self.assertEqual(self.counts(), (0, 0, 6))
+        self.assertIsNone(self.clock.lookup("roster_test_1").processed_at)
+
+
+    def test_caught_invalid_host_grant_cannot_acknowledge_clock_event(self):
+        from realm.npc_roster_utc_policy import perform_host_roster_gather_in_transaction
+        plan = self.proposal()
+        policy, mac = self.grant(plan)
+        def swallowed_failure(db, event):
+            try:
+                perform_host_roster_gather_in_transaction(
+                    db, event, engine=self.engine, crafting=self.crafting,
+                    policy=policy, host_key=HOST_KEY, grant_mac_hex="0" * 64,
+                    now_utc=NOW,
+                )
+            except ValueError:
+                pass
+        with self.assertRaisesRegex(ValueError, "did not return exact"):
+            self.clock.tick(NOW, swallowed_failure)
+        self.assertEqual(self.counts(), (0, 0, 6))
+        self.assertIsNone(self.clock.lookup("roster_test_1").processed_at)
+        result = self.run_grant(policy, mac)
+        self.assertEqual((result.executed, result.waiting), (2, 1))
+
+    def test_swallowed_mid_roster_actor_fault_does_not_acknowledge_event(self):
+        from realm.npc_roster_utc_policy import perform_host_roster_gather_in_transaction
+        plan = self.proposal()
+        policy, mac = self.grant(plan)
+        with closing(sqlite3.connect(self.dbpath)) as db, db:
+            db.execute("""
+                CREATE TRIGGER fail_second_ignored_actor
+                BEFORE INSERT ON main.action_receipts
+                WHEN (SELECT COUNT(*) FROM main.action_receipts) >= 1
+                BEGIN SELECT RAISE(ABORT, 'synthetic mid-roster fault'); END
+            """)
+        def swallowed_mid_roster_fault(db, event):
+            try:
+                return perform_host_roster_gather_in_transaction(
+                    db, event, engine=self.engine, crafting=self.crafting,
+                    policy=policy, host_key=HOST_KEY, grant_mac_hex=mac, now_utc=NOW,
+                )
+            except sqlite3.DatabaseError:
+                return None
+        with self.assertRaisesRegex(ValueError, "did not return exact"):
+            self.clock.tick(NOW, swallowed_mid_roster_fault)
+        self.assertEqual(self.counts(), (0, 0, 6))
+        self.assertIsNone(self.clock.lookup("roster_test_1").processed_at)
+        with closing(sqlite3.connect(self.dbpath)) as db, db:
+            db.execute("DROP TRIGGER fail_second_ignored_actor")
+        result = self.run_grant(policy, mac)
+        self.assertEqual((result.executed, result.waiting), (2, 1))
+
+    def test_fabricated_typed_outcome_without_actor_receipts_is_denied(self):
+        from realm.npc_roster_utc_policy import NpcRosterGatherResult
+        plan = self.proposal()
+        self.grant(plan)
+        fake = NpcRosterGatherResult(
+            event_id="roster_test_1", proposal=plan,
+            executed=2, waiting=1, responses=("forged_1", "forged_2"),
+        )
+        with self.assertRaisesRegex(ValueError, "exact actor action receipt"):
+            self.clock.tick(NOW, lambda db, event: fake)
+        self.assertEqual(self.counts(), (0, 0, 6))
+        self.assertIsNone(self.clock.lookup("roster_test_1").processed_at)
+
+    def test_valid_mixed_wait_roster_acknowledges_exact_action_receipt(self):
+        with closing(sqlite3.connect(self.dbpath)) as db, db:
+            db.execute("UPDATE main.gathering_nodes SET remaining=0 WHERE material='copper'")
+        plan = self.proposal()
+        self.assertEqual(sum(a.site is None for a in plan.assignments), 2)
+        policy, mac = self.grant(plan)
+        result = self.run_grant(policy, mac)
+        self.assertEqual((result.executed, result.waiting, len(result.responses)), (1, 2, 1))
+        self.assertEqual(self.counts(), (1, 1, 0))
+        self.assertIsNotNone(self.clock.lookup("roster_test_1").processed_at)
+
+    def test_two_competing_signed_rosters_roll_back_complete_tick_batch(self):
+        from realm.npc_roster_utc_policy import perform_host_roster_gather_in_transaction
+        plan = self.proposal()
+        policy_a, mac_a = self.grant(plan, event_id="batch_a")
+        policy_b, mac_b = self.grant(plan, event_id="batch_b")
+        grants = {"batch_a": (policy_a, mac_a), "batch_b": (policy_b, mac_b)}
+        def handler(db, event):
+            policy, mac = grants[event.event_id]
+            return perform_host_roster_gather_in_transaction(
+                db, event, engine=self.engine, crafting=self.crafting,
+                policy=policy, host_key=HOST_KEY, grant_mac_hex=mac, now_utc=NOW,
+            )
+        with self.assertRaisesRegex(ValueError, "differs from host proposal"):
+            self.clock.tick(NOW, handler)
+        self.assertEqual(self.counts(), (0, 0, 6))
+        self.assertIsNone(self.clock.lookup("batch_a").processed_at)
+        self.assertIsNone(self.clock.lookup("batch_b").processed_at)
+
+    def test_missing_actor_receipt_after_real_action_rolls_back_clock(self):
+        from realm.npc_roster_utc_policy import perform_host_roster_gather_in_transaction
+        plan = self.proposal()
+        policy, mac = self.grant(plan)
+        def silently_removed_receipt(db, event):
+            result = perform_host_roster_gather_in_transaction(
+                db, event, engine=self.engine, crafting=self.crafting,
+                policy=policy, host_key=HOST_KEY, grant_mac_hex=mac, now_utc=NOW,
+            )
+            db.execute("DELETE FROM main.action_receipts WHERE actor='Ada'")
+            db.execute("DELETE FROM main.action_receipts WHERE actor='Ben'")
+            return result
+        with self.assertRaisesRegex(ValueError, "exact actor action receipt"):
+            self.clock.tick(NOW, silently_removed_receipt)
+        self.assertEqual(self.counts(), (0, 0, 6))
+        self.assertIsNone(self.clock.lookup("roster_test_1").processed_at)
+
+
+    def test_all_wait_foreign_world_forgery_never_acks_roster(self):
+        """A callback's structurally valid empty answer is not a signed run."""
+        from dataclasses import replace
+        from realm.npc_roster_utc_policy import NpcRosterGatherResult
+        plan = self.proposal()
+        self.grant(plan)
+        spoof = replace(
+            plan, world_id="foreign_spoof",
+            assignments=tuple(replace(a, site=None, expected_units=0,
+                                      expected_utility=0) for a in plan.assignments),
+            total_expected_units=0, total_expected_utility=0,
+        )
+        outcome = NpcRosterGatherResult(
+            event_id="roster_test_1", proposal=spoof, executed=0,
+            waiting=len(spoof.assignments), responses=(),
+        )
+        with self.assertRaises(ValueError):
+            self.clock.tick(NOW, lambda db, event: outcome)
+        self.assertEqual(self.counts(), (0, 0, 6))
+        self.assertIsNone(self.clock.lookup("roster_test_1").processed_at)
+
+    def test_fake_actor_receipts_without_signed_host_execution_never_ack(self):
+        """Matching actor receipts alone cannot substitute for host execution."""
+        from realm.npc_roster_utc_policy import NpcRosterGatherResult
+        plan = self.proposal()
+        self.grant(plan)
+        actions = tuple(a for a in plan.assignments if a.site is not None)
+        fabricated = NpcRosterGatherResult(
+            "roster_test_1", plan, len(actions), len(plan.assignments) - len(actions),
+            tuple("synthetic" for _ in actions),
+        )
+        def inject_fake_receipts(db, event):
+            for assignment in actions:
+                action_id = "npcR_" + hashlib.sha256(
+                    f"{event.event_id}|{assignment.actor}".encode()
+                ).hexdigest()[:50]
+                db.execute(
+                    "INSERT INTO main.action_receipts(actor,action_id,command,response) "
+                    "VALUES(?,?,?,?)",
+                    (assignment.actor, action_id, "gather " + assignment.site.material,
+                     "synthetic"),
+                )
+            return fabricated
+        with self.assertRaises(ValueError):
+            self.clock.tick(NOW, inject_fake_receipts)
+        self.assertEqual(self.counts(), (0, 0, 6))
+        self.assertIsNone(self.clock.lookup("roster_test_1").processed_at)
+
+    def test_legitimate_execution_with_forged_world_result_never_ack(self):
+        from dataclasses import replace
+        from realm.npc_roster_utc_policy import perform_host_roster_gather_in_transaction
+        plan = self.proposal()
+        policy, mac = self.grant(plan)
+        def tamper_result(db, event):
+            real = perform_host_roster_gather_in_transaction(
+                db, event, engine=self.engine, crafting=self.crafting,
+                policy=policy, host_key=HOST_KEY, grant_mac_hex=mac, now_utc=NOW,
+            )
+            return replace(real, proposal=replace(real.proposal, world_id="foreign"))
+        with self.assertRaises(ValueError):
+            self.clock.tick(NOW, tamper_result)
+        self.assertEqual(self.counts(), (0, 0, 6))
+        self.assertIsNone(self.clock.lookup("roster_test_1").processed_at)
+
+    def test_unrelated_generic_clock_handler_still_acknowledges(self):
+        self.clock.schedule("generic_1", due_at=NOW, kind="ordinary", payload={})
+        processed = self.clock.tick(NOW, lambda db, event: None)
+        self.assertEqual(len(processed), 1)
+        self.assertIsNotNone(self.clock.lookup("generic_1").processed_at)
+        self.assertEqual(self.clock.tick(NOW, lambda db, event: None), [])
+
+
+    def test_postverify_clock_update_trigger_cannot_delete_roster_attestation(self):
+        plan = self.proposal()
+        policy, mac = self.grant(plan)
+        with closing(sqlite3.connect(self.dbpath)) as db, db:
+            db.execute("""
+                CREATE TRIGGER main.delete_attest_after_clock_ack
+                AFTER UPDATE OF processed_utc ON clock_events
+                WHEN NEW.event_id='roster_test_1'
+                BEGIN
+                    DELETE FROM npc_roster_utc_attestations
+                    WHERE event_id=NEW.event_id;
+                END
+            """)
+        with self.assertRaises(ValueError):
+            self.run_grant(policy, mac)
+        self.assertEqual(self.counts(), (0, 0, 6))
+        self.assertIsNone(self.clock.lookup("roster_test_1").processed_at)
+
+    def test_postverify_clock_update_trigger_cannot_tamper_roster_digest(self):
+        plan = self.proposal()
+        policy, mac = self.grant(plan)
+        with closing(sqlite3.connect(self.dbpath)) as db, db:
+            db.execute("""
+                CREATE TRIGGER main.tamper_attest_digest_after_clock_ack
+                AFTER UPDATE OF processed_utc ON clock_events
+                WHEN NEW.event_id='roster_test_1'
+                BEGIN
+                    UPDATE npc_roster_utc_attestations
+                    SET outcome_sha256='0000000000000000000000000000000000000000000000000000000000000000'
+                    WHERE event_id=NEW.event_id;
+                END
+            """)
+        with self.assertRaises(ValueError):
+            self.run_grant(policy, mac)
+        self.assertEqual(self.counts(), (0, 0, 6))
+        self.assertIsNone(self.clock.lookup("roster_test_1").processed_at)
+
+    def test_postverify_clock_update_trigger_cannot_tamper_valid_mac(self):
+        plan = self.proposal()
+        policy, mac = self.grant(plan)
+        with closing(sqlite3.connect(self.dbpath)) as db, db:
+            db.execute("""
+                CREATE TRIGGER main.tamper_attest_mac_after_clock_ack
+                AFTER UPDATE OF processed_utc ON clock_events
+                WHEN NEW.event_id='roster_test_1'
+                BEGIN
+                    UPDATE npc_roster_utc_attestations
+                    SET execution_mac_hex='ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff'
+                    WHERE event_id=NEW.event_id;
+                END
+            """)
+        with self.assertRaises(ValueError):
+            self.run_grant(policy, mac)
+        self.assertEqual(self.counts(), (0, 0, 6))
+        self.assertIsNone(self.clock.lookup("roster_test_1").processed_at)
+
+
+    def test_postverify_clock_state_trigger_cannot_delete_roster_attestation(self):
+        plan = self.proposal()
+        policy, mac = self.grant(plan)
+        with closing(sqlite3.connect(self.dbpath)) as db, db:
+            db.execute("""
+                CREATE TRIGGER main.delete_attest_after_clock_state
+                AFTER INSERT ON clock_state
+                BEGIN DELETE FROM npc_roster_utc_attestations; END
+            """)
+        with self.assertRaises(ValueError):
+            self.run_grant(policy, mac)
+        self.assertEqual(self.counts(), (0, 0, 6))
+        self.assertIsNone(self.clock.lookup("roster_test_1").processed_at)
+
+    def test_postverify_later_generic_batch_event_cannot_delete_roster_attestation(self):
+        from realm.npc_roster_utc_policy import perform_host_roster_gather_in_transaction
+        plan = self.proposal()
+        policy, mac = self.grant(plan, event_id="a_roster")
+        self.clock.schedule("z_generic", due_at=NOW, kind="ordinary", payload={})
+        def handler(db, event):
+            if event.kind == "npc_roster_gather":
+                return perform_host_roster_gather_in_transaction(
+                    db, event, engine=self.engine, crafting=self.crafting,
+                    policy=policy, host_key=HOST_KEY, grant_mac_hex=mac, now_utc=NOW,
+                )
+            db.execute("DELETE FROM main.npc_roster_utc_attestations WHERE event_id='a_roster'")
+            return None
+        with self.assertRaises(ValueError):
+            self.clock.tick(NOW, handler)
+        self.assertEqual(self.counts(), (0, 0, 6))
+        self.assertIsNone(self.clock.lookup("a_roster").processed_at)
+        self.assertIsNone(self.clock.lookup("z_generic").processed_at)
+
+    def test_postverify_clock_trigger_cannot_change_expected_processed_utc(self):
+        plan = self.proposal()
+        policy, mac = self.grant(plan)
+        with closing(sqlite3.connect(self.dbpath)) as db, db:
+            db.execute("""
+                CREATE TRIGGER main.tamper_processed_utc_after_clock_ack
+                AFTER UPDATE OF processed_utc ON clock_events
+                WHEN NEW.event_id='roster_test_1'
+                BEGIN
+                    UPDATE clock_events SET processed_utc='2099-01-01T00:00:00.000000+00:00'
+                    WHERE event_id=NEW.event_id;
+                END
+            """)
+        # Both the generic clock integrity guard and the roster-specific
+        # postcondition can reject this trigger; either must roll back effects.
+        with self.assertRaises((ValueError, RuntimeError)):
+            self.run_grant(policy, mac)
         self.assertEqual(self.counts(), (0, 0, 6))
         self.assertIsNone(self.clock.lookup("roster_test_1").processed_at)
 
