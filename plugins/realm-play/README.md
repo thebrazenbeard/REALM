@@ -104,6 +104,53 @@ are **not** a Lappy installation, browser-to-host transport check, or
 evaluation of world-aware learning. The three draft PRs must be reconciled
 before any host setup. No live-world mutation is required for tests.
 
+### Read-only host qualification
+
+After an operator has privately configured an **existing** joined character
+and world, run the packaged verifier locally with the four host environment
+variables above plus `REALM_EXPECT_PLAYER` set to the expected character name:
+
+```sh
+python -B plugins/realm-play/server/qualify_readonly.py
+```
+
+On Windows, use `py -3 -B plugins/realm-play/server/qualify_readonly.py`
+or the host-qualified absolute Python executable path to avoid the Store alias.
+
+The verifier launches this package's authoritative REALM MCP backend and
+sends only `initialize`, `realm_status`, and `realm_look`. It fails closed
+on a mismatched player/world, an unjoined character, or a rejected response.
+It prints a minimal result without the player token, room narrative, or raw
+subprocess output. **It never invokes `realm_join`**: first-time joining can
+change the world. Here *read-only* means no intentional gameplay mutation;
+the authoritative engine may still open SQLite transactions, initialize
+schema/WAL metadata, or touch storage bookkeeping. A passing local verifier
+establishes a no-gameplay-mutation backend round trip, not byte-for-byte
+database immutability, ChatGPT Web tool discovery, an enforceable host command
+ACL, or authorization to enable mutating gameplay operations.
+
+### Private ChatGPT connection candidate (not installed)
+
+[OpenAI Secure MCP Tunnel](https://developers.openai.com/api/docs/guides/secure-mcp-tunnels)
+documents an outbound-only route from a private stdio MCP server to supported
+OpenAI products without opening a public game port. This is a **candidate**,
+not a deployed transport: it needs a Platform tunnel ID, a runtime API key,
+workspace association, permissions, and permitted outbound access. ChatGPT
+[custom MCP connection permissions](https://help.openai.com/en/articles/12584461-connecting-custom-mcp-servers-in-chatgpt)
+depend on account plan and workspace; full write-capable custom MCP access
+may not be available to an individual Plus account. Free operation has
+**not** been verified, so the $0 rule forbids provisioning paid resources
+or starting a billed service without separate authorization.
+
+A tunnel supplies transport, **not** tool authority. Before exposing this
+backend to ChatGPT, enforce a host-side allowlist containing only
+`realm_status` and `realm_look`, with a pinned world and private player
+credential. The unrestricted nine-tool backend is not acceptable as a
+read-only pilot: `realm_command` can reach historical speech via `history`
+and `listen` even if `realm_feed` is hidden. Neither a plugin skill nor a
+prompt is a security boundary. The WorkBridge path in PR #53 is an alternate
+candidate, subject to the same host-enforced restrictions.
+
 ## Boundaries
 
 - Host-private `REALM_PLAYER_TOKEN` is used only by REALM authentication.
