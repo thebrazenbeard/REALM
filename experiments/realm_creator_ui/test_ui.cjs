@@ -48,7 +48,8 @@ function makeFile(name, text) {
 function createApp(fetchImpl) {
   const ids = ["world-id", "world-name", "host-token", "source-files", "preview-form",
     "preview-button", "review-region", "room-editor", "review-ack", "compile-button",
-    "status", "download-pack"];
+    "status", "download-pack", "existing-form", "existing-file",
+    "existing-result", "existing-summary", "existing-rooms"];
   const elements = Object.fromEntries(ids.map(id => [id, new Element()]));
   const blobs = [];
   const createdUrls = [];
@@ -94,6 +95,28 @@ function samplePreview() {
   };
 }
 
+function sampleExistingWorldpack() {
+  return {
+    preview: {
+      worldpack: {
+        schema: "realm.worldpack.v1", world_id: "existing_world", name: "Existing World",
+        start_room: "dock", rooms: [
+          { id: "dock", name: "<script>not executed</script>",
+            description: "An authored dock.", exits: { east: "hall" } },
+          { id: "hall", name: "Hall", description: "An authored hall.", exits: { west: "dock" } },
+        ],
+        items: [{ id: "item_one", name: "Lamp", room: "dock", description: "A light." }],
+      },
+      provenance: { source_id: "local_existing_pack", source_sha256: "a".repeat(64),
+        source_status: "UNVERIFIED", authenticated: false },
+      semantic_sha256: "b".repeat(64),
+      canon_status: "UNREVIEWED", review_status: "REVIEW_REQUIRED",
+      approval_authenticated: false, world_imported: false, worldpack_generated: false,
+    },
+    counts: { rooms: 2, items: 1, directed_exits: 2 },
+  };
+}
+
 test("preview sends bounded UTF-8 source and ephemeral token, renders untrusted text inertly", async () => {
   const requests = [];
   const { elements } = createApp(async (url, options) => {
@@ -115,6 +138,88 @@ test("preview sends bounded UTF-8 source and ephemeral token, renders untrusted 
   assert.equal(elements["compile-button"].disabled, true);
   assert.equal(elements["review-region"].hidden, false);
   assert.match(elements.status.textContent, /review/i);
+});
+
+test("existing authored worldpack upload renders exact topology as inert, unapproved preview", async () => {
+  const requests = [];
+  const { elements, blobs } = createApp(async (url, options) => {
+    requests.push({ url, options });
+    return { ok: true, async json() { return sampleExistingWorldpack(); } };
+  });
+  const raw = JSON.stringify(sampleExistingWorldpack().preview.worldpack);
+  elements["existing-file"].files = [makeFile("authored.worldpack.json", raw)];
+  await elements["existing-form"].fire("submit");
+  assert.equal(requests.length, 1);
+  assert.equal(requests[0].url, "/api/v1/creator/existing-preview");
+  assert.equal(requests[0].options.headers["X-REALM-CREATOR-TOKEN"], "ephemeral-secret");
+  assert.equal(requests[0].options.credentials, "omit");
+  const payload = JSON.parse(requests[0].options.body);
+  assert.equal(payload.source_id, "local_existing_pack");
+  assert.equal(Buffer.from(payload.worldpack_base64, "base64").toString("utf8"), raw);
+  assert.equal(elements["existing-result"].hidden, false);
+  assert.match(elements["existing-summary"].textContent, /2 rooms.*1 items.*2 directed exits/i);
+  const headings = findAll(elements["existing-rooms"], "h3");
+  assert.equal(headings.length, 2);
+  assert.equal(headings[0].textContent, "<script>not executed</script>");
+  assert.equal(findAll(elements["existing-rooms"], "script").length, 0);
+  assert.match(elements["existing-summary"].textContent, /UNREVIEWED/i);
+  assert.equal(elements["review-region"].hidden, true);
+  assert.equal(elements["download-pack"].hidden, true);
+  assert.equal(blobs.length, 0);
+});
+
+test("existing worldpack displays bidi and invisible format controls as visible escapes", async () => {
+  const data = sampleExistingWorldpack();
+  data.preview.worldpack.name = "Galaxy\u202eReverse";
+  data.preview.worldpack.rooms[0].name = "Gate\u202eSpoof";
+  data.preview.worldpack.rooms[0].description = "Alert\u2066hidden";
+  data.preview.worldpack.items[0].name = "Lamp\u200dMask";
+  data.preview.worldpack.items[0].description = "Tag\u{e0001}Marker";
+  const requests = [];
+  const { elements } = createApp(async (url, options) => {
+    requests.push({ url, options });
+    return { ok: true, async json() { return data; } };
+  });
+  const raw = JSON.stringify(data.preview.worldpack);
+  elements["existing-file"].files = [makeFile("bidi.json", raw)];
+  await elements["existing-form"].fire("submit");
+  assert.equal(elements["existing-result"].hidden, false);
+  assert.equal(requests.length, 1);
+  assert.equal(Buffer.from(JSON.parse(requests[0].options.body).worldpack_base64, "base64").toString("utf8"), raw);
+  const summary = elements["existing-summary"].textContent;
+  assert.match(summary, /Galaxy\\u202eReverse/);
+  assert.match(summary, /format controls.*5/i);
+  const cards = findAll(elements["existing-rooms"], "article");
+  assert.match(findAll(cards[0], "h3")[0].textContent, /Gate\\u202eSpoof/);
+  assert.match(findAll(cards[0], "p").map(node => node.textContent).join(" "), /Alert\\u2066hidden/);
+  const renderedText = findAll(elements["existing-rooms"], "p").map(node => node.textContent).join(" ");
+  assert.match(renderedText, /Lamp\\u200dMask/);
+  assert.match(renderedText, /Tag\\u{e0001}Marker/);
+  assert.doesNotMatch(summary + renderedText + cards[0].children.map(node => node.textContent).join(""), /\p{Cf}/u);
+});
+
+test("existing worldpack preview rejects oversized uploads and discards stale replies", async () => {
+  const requests = [];
+  let release;
+  const waiting = new Promise(resolve => { release = resolve; });
+  const { elements } = createApp(async (url, options) => {
+    requests.push({ url, options });
+    return await waiting;
+  });
+  elements["existing-file"].files = [makeFile("large.json", "x".repeat(512 * 1024 + 1))];
+  await elements["existing-form"].fire("submit");
+  assert.equal(requests.length, 0);
+  assert.equal(elements["existing-result"].hidden, true);
+  elements["existing-file"].files = [makeFile("good.json", JSON.stringify(sampleExistingWorldpack().preview.worldpack))];
+  await elements["existing-file"].fire("change");
+  const inFlight = elements["existing-form"].fire("submit");
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(requests.length, 1);
+  elements["existing-file"].files = [makeFile("changed.json", "{}")];
+  await elements["existing-file"].fire("change");
+  release({ ok: true, async json() { return sampleExistingWorldpack(); } });
+  await inFlight;
+  assert.equal(elements["existing-result"].hidden, true);
 });
 
 test("compile needs explicit review and emits exact server worldpack bytes without importing", async () => {
@@ -177,7 +282,8 @@ test("invalid upload and absent token fail locally without fetch or token persis
 test("HTML declares every wired input and uses only external script/styles", () => {
   const html = fs.readFileSync(path.join(__dirname, "static", "index.html"), "utf8");
   for (const id of ["preview-form", "world-id", "world-name", "host-token", "source-files",
-    "review-region", "room-editor", "review-ack", "compile-button", "status", "download-pack"]) {
+    "review-region", "room-editor", "review-ack", "compile-button", "status", "download-pack",
+    "existing-form", "existing-file", "existing-result", "existing-summary", "existing-rooms"]) {
     assert.match(html, new RegExp('id="' + id + '"'));
   }
   assert.match(html, /<script src="\/app\.js" defer><\/script>/);

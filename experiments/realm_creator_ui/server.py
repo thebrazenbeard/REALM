@@ -20,6 +20,7 @@ from pathlib import Path
 
 from experiments.realm_creator import CreatorDraftError, compile_approved_worldpack, prepare_draft
 from experiments.realm_creator_generation import RegionProposalError, propose_region
+from experiments.realm_creator_ui.existing_pack import preview_existing_worldpack
 from realm.worldpack import MAX_SOURCE_BYTES
 
 MAX_BODY_BYTES = 1536 * 1024
@@ -40,6 +41,15 @@ class _ClientError(ValueError):
     def __init__(self, status: int):
         self.status = status
         super().__init__("Rejected Creator request")
+
+
+def _unique_body_keys(pairs: list[tuple[str, object]]) -> dict:
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise _ClientError(400)
+        result[key] = value
+    return result
 
 
 def _file_sources(records: object) -> dict[str, bytes]:
@@ -66,6 +76,33 @@ def _file_sources(records: object) -> dict[str, bytes]:
             raise _ClientError(400) from exc
         result[name] = data
     return result
+
+
+def _existing_pack_response(data: dict) -> dict:
+    """Read-only preview of an already-authored, *unapproved* worldpack."""
+    if set(data) != {"source_id", "worldpack_base64"}:
+        raise _ClientError(400)
+    encoded = data["worldpack_base64"]
+    if not isinstance(encoded, str):
+        raise _ClientError(400)
+    if len(encoded) > 4 * ((MAX_SOURCE_BYTES + 2) // 3):
+        raise _ClientError(413)
+    try:
+        raw = base64.b64decode(encoded.encode("ascii"), validate=True)
+    except (UnicodeEncodeError, ValueError, base64.binascii.Error) as exc:
+        raise _ClientError(400) from exc
+    if len(raw) > MAX_SOURCE_BYTES:
+        raise _ClientError(413)
+    preview = preview_existing_worldpack(raw, {"source_id": data["source_id"]})
+    pack = preview["worldpack"]
+    return {
+        "preview": preview,
+        "counts": {
+            "rooms": len(pack["rooms"]),
+            "items": len(pack["items"]),
+            "directed_exits": sum(len(room["exits"]) for room in pack["rooms"]),
+        },
+    }
 
 
 def _worldpack_json(compiled: dict) -> str:
@@ -181,8 +218,10 @@ class CreatorHandler(BaseHTTPRequestHandler):
         if len(raw) != size:
             raise _ClientError(400)
         try:
-            data = json.loads(raw.decode("utf-8"))
-        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            data = json.loads(raw.decode("utf-8"), object_pairs_hook=_unique_body_keys)
+        except _ClientError:
+            raise
+        except (UnicodeDecodeError, json.JSONDecodeError, ValueError, RecursionError) as exc:
             raise _ClientError(400) from exc
         if not isinstance(data, dict):
             raise _ClientError(400)
@@ -207,11 +246,15 @@ class CreatorHandler(BaseHTTPRequestHandler):
             self._drain_rejected_body()
             self._json(403, {"error": "Forbidden"})
             return
-        if self.path not in {"/api/v1/creator/preview", "/api/v1/creator/compile"}:
+        if self.path not in {"/api/v1/creator/preview", "/api/v1/creator/compile",
+                             "/api/v1/creator/existing-preview"}:
             self._json(404, {"error": "Not found"})
             return
         try:
             data = self._body()
+            if self.path == "/api/v1/creator/existing-preview":
+                self._json(200, _existing_pack_response(data))
+                return
             expected = {"world_id", "name", "sources"}
             compile_request = self.path.endswith("/compile")
             if compile_request:
