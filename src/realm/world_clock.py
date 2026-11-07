@@ -13,6 +13,7 @@ import hashlib
 import json
 import re
 import sqlite3
+from collections import defaultdict
 from contextlib import contextmanager, closing
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -287,12 +288,70 @@ class WorldClock:
             ).fetchall()
             processed = []
             roster_proofs = []
+            # Bound the actual harvested state as well as signed receipts. A
+            # trigger after acknowledgment can otherwise erase a pouch or
+            # gather history while leaving the roster attestation intact.
+            node_before = pouch_before = None
+            first_roster_event_floor = None
+            node_gathered = defaultdict(int)
+            pouch_gathered = defaultdict(int)
+            gather_events = {}
             for row in rows:
                 event = _event(row)
+                if event.kind == "npc_roster_gather":
+                    if node_before is None:
+                        first_roster_event_floor = db.execute(
+                            "SELECT COALESCE(MAX(id),0) FROM main.events"
+                        ).fetchone()[0]
+                        node_before = {
+                            (r["room_id"], r["material"]): (r["remaining"], r["batch_yield"])
+                            for r in db.execute(
+                                "SELECT room_id,material,remaining,batch_yield "
+                                "FROM main.gathering_nodes"
+                            )
+                        }
+                        pouch_before = {
+                            (r["actor"], r["material"]): r["quantity"]
+                            for r in db.execute(
+                                "SELECT actor,material,quantity FROM main.material_pouches"
+                            )
+                        }
+                    prior_event_id = db.execute(
+                        "SELECT COALESCE(MAX(id),0) FROM main.events"
+                    ).fetchone()[0]
                 outcome = handler(db, event)
                 if event.kind == "npc_roster_gather":
                     initial_proof = _verify_roster_utc_ack(db, event, outcome)
                     roster_proofs.append((event, outcome, initial_proof))
+                    new_gathers = db.execute(
+                        "SELECT id,actor,room_id,kind,payload_json FROM main.events "
+                        "WHERE id>? AND kind='gather' ORDER BY id",
+                        (prior_event_id,),
+                    ).fetchall()
+                    actions = tuple(
+                        a for a in outcome.proposal.assignments if a.site is not None
+                    )
+                    if len(new_gathers) != len(actions):
+                        raise ValueError("Roster action lacks exact gather history")
+                    pending_gathers = list(new_gathers)
+                    for assignment in actions:
+                        quantity = assignment.expected_units
+                        site = assignment.site
+                        node_gathered[(site.room_id, site.material)] += quantity
+                        pouch_gathered[(assignment.actor, site.material)] += quantity
+                        matching = [
+                            r for r in pending_gathers
+                            if r["actor"] == assignment.actor
+                            and r["room_id"] == site.room_id
+                            and json.loads(r["payload_json"]) == {
+                                "material": site.material, "amount": quantity
+                            }
+                        ]
+                        if len(matching) != 1:
+                            raise ValueError("Roster action gather history mismatches grant")
+                        gathered = matching[0]
+                        gather_events[gathered["id"]] = tuple(gathered)
+                        pending_gathers.remove(gathered)
                 updated = db.execute(
                     "UPDATE main.clock_events SET processed_utc=? "
                     "WHERE event_id=? AND processed_utc IS NULL",
@@ -363,4 +422,43 @@ class WorldClock:
                         or main_event["kind"] != event.kind
                         or main_event["payload_json"] != _payload(event.payload)):
                     raise ValueError("Roster UTC completion changed before commit")
+            if node_before is not None:
+                # Full post-roster deltas prohibit extra, ungranted rows even
+                # when all originally signed actors and receipts remain valid.
+                # Ordinary say/move events are unaffected; additional gathers
+                # require a separate governed tick or equivalent attestation.
+                expected_nodes = dict(node_before)
+                for key, units in node_gathered.items():
+                    stock, batch_yield = expected_nodes[key]
+                    expected_nodes[key] = (stock - units, batch_yield)
+                actual_nodes = {
+                    (r["room_id"], r["material"]): (r["remaining"], r["batch_yield"])
+                    for r in db.execute(
+                        "SELECT room_id,material,remaining,batch_yield "
+                        "FROM main.gathering_nodes"
+                    )
+                }
+                if actual_nodes != expected_nodes:
+                    raise ValueError("Roster resource inventory changed outside signed plan")
+                expected_pouches = dict(pouch_before)
+                for key, units in pouch_gathered.items():
+                    expected_pouches[key] = expected_pouches.get(key, 0) + units
+                actual_pouches = {
+                    (r["actor"], r["material"]): r["quantity"]
+                    for r in db.execute(
+                        "SELECT actor,material,quantity FROM main.material_pouches"
+                    )
+                }
+                if actual_pouches != expected_pouches:
+                    raise ValueError("Roster pouch inventory changed outside signed plan")
+                all_new_gathers = {
+                    r["id"]: tuple(r)
+                    for r in db.execute(
+                        "SELECT id,actor,room_id,kind,payload_json FROM main.events "
+                        "WHERE id>? AND kind='gather'",
+                        (first_roster_event_floor,),
+                    )
+                }
+                if all_new_gathers != gather_events:
+                    raise ValueError("Roster gather history contains ungranted effects")
             return processed
