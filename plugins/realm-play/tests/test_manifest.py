@@ -40,6 +40,31 @@ class PluginManifestTests(unittest.TestCase):
         self.assertTrue((ROOT / "server" / "realm_mcp.py").is_file())
         self.assertFalse(any(key in server for key in ("url", "auth", "token", "apiKey")))
 
+    def test_selected_backend_contract_and_truthful_release_boundary(self):
+        manifest = json.loads((ROOT / "plugin.json").read_text(encoding="utf-8"))
+        self.assertEqual("0.2.0", manifest["version"])
+        documentation = (ROOT / "README.md").read_text(encoding="utf-8")
+        skill = (ROOT / "skills" / "play-realm" / "SKILL.md").read_text(encoding="utf-8")
+        launcher = (ROOT / "server" / "realm_mcp.py").read_text(encoding="utf-8")
+
+        for name in ("realm_status", "realm_join", "realm_look", "realm_inventory",
+                     "realm_move", "realm_command", "realm_say", "realm_feed", "realm_map"):
+            self.assertIn(name, documentation)
+            self.assertIn(name, skill)
+        for setting in ("REALM_ROOT", "REALM_DB_PATH", "REALM_WORLD_ID",
+                        "REALM_PLAYER_TOKEN"):
+            self.assertIn(setting, documentation)
+        self.assertIn("realm.mcp_server", launcher)
+        self.assertNotIn("ResidentController", launcher)
+        self.assertNotIn("REALM_ACTOR", launcher)
+
+        self.assertIn("action_id", skill)
+        self.assertIn("280 characters", skill)
+        self.assertIn("Temporal privacy not qualified", skill)
+        self.assertIn("Fog-of-war not qualified", skill)
+        self.assertIn("not installed", documentation)
+        self.assertIn("Lappy installation", documentation)
+
 
 if __name__ == "__main__":
     unittest.main()
