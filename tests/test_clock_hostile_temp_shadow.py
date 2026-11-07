@@ -44,6 +44,82 @@ class TempShadowClockTests(unittest.TestCase):
         with self.assertRaises(ClockSkewError):
             self.clock.tick(BASE - timedelta(microseconds=1), lambda db, event: None)
 
+    def test_temp_receipt_trigger_cannot_silently_undo_main_receipt(self):
+        def tamper(db, event):
+            db.execute("""CREATE TEMP TRIGGER undo_receipt
+                AFTER UPDATE OF processed_utc ON main.clock_events
+                BEGIN
+                    UPDATE clock_events SET processed_utc=NULL
+                    WHERE event_id=NEW.event_id;
+                END""")
+            db.execute("INSERT INTO main.host_effects VALUES (?)", (event.event_id,))
+        with self.assertRaisesRegex(RuntimeError, "clock.*postcondition|receipt"):
+            self.clock.tick(BASE, tamper)
+        self.assertIsNone(self.clock.lookup("due").processed_at)
+        with closing(sqlite3.connect(self.path)) as db:
+            self.assertEqual(0, db.execute("SELECT count(*) FROM main.host_effects").fetchone()[0])
+            self.assertIsNone(db.execute("SELECT last_utc FROM main.clock_state WHERE id=1").fetchone())
+        self.assertEqual(["due"], [e.event_id for e in self.clock.tick(BASE, lambda db, e:
+            db.execute("INSERT INTO main.host_effects VALUES (?)", (e.event_id,)))])
+        self.assertEqual([], WorldClock(self.path).tick(BASE, lambda db, e: None))
+
+    def test_temp_state_trigger_cannot_revert_last_utc_after_update(self):
+        earlier = BASE - timedelta(microseconds=1)
+        self.assertEqual([], self.clock.tick(earlier, lambda db, event: None))
+        def tamper(db, event):
+            db.execute("""CREATE TEMP TRIGGER undo_clock_state
+                AFTER UPDATE OF last_utc ON main.clock_state
+                BEGIN
+                    UPDATE clock_state SET last_utc=OLD.last_utc WHERE id=NEW.id;
+                END""")
+            db.execute("INSERT INTO main.host_effects VALUES (?)", (event.event_id,))
+        with self.assertRaisesRegex(RuntimeError, "clock.*postcondition|state"):
+            self.clock.tick(BASE, tamper)
+        with closing(sqlite3.connect(self.path)) as db:
+            self.assertEqual(earlier.isoformat(timespec="microseconds"),
+                             db.execute("SELECT last_utc FROM main.clock_state WHERE id=1").fetchone()[0])
+            self.assertEqual(0, db.execute("SELECT count(*) FROM main.host_effects").fetchone()[0])
+        self.assertIsNone(self.clock.lookup("due").processed_at)
+        self.assertEqual(1, len(WorldClock(self.path).tick(BASE, lambda db, event: None)))
+
+    def test_temp_state_insert_trigger_cannot_corrupt_initial_watermark(self):
+        def tamper(db, event):
+            db.execute("""CREATE TEMP TRIGGER undo_first_watermark
+                AFTER INSERT ON main.clock_state
+                BEGIN
+                    UPDATE clock_state SET last_utc='2000-01-01T00:00:00+00:00'
+                    WHERE id=NEW.id;
+                END""")
+            db.execute("INSERT INTO main.host_effects VALUES (?)", (event.event_id,))
+        with self.assertRaisesRegex(RuntimeError, "Clock state postcondition"):
+            self.clock.tick(BASE, tamper)
+        with closing(sqlite3.connect(self.path)) as db:
+            self.assertIsNone(db.execute("SELECT last_utc FROM main.clock_state WHERE id=1").fetchone())
+            self.assertEqual(0, db.execute("SELECT count(*) FROM main.host_effects").fetchone()[0])
+        self.assertIsNone(self.clock.lookup("due").processed_at)
+        self.assertEqual(1, len(WorldClock(self.path).tick(BASE, lambda db, event: None)))
+
+    def test_later_event_trigger_cannot_erase_earlier_batch_receipt(self):
+        self.clock.schedule("later", due_at=BASE, kind="test", payload={})
+        def tamper(db, event):
+            if event.event_id == "later":
+                db.execute("""CREATE TEMP TRIGGER undo_first
+                    AFTER UPDATE OF processed_utc ON main.clock_events
+                    WHEN NEW.event_id='later'
+                    BEGIN
+                        UPDATE clock_events SET processed_utc=NULL WHERE event_id='due';
+                    END""")
+            db.execute("INSERT INTO main.host_effects VALUES (?)", (event.event_id,))
+        with self.assertRaisesRegex(RuntimeError, "clock.*postcondition|receipt"):
+            self.clock.tick(BASE, tamper)
+        with closing(sqlite3.connect(self.path)) as db:
+            self.assertEqual(0, db.execute("SELECT count(*) FROM main.host_effects").fetchone()[0])
+            self.assertEqual(2, db.execute("SELECT count(*) FROM main.clock_events WHERE processed_utc IS NULL").fetchone()[0])
+        retry = WorldClock(self.path)
+        self.assertEqual(["due", "later"], [e.event_id for e in retry.tick(BASE, lambda db, event:
+            db.execute("INSERT INTO main.host_effects VALUES (?)", (event.event_id,)))])
+        self.assertEqual([], WorldClock(self.path).tick(BASE, lambda db, event: None))
+
     def test_shadowed_same_instant_batch_replays_zero_effects_after_restart(self):
         eastern = timezone(timedelta(hours=-5))
         self.clock.schedule("aa", due_at=BASE.astimezone(eastern), kind="test", payload={})

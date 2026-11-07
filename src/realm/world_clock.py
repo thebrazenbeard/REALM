@@ -218,4 +218,20 @@ class WorldClock:
                 "ON CONFLICT(id) DO UPDATE SET last_utc=excluded.last_utc",
                 (stamp,),
             )
+            # Handler-created TEMP triggers can alter the durable receipts or
+            # clock watermark after UPDATE rowcount checks succeeded. Verify
+            # the final main-schema state, including earlier batch members,
+            # while still inside the same rollback-capable transaction.
+            state_after = db.execute(
+                "SELECT last_utc FROM main.clock_state WHERE id=1"
+            ).fetchone()
+            if state_after is None or state_after["last_utc"] != stamp:
+                raise RuntimeError("Clock state postcondition failed during host transaction")
+            for event in processed:
+                receipt_after = db.execute(
+                    "SELECT processed_utc FROM main.clock_events WHERE event_id=?",
+                    (event.event_id,),
+                ).fetchone()
+                if receipt_after is None or receipt_after["processed_utc"] != stamp:
+                    raise RuntimeError("Clock receipt postcondition failed during host transaction")
             return processed
