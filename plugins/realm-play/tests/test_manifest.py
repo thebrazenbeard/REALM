@@ -42,7 +42,7 @@ class PluginManifestTests(unittest.TestCase):
 
     def test_selected_backend_contract_and_truthful_release_boundary(self):
         manifest = json.loads((ROOT / "plugin.json").read_text(encoding="utf-8"))
-        self.assertEqual("0.2.0", manifest["version"])
+        self.assertEqual("0.2.1", manifest["version"])
         documentation = (ROOT / "README.md").read_text(encoding="utf-8")
         skill = (ROOT / "skills" / "play-realm" / "SKILL.md").read_text(encoding="utf-8")
         launcher = (ROOT / "server" / "realm_mcp.py").read_text(encoding="utf-8")
@@ -64,6 +64,7 @@ class PluginManifestTests(unittest.TestCase):
         self.assertIn("Fog-of-war not qualified", skill)
         self.assertIn("not installed", documentation)
         self.assertIn("Lappy installation", documentation)
+        self.assertTrue((ROOT / "server" / "qualify_readonly.py").is_file())
 
 
 if __name__ == "__main__":
