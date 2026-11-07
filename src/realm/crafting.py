@@ -18,7 +18,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Mapping
 
-from .engine import Engine
+from .engine import Engine, _append_event_with_deliveries
 
 
 _KEY = re.compile(r"^[a-z][a-z0-9 _-]{0,47}$")
@@ -300,7 +300,4 @@ class Crafting:
 
     @staticmethod
     def _event(db: sqlite3.Connection, actor: str, room: str, kind: str, payload: dict) -> None:
-        db.execute(
-            "INSERT INTO events (occurred_at,actor,room_id,kind,payload_json) VALUES (?,?,?,?,?)",
-            (_now(), actor, room, kind, json.dumps(payload, sort_keys=True)),
-        )
+        _append_event_with_deliveries(db, actor, room, kind, payload)
