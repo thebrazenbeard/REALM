@@ -1,0 +1,20 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+  "name": "realm-play",
+  "version": "0.1.0",
+  "description": "Use host-bound local REALM game tools from an agent that supports stdio MCP plugins.",
+  "author": {"name": "thebrazenbeard"},
+  "repository": "https://github.com/thebrazenbeard/REALM",
+  "extensions": {
+    "com.openai": {
+      "interface": {
+        "displayName": "REALM Play",
+        "shortDescription": "Play local REALM worlds",
+        "longDescription": "Local-only REALM tools for room observation and permitted player actions through the game's authoritative engine. Requires a configured local MCP host and a pre-joined character.",
+        "developerName": "thebrazenbeard",
+        "capabilities": [],
+        "defaultPrompt": "Explore the currently configured REALM world with me. Look before acting and show the actual game responses."
+      }
+    }
+  }
+}
