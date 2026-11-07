@@ -36,7 +36,12 @@ preserving legitimate existing receipt rows. This currently costs
 O(number of stored atmosphere receipts) per new action; the performance and
 storage growth of long-lived worlds require separate qualification.
 Post-write deletion, rewrite, or extra insertion fails closed and rolls back the
-nested action; unrelated host audit rows remain permitted. This is an
+nested action. A final host-world binding check also rejects late SQL triggers
+that change or delete `main.world_meta.world_id`, even if atmosphere state and
+receipts remain internally consistent. The same action now requires unchanged
+world authority metadata: `world_id`, `schema`, `name`, `start_room`, and
+`worldpack_sha256`, including whether optional rows were originally absent.
+Unrelated host audit and metadata rows remain permitted. This is an
 **action-end** guard, not a guarantee that an enclosing host transaction cannot
 subsequently mutate or roll back rows. An installed trigger on a *later* host
 audit event can still erase an atmosphere receipt before the outer commit.
