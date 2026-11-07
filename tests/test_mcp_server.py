@@ -240,6 +240,37 @@ class MCPServerTests(unittest.TestCase):
         self.assertTrue(answer["result"]["isError"])
         self.assertNotIn(self.token, json.dumps(answer))
 
+    def test_typed_play_calls_work_over_real_stdio_subprocess(self):
+        calls = [
+            ("realm_join", {}),
+            ("realm_inventory", {}),
+            ("realm_move", {"direction": "north", "action_id": "stdio-north"}),
+            ("realm_move", {"direction": "north", "action_id": "stdio-north"}),
+            ("realm_say", {"message": "I made it.", "action_id": "stdio-say"}),
+            ("realm_feed", {"after": 0}),
+        ]
+        requests = [{"jsonrpc": "2.0", "id": index,
+                     "method": "tools/call", "params": {"name": name, "arguments": arguments}}
+                    for index, (name, arguments) in enumerate(calls, start=1)]
+        env = dict(os.environ)
+        env.update({"REALM_DB_PATH": str(self.database), "REALM_WORLD_ID": "sandbox",
+                    "REALM_PLAYER_TOKEN": self.token, "PYTHONPATH": str(ROOT / "src")})
+        result = subprocess.run([sys.executable, "-m", "realm.mcp_server"],
+                                input="".join(json.dumps(item) + "\n" for item in requests),
+                                capture_output=True, text=True, env=env, timeout=15)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn(self.token, result.stdout + result.stderr)
+        replies = [json.loads(line) for line in result.stdout.splitlines()]
+        self.assertEqual([item["id"] for item in replies], list(range(1, 7)))
+        self.assertTrue(all(not item["result"]["isError"] for item in replies))
+        self.assertEqual(replies[2]["result"]["structuredContent"],
+                         replies[3]["result"]["structuredContent"])
+        self.assertIn("I made it.", replies[5]["result"]["content"][0]["text"])
+        with sqlite3.connect(self.database) as db:
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM action_receipts").fetchone()[0], 2)
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM events WHERE kind='move'").fetchone()[0], 1)
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM events WHERE kind='say'").fetchone()[0], 1)
+
     def test_duplicate_json_keys_are_rejected_before_action(self):
         raw = (b'{"jsonrpc":"2.0","id":7,"method":"tools/call",'
                b'"params":{"name":"realm_join","name":"realm_command",'
