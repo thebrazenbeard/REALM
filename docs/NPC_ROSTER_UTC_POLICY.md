@@ -26,7 +26,27 @@ back together. Nested savepoint also rolls back partial writes on caught faults.
 - No NPC autonomy, player consent, private lore/canon release or VN2 deployment.
 - Host permit keys do not grant Patrick owner/release authority.
 - SQLite snapshot rollback needs a separate protected external witness.
-- Host callbacks must propagate failures, or a zero-effect clock completion
-  could be acknowledged despite the nested roster rollback.
+- For `npc_roster_gather`, the clock requires a matching
+  `NpcRosterGatherResult`, executed/WAIT counts, exact actor/action receipts,
+  world/policy/UTC binding and a same-writer `npc_roster_utc_attestations`
+  row. The host-permitted executor writes that receipt only after checking the
+  signed grant, full proposal, stock and action results, then seals the exact
+  outcome digest with a distinct HMAC execution domain. The clock checks the
+  receipt's recorded digest, not the private host key; arbitrary malicious
+  host code with database write access is outside this trust boundary.
+  Failed/missing or forged results roll back the entire tick batch, including
+  any tentative actor effects or extra receipts. A partial WAIT roster is valid;
+  all-WAIT is denied because the present planner requires harvestable stock.
+  After all callbacks, clock receipt updates and the clock-state write, the tick
+  rechecks every selected roster against authoritative MAIN event/UTC, actor
+  receipts and the complete attestation snapshot (including both MACs).
+  A MAIN trigger that deletes or corrupts an earlier attestation therefore
+  aborts the whole batch before commit, even if a later generic event caused it.
+  Host code should still propagate failures rather than concealing them.
+- After upgrading existing worlds, the trusted host must rerun opt-in
+  `WorldClock.enable()` to create the additive attestation table before using
+  roster ticks. No automatic world installation or migration occurs in this Draft.
+- This is an accidental host-integration safeguard, not a replacement for
+  host permit issuance, owner consent, or a protected external witness.
 - Welfare allocation is not Nash equilibrium or actor-fair; WAIT-order skew
   remains observed across seeded multiplayer trials.

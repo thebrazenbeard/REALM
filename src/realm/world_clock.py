@@ -9,6 +9,7 @@ use a transactional outbox plus idempotent external consumer for those.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import sqlite3
@@ -38,6 +39,15 @@ CREATE INDEX IF NOT EXISTS idx_clock_due
 CREATE TABLE IF NOT EXISTS clock_state (
     id INTEGER PRIMARY KEY CHECK(id = 1),
     last_utc TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS npc_roster_utc_attestations (
+    event_id TEXT PRIMARY KEY REFERENCES clock_events(event_id),
+    world_id TEXT NOT NULL,
+    policy_id TEXT NOT NULL,
+    due_utc TEXT NOT NULL,
+    outcome_sha256 TEXT NOT NULL,
+    grant_mac_hex TEXT NOT NULL,
+    execution_mac_hex TEXT NOT NULL
 );
 """
 
@@ -89,6 +99,68 @@ def _event(row: sqlite3.Row) -> DueEvent:
         processed_at=(datetime.fromisoformat(row["processed_utc"])
                       if row["processed_utc"] is not None else None),
     )
+
+
+
+def _verify_roster_utc_ack(db: sqlite3.Connection, event: DueEvent, outcome: object) -> tuple[str, ...]:
+    """Refuse to acknowledge a roster event without exact in-transaction receipts.
+
+    The host's typed result is necessary but not sufficient: a swallowed handler
+    exception, stale result, or omitted actor receipt must never advance the UTC
+    queue. WAIT is valid within a signed execution; all-WAIT is currently invalid
+    because the planner refuses worlds without harvestable resources.
+    """
+    from .npc_roster_utc_policy import NpcRosterGatherResult, _roster_result_sha256
+
+    if type(outcome) is not NpcRosterGatherResult or outcome.event_id != event.event_id:
+        raise ValueError("Roster host callback did not return exact completed outcome")
+    assignments = outcome.proposal.assignments
+    if not 2 <= len(assignments) <= 8:
+        raise ValueError("Roster completion requires a bounded actor plan")
+    actions = tuple(a for a in assignments if a.site is not None)
+    if (outcome.executed != len(actions)
+            or outcome.waiting != len(assignments) - len(actions)
+            or len(outcome.responses) != len(actions)):
+        raise ValueError("Roster completion counts or WAIT status do not match plan")
+    if len(set(a.actor.casefold() for a in assignments)) != len(assignments):
+        raise ValueError("Roster completion repeats an actor")
+    if not actions:
+        raise ValueError("All-WAIT roster cannot come from current harvest planner")
+    world_row = db.execute(
+        "SELECT value FROM main.world_meta WHERE key='world_id'"
+    ).fetchone()
+    if (world_row is None or outcome.proposal.world_id != world_row["value"]
+            or event.payload.get("world_id") != world_row["value"]):
+        raise ValueError("Roster outcome is not bound to authoritative world")
+    for assignment, response in zip(actions, outcome.responses):
+        action_id = "npcR_" + hashlib.sha256(
+            f"{event.event_id}|{assignment.actor}".encode("utf-8")
+        ).hexdigest()[:50]
+        receipt = db.execute(
+            "SELECT command,response FROM main.action_receipts "
+            "WHERE actor=? AND action_id=?",
+            (assignment.actor, action_id),
+        ).fetchone()
+        if (receipt is None
+                or receipt["command"] != "gather " + assignment.site.material
+                or receipt["response"] != response):
+            raise ValueError("Roster clock receipt lacks exact actor action receipt")
+    attest = db.execute(
+        "SELECT world_id,policy_id,due_utc,outcome_sha256,grant_mac_hex,execution_mac_hex "
+        "FROM main.npc_roster_utc_attestations WHERE event_id=?",
+        (event.event_id,),
+    ).fetchone()
+    if (attest is None
+            or attest["world_id"] != world_row["value"]
+            or attest["policy_id"] != event.payload.get("policy_id")
+            or attest["due_utc"] != _stamp(event.due_at)
+            or attest["outcome_sha256"] != _roster_result_sha256(outcome)
+            or any(not re.fullmatch(r"[0-9a-f]{64}", attest[key])
+                   for key in ("grant_mac_hex", "execution_mac_hex"))):
+        raise ValueError("Roster clock receipt lacks bound host execution attestation")
+    # Preserve both MAC fields exactly across later trigger/callback DML.
+    # The clock has no host key; the executor checked the grant before writing.
+    return tuple(attest)
 
 
 class WorldClock:
@@ -171,7 +243,7 @@ class WorldClock:
             ).fetchone()
             return _event(row) if row else None
 
-    def tick(self, now_utc: datetime, handler: Callable[[sqlite3.Connection, DueEvent], None],
+    def tick(self, now_utc: datetime, handler: Callable[[sqlite3.Connection, DueEvent], object],
              *, limit: int = 100, acknowledge_forward_jump: bool = False) -> list[DueEvent]:
         """Apply at most limit due effects AND receipts in one SQLite transaction.
 
@@ -214,9 +286,13 @@ class WorldClock:
                 "ORDER BY due_utc, event_id LIMIT ?", (stamp, limit),
             ).fetchall()
             processed = []
+            roster_proofs = []
             for row in rows:
                 event = _event(row)
-                handler(db, event)
+                outcome = handler(db, event)
+                if event.kind == "npc_roster_gather":
+                    initial_proof = _verify_roster_utc_ack(db, event, outcome)
+                    roster_proofs.append((event, outcome, initial_proof))
                 updated = db.execute(
                     "UPDATE main.clock_events SET processed_utc=? "
                     "WHERE event_id=? AND processed_utc IS NULL",
@@ -265,4 +341,26 @@ class WorldClock:
                     raise RuntimeError("Clock new event postcondition failed during host transaction")
             if unseen:
                 raise RuntimeError("Clock event deletion postcondition failed during host transaction")
+            # Clock receipts, state updates and later events may fire MAIN triggers
+            # that invalidate a roster verified earlier in this tick. Run the
+            # final read-only postcondition after *all* transaction DML.
+            if roster_proofs:
+                final_state = db.execute(
+                    "SELECT last_utc FROM main.clock_state WHERE id=1"
+                ).fetchone()
+                if final_state is None or final_state["last_utc"] != stamp:
+                    raise ValueError("Roster tick lost authoritative UTC clock state")
+            for event, outcome, original_proof in roster_proofs:
+                if _verify_roster_utc_ack(db, event, outcome) != original_proof:
+                    raise ValueError("Roster attestation changed after initial verification")
+                main_event = db.execute(
+                    "SELECT due_utc,kind,payload_json,processed_utc "
+                    "FROM main.clock_events WHERE event_id=?",
+                    (event.event_id,),
+                ).fetchone()
+                if (main_event is None or main_event["processed_utc"] != stamp
+                        or main_event["due_utc"] != _stamp(event.due_at)
+                        or main_event["kind"] != event.kind
+                        or main_event["payload_json"] != _payload(event.payload)):
+                    raise ValueError("Roster UTC completion changed before commit")
             return processed
