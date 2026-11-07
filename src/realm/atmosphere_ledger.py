@@ -19,6 +19,15 @@ _ACTIONS = {"hatch", "breach", "tick"}
 _MAX_STATE_BYTES = 4 * 1024 * 1024
 _MAX_COMMAND_BYTES = 4096
 _RECEIPT_ID = re.compile(r"[A-Za-z][A-Za-z0-9_-]{0,63}\Z")
+_WORLD_AUTHORITY_KEYS = ("world_id", "schema", "name", "start_room", "worldpack_sha256")
+
+
+def _world_authority(db):
+    """Preserve engine identity and imported worldpack provenance, not audit keys."""
+    return {row["key"]: row["value"] for row in db.execute(
+        "SELECT key,value FROM main.world_meta WHERE key IN (?,?,?,?,?)",
+        _WORLD_AUTHORITY_KEYS,
+    )}
 
 
 def _json(value, limit):
@@ -204,6 +213,7 @@ class AtmosphereLedger:
                         "SELECT action_id,world_id,command_json,result_json FROM main.atm_receipts"
                     )
                 }
+                before_world_authority = _world_authority(db)
                 state = db.execute("SELECT world_id,version,state_json FROM main.atm_state WHERE id=1").fetchone()
                 if state is None or state["world_id"] != world_id:
                     raise RuntimeError("Atmosphere world state missing")
@@ -250,6 +260,11 @@ class AtmosphereLedger:
                     tuple(persisted_receipt) != (world_id, command, response_json) or
                     persisted_receipts != expected_receipts):
                     raise ValueError("Atmosphere state/receipt diverged before acknowledgment")
+                # Receipt triggers may change/delete main.world_meta after the
+                # initial binding check while preserving every atmosphere row.
+                self._bound(db, world_id, require_transaction=True)
+                if _world_authority(db) != before_world_authority:
+                    raise ValueError("Atmosphere world authority metadata diverged")
                 result = _read(response_json, _MAX_STATE_BYTES)
             db.execute("RELEASE SAVEPOINT atm_action")
             return result
