@@ -9,6 +9,7 @@ use a transactional outbox plus idempotent external consumer for those.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import sqlite3
@@ -91,6 +92,43 @@ def _event(row: sqlite3.Row) -> DueEvent:
     )
 
 
+
+def _verify_roster_utc_ack(db: sqlite3.Connection, event: DueEvent, outcome: object) -> None:
+    """Refuse to acknowledge a roster event without exact in-transaction receipts.
+
+    The host's typed result is necessary but not sufficient: a swallowed handler
+    exception, stale result, or omitted actor receipt must never advance the UTC
+    queue. WAIT is an explicit, valid zero-action result when the full plan waits.
+    """
+    from .npc_roster_utc_policy import NpcRosterGatherResult
+
+    if type(outcome) is not NpcRosterGatherResult or outcome.event_id != event.event_id:
+        raise ValueError("Roster host callback did not return exact completed outcome")
+    assignments = outcome.proposal.assignments
+    if not 2 <= len(assignments) <= 8:
+        raise ValueError("Roster completion requires a bounded actor plan")
+    actions = tuple(a for a in assignments if a.site is not None)
+    if (outcome.executed != len(actions)
+            or outcome.waiting != len(assignments) - len(actions)
+            or len(outcome.responses) != len(actions)):
+        raise ValueError("Roster completion counts or WAIT status do not match plan")
+    if len(set(a.actor.casefold() for a in assignments)) != len(assignments):
+        raise ValueError("Roster completion repeats an actor")
+    for assignment, response in zip(actions, outcome.responses):
+        action_id = "npcR_" + hashlib.sha256(
+            f"{event.event_id}|{assignment.actor}".encode("utf-8")
+        ).hexdigest()[:50]
+        receipt = db.execute(
+            "SELECT command,response FROM main.action_receipts "
+            "WHERE actor=? AND action_id=?",
+            (assignment.actor, action_id),
+        ).fetchone()
+        if (receipt is None
+                or receipt["command"] != "gather " + assignment.site.material
+                or receipt["response"] != response):
+            raise ValueError("Roster clock receipt lacks exact actor action receipt")
+
+
 class WorldClock:
     """One per-world database; host-only, disabled until explicit enable().
 
@@ -171,7 +209,7 @@ class WorldClock:
             ).fetchone()
             return _event(row) if row else None
 
-    def tick(self, now_utc: datetime, handler: Callable[[sqlite3.Connection, DueEvent], None],
+    def tick(self, now_utc: datetime, handler: Callable[[sqlite3.Connection, DueEvent], object],
              *, limit: int = 100, acknowledge_forward_jump: bool = False) -> list[DueEvent]:
         """Apply at most limit due effects AND receipts in one SQLite transaction.
 
@@ -204,7 +242,9 @@ class WorldClock:
             processed = []
             for row in rows:
                 event = _event(row)
-                handler(db, event)
+                outcome = handler(db, event)
+                if event.kind == "npc_roster_gather":
+                    _verify_roster_utc_ack(db, event, outcome)
                 updated = db.execute(
                     "UPDATE clock_events SET processed_utc=? "
                     "WHERE event_id=? AND processed_utc IS NULL",
