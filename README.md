@@ -56,7 +56,9 @@ The current integration candidate supports:
 - A Pages-compatible static browser client under `docs/`, including a live map
   display. GitHub Pages does not run the game server.
 - A separately gated loopback-only Telnet adapter (`TERMINAL.md`). Its local
-  token is not the HTTP player identity system.
+  token is not the HTTP player identity system. The two incompatible identity
+  modes now claim their world transactionally: they cannot serve the **same**
+  world database without an explicit, offline operator migration.
 
 **Not implemented or qualified:** public TLS hosting, rate limits, public
 account registration, expiring sessions, fog of war, AI/NPC co-player loops,
@@ -115,9 +117,12 @@ On Windows PowerShell use `$env:PYTHONPATH = 'src'` before running `python -m re
 
 ### SQLite journal and runtime qualification
 
-New worlds use SQLite WAL by default. The programmatic `Engine(path,
-journal_mode="DELETE")` option can create a **fresh** rollback-journal world for
-disposable local testing. Reopening that database with `Engine(path)` retains
+New worlds use SQLite WAL by default **only when the loaded SQLite release
+contains the documented WAL-reset fix**. Otherwise, new worlds use the DELETE
+rollback journal; explicitly requesting WAL or reopening an existing WAL world
+under an unqualified library fails closed. The programmatic `Engine(path,
+journal_mode="DELETE")` option can also select a fresh rollback-journal world.
+Reopening that database with `Engine(path)` retains
 its existing journal instead of silently converting it back to WAL. Explicit
 mode changes on an existing world are rejected; changing a played world's
 journal mode requires an offline, separately reviewed migration with a verified
@@ -136,7 +141,8 @@ PYTHONPATH=src python -m realm.sqlite_runtime
 
 Exit `0` means the loaded library's version is in a release line carrying
 SQLite's documented 2026 WAL-reset fix; exit `2` means it is not. The command
-prints the actual linked SQLite version and source ID. Passing the version
+prints the actual linked SQLite version and source ID. The Engine now enforces
+this version gate for WAL access, but passing the version
 check **does not** replace concurrency, consistency, restart and online-backup
 qualification. The vendor calls the bug rare, not an emergency; it has not
 been observed in REALM. See [official SQLite WAL guidance](https://sqlite.org/wal.html#walresetbug).
