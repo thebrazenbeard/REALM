@@ -10,6 +10,7 @@ import argparse
 import json
 import re
 import sqlite3
+from datetime import datetime, timezone
 from contextlib import closing
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -103,6 +104,25 @@ class Gateway:
         guard = self._scoped_writer_guard(player, token, "command:write")
         text = self.router.act(player, command, action_id=action_id, writer_guard=guard)
         return {"ok": True, "text": text, "cursor": self.cursor()}
+
+    def ship_depart_remote(
+        self, token: str, ship_id: str, destination: str, action_id: str,
+    ) -> dict:
+        """Use host UTC and recheck ship:depart inside the ship writer transaction."""
+        if self.scoped_credentials is None:
+            raise PermissionError("Scoped ship credentials are required")
+        if (not isinstance(ship_id, str) or not isinstance(destination, str)
+                or not isinstance(action_id, str)):
+            raise ValueError("Ship ID, destination and stable action ID are required")
+        from .ship_command_auth import AuthenticatedShipCommands
+        from .world_clock import WorldClock
+        pilot = AuthenticatedShipCommands(self, WorldClock(self.engine.db_path))
+        result = pilot.depart(
+            token, ship_id, destination,
+            now=int(datetime.now(timezone.utc).timestamp()),
+            action_id=action_id, scoped=True,
+        )
+        return {"ok": True, **result}
 
     def _bind_world_id(self, world_id: str, *, adopt_unbound_world: bool) -> None:
         """Persist the host's world identity before any gateway can serve it.
@@ -321,6 +341,7 @@ class GatewayHandler(BaseHTTPRequestHandler):
             "/api/v1/map": "map:read",
             "/api/v1/feed": "feed:read",
             "/api/v1/feed/wait": "feed:read",
+            "/api/v1/ship/depart": "ship:depart",
         }.get(path)
         if capability is None:
             return None
@@ -398,7 +419,7 @@ class GatewayHandler(BaseHTTPRequestHandler):
         principal = self._gate()
         if principal is None:
             return
-        if path not in {"/api/v1/join", "/api/v1/command"}:
+        if path not in {"/api/v1/join", "/api/v1/command", "/api/v1/ship/depart"}:
             self._send(404, {"ok": False, "error": "Unknown endpoint"})
             return
         if self.headers.get("Content-Type", "").split(";", 1)[0].strip().lower() != "application/json":
@@ -427,18 +448,30 @@ class GatewayHandler(BaseHTTPRequestHandler):
                 _, _, presented = self.headers.get("Authorization", "").partition(" ")
                 if path == "/api/v1/join":
                     result = self.server.gateway.join_remote(principal, presented)
+                elif path == "/api/v1/ship/depart":
+                    result = self.server.gateway.ship_depart_remote(
+                        presented, obj.get("ship_id"), obj.get("destination"),
+                        obj.get("action_id"),
+                    )
                 else:
                     result = self.server.gateway.command_remote(
                         principal, obj.get("command"), obj.get("action_id"), presented
                     )
             elif path == "/api/v1/join":
                 result = self.server.gateway.join(principal)
+            elif path == "/api/v1/ship/depart":
+                raise PermissionError("Scoped ship credentials are required")
             else:
                 result = self.server.gateway.command(
                     principal, obj.get("command"), obj.get("action_id")
                 )
         except PermissionError:
             self._send(401, {"ok": False, "error": "Active scoped bearer required"})
+            return
+        except RuntimeError:
+            if path != "/api/v1/ship/depart":
+                raise
+            self._send(409, {"ok": False, "error": "Ship world clock or state not ready"})
             return
         except (ValueError, json.JSONDecodeError) as error:
             self._send(400, {"ok": False, "error": str(error)})
