@@ -40,6 +40,15 @@ CREATE TABLE IF NOT EXISTS clock_state (
     id INTEGER PRIMARY KEY CHECK(id = 1),
     last_utc TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS npc_roster_utc_attestations (
+    event_id TEXT PRIMARY KEY REFERENCES clock_events(event_id),
+    world_id TEXT NOT NULL,
+    policy_id TEXT NOT NULL,
+    due_utc TEXT NOT NULL,
+    outcome_sha256 TEXT NOT NULL,
+    grant_mac_hex TEXT NOT NULL,
+    execution_mac_hex TEXT NOT NULL
+);
 """
 
 
@@ -98,9 +107,10 @@ def _verify_roster_utc_ack(db: sqlite3.Connection, event: DueEvent, outcome: obj
 
     The host's typed result is necessary but not sufficient: a swallowed handler
     exception, stale result, or omitted actor receipt must never advance the UTC
-    queue. WAIT is an explicit, valid zero-action result when the full plan waits.
+    queue. WAIT is valid within a signed execution; all-WAIT is currently invalid
+    because the planner refuses worlds without harvestable resources.
     """
-    from .npc_roster_utc_policy import NpcRosterGatherResult
+    from .npc_roster_utc_policy import NpcRosterGatherResult, _roster_result_sha256
 
     if type(outcome) is not NpcRosterGatherResult or outcome.event_id != event.event_id:
         raise ValueError("Roster host callback did not return exact completed outcome")
@@ -114,6 +124,14 @@ def _verify_roster_utc_ack(db: sqlite3.Connection, event: DueEvent, outcome: obj
         raise ValueError("Roster completion counts or WAIT status do not match plan")
     if len(set(a.actor.casefold() for a in assignments)) != len(assignments):
         raise ValueError("Roster completion repeats an actor")
+    if not actions:
+        raise ValueError("All-WAIT roster cannot come from current harvest planner")
+    world_row = db.execute(
+        "SELECT value FROM main.world_meta WHERE key='world_id'"
+    ).fetchone()
+    if (world_row is None or outcome.proposal.world_id != world_row["value"]
+            or event.payload.get("world_id") != world_row["value"]):
+        raise ValueError("Roster outcome is not bound to authoritative world")
     for assignment, response in zip(actions, outcome.responses):
         action_id = "npcR_" + hashlib.sha256(
             f"{event.event_id}|{assignment.actor}".encode("utf-8")
@@ -127,6 +145,19 @@ def _verify_roster_utc_ack(db: sqlite3.Connection, event: DueEvent, outcome: obj
                 or receipt["command"] != "gather " + assignment.site.material
                 or receipt["response"] != response):
             raise ValueError("Roster clock receipt lacks exact actor action receipt")
+    attest = db.execute(
+        "SELECT world_id,policy_id,due_utc,outcome_sha256,grant_mac_hex,execution_mac_hex "
+        "FROM main.npc_roster_utc_attestations WHERE event_id=?",
+        (event.event_id,),
+    ).fetchone()
+    if (attest is None
+            or attest["world_id"] != world_row["value"]
+            or attest["policy_id"] != event.payload.get("policy_id")
+            or attest["due_utc"] != _stamp(event.due_at)
+            or attest["outcome_sha256"] != _roster_result_sha256(outcome)
+            or any(not re.fullmatch(r"[0-9a-f]{64}", attest[key])
+                   for key in ("grant_mac_hex", "execution_mac_hex"))):
+        raise ValueError("Roster clock receipt lacks bound host execution attestation")
 
 
 class WorldClock:
