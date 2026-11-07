@@ -26,7 +26,15 @@ back together. Nested savepoint also rolls back partial writes on caught faults.
 - No NPC autonomy, player consent, private lore/canon release or VN2 deployment.
 - Host permit keys do not grant Patrick owner/release authority.
 - SQLite snapshot rollback needs a separate protected external witness.
-- Host callbacks must propagate failures, or a zero-effect clock completion
-  could be acknowledged despite the nested roster rollback.
+- For `npc_roster_gather`, the clock now requires a matching
+  `NpcRosterGatherResult` and verifies executed/WAIT counts plus each exact
+  actor/action receipt **inside the same writer transaction** before acknowledging
+  the clock event. Swallowed handler failures and fabricated/no-receipt outcomes
+  abort the entire tick batch; valid WAIT entries in mixed rosters remain permitted.
+  The current allocation planner rejects zero harvestable sites, so an all-WAIT
+  plan is not currently executable through the proposal interface.
+  Host code should still propagate failures rather than concealing them.
+- This is an accidental host-integration safeguard, not a replacement for
+  host permit issuance, owner consent, or a protected external witness.
 - Welfare allocation is not Nash equilibrium or actor-fair; WAIT-order skew
   remains observed across seeded multiplayer trials.
