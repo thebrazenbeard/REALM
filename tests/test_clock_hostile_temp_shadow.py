@@ -120,6 +120,111 @@ class TempShadowClockTests(unittest.TestCase):
             db.execute("INSERT INTO main.host_effects VALUES (?)", (event.event_id,)))])
         self.assertEqual([], WorldClock(self.path).tick(BASE, lambda db, event: None))
 
+    def test_trigger_cannot_premark_unselected_future_event(self):
+        self.clock.schedule("future", due_at=BASE + timedelta(seconds=10), kind="test", payload={})
+        def tamper(db, event):
+            db.execute("""CREATE TEMP TRIGGER premake_future_receipt
+                AFTER UPDATE OF processed_utc ON main.clock_events
+                BEGIN
+                    UPDATE clock_events SET processed_utc=NEW.processed_utc WHERE event_id='future';
+                END""")
+            db.execute("INSERT INTO main.host_effects VALUES (?)", (event.event_id,))
+        with self.assertRaisesRegex(RuntimeError, "Clock.*postcondition"):
+            self.clock.tick(BASE, tamper)
+        with closing(sqlite3.connect(self.path)) as db:
+            self.assertEqual(0, db.execute("SELECT count(*) FROM main.host_effects").fetchone()[0])
+            self.assertEqual(2, db.execute("SELECT count(*) FROM main.clock_events WHERE processed_utc IS NULL").fetchone()[0])
+        self.assertEqual(["due"], [e.event_id for e in self.clock.tick(BASE, lambda db, event:
+            db.execute("INSERT INTO main.host_effects VALUES (?)", (event.event_id,)))])
+        self.assertEqual(["future"], [e.event_id for e in WorldClock(self.path).tick(
+            BASE + timedelta(seconds=10), lambda db, event:
+            db.execute("INSERT INTO main.host_effects VALUES (?)", (event.event_id,)))])
+        self.assertEqual([], WorldClock(self.path).tick(BASE + timedelta(seconds=10), lambda db, event: None))
+
+    def test_trigger_cannot_reset_already_processed_receipt(self):
+        earlier = BASE - timedelta(microseconds=1)
+        self.clock.schedule("earlier", due_at=earlier, kind="test", payload={})
+        self.assertEqual(["earlier"], [e.event_id for e in self.clock.tick(earlier, lambda db, event: None)])
+        def tamper(db, event):
+            db.execute("""CREATE TEMP TRIGGER replay_completed_receipt
+                AFTER UPDATE OF processed_utc ON main.clock_events
+                BEGIN
+                    UPDATE clock_events SET processed_utc=NULL WHERE event_id='earlier';
+                END""")
+            db.execute("INSERT INTO main.host_effects VALUES (?)", (event.event_id,))
+        with self.assertRaisesRegex(RuntimeError, "Clock.*postcondition"):
+            self.clock.tick(BASE, tamper)
+        self.assertIsNone(self.clock.lookup("due").processed_at)
+        self.assertEqual(earlier, self.clock.lookup("earlier").processed_at)
+        with closing(sqlite3.connect(self.path)) as db:
+            self.assertEqual(0, db.execute("SELECT count(*) FROM main.host_effects").fetchone()[0])
+
+    def test_trigger_cannot_rewrite_unselected_future_event_metadata(self):
+        later = BASE + timedelta(seconds=10)
+        self.clock.schedule("future", due_at=later, kind="test", payload={"v": 1})
+        def tamper(db, event):
+            db.execute("""CREATE TEMP TRIGGER rewrite_future_deadline
+                AFTER UPDATE OF processed_utc ON main.clock_events
+                BEGIN
+                    UPDATE clock_events SET due_utc='2099-01-01T00:00:00.000000+00:00'
+                    WHERE event_id='future';
+                END""")
+            db.execute("INSERT INTO main.host_effects VALUES (?)", (event.event_id,))
+        with self.assertRaisesRegex(RuntimeError, "Clock.*postcondition"):
+            self.clock.tick(BASE, tamper)
+        self.assertEqual(later, self.clock.lookup("future").due_at)
+        with closing(sqlite3.connect(self.path)) as db:
+            self.assertEqual(0, db.execute("SELECT count(*) FROM main.host_effects").fetchone()[0])
+
+    def test_trigger_cannot_rewrite_unselected_future_kind_and_payload(self):
+        later = BASE + timedelta(seconds=10)
+        self.clock.schedule("future", due_at=later, kind="test", payload={"v": 1})
+        def tamper(db, event):
+            db.execute("""CREATE TEMP TRIGGER rewrite_future_kind
+                AFTER UPDATE OF processed_utc ON main.clock_events
+                BEGIN
+                    UPDATE clock_events SET kind='wrong', payload_json='{"v":2}'
+                    WHERE event_id='future';
+                END""")
+            db.execute("INSERT INTO main.host_effects VALUES (?)", (event.event_id,))
+        with self.assertRaisesRegex(RuntimeError, "Clock event receipt/metadata postcondition"):
+            self.clock.tick(BASE, tamper)
+        self.assertEqual("test", self.clock.lookup("future").kind)
+        self.assertEqual({"v": 1}, self.clock.lookup("future").payload)
+        with closing(sqlite3.connect(self.path)) as db:
+            self.assertEqual(0, db.execute("SELECT count(*) FROM main.host_effects").fetchone()[0])
+
+    def test_trigger_cannot_delete_unselected_future_event(self):
+        later = BASE + timedelta(seconds=10)
+        self.clock.schedule("future", due_at=later, kind="test", payload={})
+        def tamper(db, event):
+            db.execute("""CREATE TEMP TRIGGER delete_future
+                AFTER UPDATE OF processed_utc ON main.clock_events
+                BEGIN
+                    DELETE FROM clock_events WHERE event_id='future';
+                END""")
+            db.execute("INSERT INTO main.host_effects VALUES (?)", (event.event_id,))
+        with self.assertRaisesRegex(RuntimeError, "Clock event deletion postcondition"):
+            self.clock.tick(BASE, tamper)
+        self.assertIsNotNone(self.clock.lookup("future"))
+        with closing(sqlite3.connect(self.path)) as db:
+            self.assertEqual(0, db.execute("SELECT count(*) FROM main.host_effects").fetchone()[0])
+
+    def test_trusted_handler_can_enqueue_new_pending_event(self):
+        later = BASE + timedelta(seconds=10)
+        def handler(db, event):
+            db.execute("INSERT INTO main.clock_events "
+                       "(event_id,due_utc,kind,payload_json) VALUES (?,?,?,?)",
+                       ("newfuture", later.isoformat(timespec="microseconds"),
+                        "test", "{}"))
+            db.execute("INSERT INTO main.host_effects VALUES (?)", (event.event_id,))
+        self.assertEqual(["due"], [e.event_id for e in self.clock.tick(BASE, handler)])
+        self.assertIsNone(self.clock.lookup("newfuture").processed_at)
+        self.assertEqual(["newfuture"], [e.event_id for e in WorldClock(self.path).tick(
+            later, lambda db, event: db.execute(
+                "INSERT INTO main.host_effects VALUES (?)", (event.event_id,)))])
+        self.assertEqual([], WorldClock(self.path).tick(later, lambda db, event: None))
+
     def test_shadowed_same_instant_batch_replays_zero_effects_after_restart(self):
         eastern = timezone(timedelta(hours=-5))
         self.clock.schedule("aa", due_at=BASE.astimezone(eastern), kind="test", payload={})
