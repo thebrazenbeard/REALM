@@ -134,7 +134,8 @@ class RealmMCPBridge:
         self._world_id = world_id
         self._token = token
         self.gateway = Gateway(self.db_path, world_id=world_id)
-        if self.gateway.credentials.authenticate(token) is None:
+        self._bound_actor = self.gateway.credentials.authenticate(token)
+        if self._bound_actor is None:
             raise RealmMCPError("host player credential is invalid or revoked")
 
     def _actor(self) -> str:
@@ -147,6 +148,8 @@ class RealmMCPBridge:
         actor = self.gateway.credentials.authenticate(self._token)
         if actor is None:
             raise RealmMCPError("host player credential is invalid or revoked")
+        if actor != self._bound_actor:
+            raise RealmMCPError("host player identity changed; restart with an explicitly bound character")
         return actor
 
     def call(self, name: str, arguments: object) -> dict[str, object]:
@@ -282,7 +285,9 @@ def serve_stdio(bridge: RealmMCPBridge, source: IO[bytes], destination: IO[str])
         else:
             result = dispatch(obj, bridge)
         if result is not None:
-            destination.write(json.dumps(result, ensure_ascii=False, separators=(",", ":")) + "\n")
+            # Escape unpaired surrogate code points accepted by json.loads;
+            # writing those directly to a strict UTF-8 stdout kills the MCP process.
+            destination.write(json.dumps(result, ensure_ascii=True, separators=(",", ":")) + "\n")
             destination.flush()
 
 

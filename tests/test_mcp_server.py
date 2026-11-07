@@ -187,6 +187,17 @@ class MCPServerTests(unittest.TestCase):
             self.assertEqual(db.execute("SELECT room_id FROM players WHERE id='Vera'").fetchone()[0], "atrium")
             self.assertEqual(db.execute("SELECT COUNT(*) FROM action_receipts").fetchone()[0], 0)
 
+    def test_rebinding_same_token_to_different_player_cannot_change_live_identity(self):
+        self.assertEqual(self.bridge.call("realm_status", {})["player"], "Vera")
+        with sqlite3.connect(self.database) as db:
+            db.execute("UPDATE player_credentials SET player_name='Patrick' WHERE player_name='Vera'")
+        with self.assertRaisesRegex(RealmMCPError, "identity changed"):
+            self.bridge.call("realm_status", {})
+        with self.assertRaisesRegex(RealmMCPError, "identity changed"):
+            self.bridge.call("realm_join", {})
+        with sqlite3.connect(self.database) as db:
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM players").fetchone()[0], 0)
+
     def test_overlong_or_nonprintable_speech_rejected_without_receipt(self):
         self.bridge.call("realm_join", {})
         for message in ("x" * 281, "hello\tworld", "hello\nworld", " hello", "hello "):
@@ -252,6 +263,18 @@ class MCPServerTests(unittest.TestCase):
         self.assertEqual(len(rows), 2)
         self.assertEqual(rows[0]["error"]["code"], -32700)
         self.assertEqual(rows[1]["id"], 9)
+        self.assertEqual(rows[1]["result"], {})
+
+    def test_escaped_unpaired_surrogate_id_cannot_crash_utf8_writer(self):
+        malformed_id = b'{"jsonrpc":"2.0","id":"\\ud800","method":"ping"}\n'
+        ping = b'{"jsonrpc":"2.0","id":10,"method":"ping"}\n'
+        wire = io.BytesIO()
+        destination = io.TextIOWrapper(wire, encoding="utf-8", errors="strict", write_through=True)
+        serve_stdio(self.bridge, io.BytesIO(malformed_id + ping), destination)
+        rows = [json.loads(line) for line in wire.getvalue().decode("utf-8").splitlines()]
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(rows[0]["result"], {})
+        self.assertEqual(rows[1]["id"], 10)
         self.assertEqual(rows[1]["result"], {})
 
     def test_malformed_request_identifiers_and_protocol_version_fail_safely(self):
