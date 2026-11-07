@@ -180,6 +180,105 @@ class PRStackLiveTest(unittest.TestCase):
             with self.assertRaises(ValueError):
                 fetch_live_open_prs()
 
+    def test_last_only_later_page_cannot_confirm_terminal(self):
+        # RED at PR113: a 27-PR page plus rel=last page2/3 hid #92.
+        rows = []
+        for number in range(61, 88):
+            item = copy.deepcopy(self.live[61])
+            item["number"] = number
+            rows.append(item)
+        hidden = copy.deepcopy(self.live[61])
+        hidden["number"] = 92
+        for page in (2, 3):
+            link = f'<{API}?state=open&per_page=100&page={page}>; rel="last"'
+            with self.subTest(last_page=page):
+                with self.assertRaises(ValueError):
+                    has_next_page(link, 1)
+                with patch("research.pr_stack_live.urlopen",
+                           side_effect=[_Response(rows, link),
+                                        _Response([hidden], page=2)]) as lookup:
+                    with self.assertRaises(ValueError):
+                        fetch_live_open_prs()
+                self.assertEqual(lookup.call_count, 1)
+
+    def test_next_and_last_must_agree_on_page_order(self):
+        next2 = f'<{API}?state=open&per_page=100&page=2>; rel="next"'
+        last1 = f'<{API}?state=open&per_page=100&page=1>; rel="last"'
+        for link in (next2 + ", " + last1, last1 + ", " + next2):
+            with self.subTest(link=link):
+                with self.assertRaises(ValueError):
+                    has_next_page(link, 1)
+        with self.assertRaises(ValueError):
+            has_next_page(last1, 2)
+        with self.assertRaises(ValueError):
+            has_next_page(next2 + ", " + next2, 1)
+        with self.assertRaises(ValueError):
+            has_next_page(next2 + '; title="quoted,a,b"', 1)
+
+    def test_consistent_last_page_and_real_terminal_still_work(self):
+        last1 = f'<{API}?state=open&per_page=100&page=1>; rel="last"'
+        last2 = f'<{API}?state=open&per_page=100&page=2>; rel="last"'
+        last3 = f'<{API}?state=open&per_page=100&page=3>; rel="last"'
+        next2 = f'<{API}?state=open&per_page=100&page=2>; rel="next"'
+        self.assertFalse(has_next_page(last1, 1))
+        self.assertFalse(has_next_page(last2, 2))
+        self.assertTrue(has_next_page(next2 + ", " + last2, 1))
+        self.assertTrue(has_next_page(next2 + ", " + last3, 1))
+        with patch("research.pr_stack_live.urlopen",
+                   return_value=_Response([self.live[61]], last1)):
+            observed = fetch_live_open_prs()
+        self.assertEqual(assess_live(self.snapshot, observed)["pr_gate"], "PASS")
+
+        hidden = copy.deepcopy(self.live[61])
+        hidden["number"] = 92
+        with patch("research.pr_stack_live.urlopen",
+                   side_effect=[_Response([self.live[61]], next2 + ", " + last2),
+                                _Response([hidden], last2, page=2)]) as lookup:
+            observed = fetch_live_open_prs()
+        self.assertEqual(lookup.call_count, 2)
+        self.assertIn("UNTRACKED_OPEN_PR:92",
+                      assess_live(self.snapshot, observed)["findings"])
+
+        with patch("research.pr_stack_live.urlopen",
+                   side_effect=[_Response([self.live[61]], next2 + ", " + last3),
+                                _Response([hidden], last3, page=2)]) as lookup:
+            with self.assertRaises(ValueError):
+                fetch_live_open_prs()
+        self.assertEqual(lookup.call_count, 2)
+
+    def test_advertised_last_is_preserved_across_responses(self):
+        next2 = f'<{API}?state=open&per_page=100&page=2>; rel="next"'
+        next3 = f'<{API}?state=open&per_page=100&page=3>; rel="next"'
+        last2 = f'<{API}?state=open&per_page=100&page=2>; rel="last"'
+        last3 = f'<{API}?state=open&per_page=100&page=3>; rel="last"'
+        later = copy.deepcopy(self.live[61])
+        later["number"] = 92
+        for second_link in ("", last2):
+            with self.subTest(second_link=second_link):
+                with patch("research.pr_stack_live.urlopen",
+                           side_effect=[_Response([self.live[61]], next2 + ", " + last3),
+                                        _Response([later], second_link, page=2)]) as lookup:
+                    with self.assertRaises(ValueError):
+                        fetch_live_open_prs()
+                self.assertEqual(lookup.call_count, 2)
+        with patch("research.pr_stack_live.urlopen",
+                   side_effect=[_Response([self.live[61]], next2 + ", " + last2),
+                                _Response([later], next3, page=2)]) as lookup:
+            with self.assertRaises(ValueError):
+                fetch_live_open_prs()
+        self.assertEqual(lookup.call_count, 2)
+
+        third = copy.deepcopy(self.live[61])
+        third["number"] = 93
+        with patch("research.pr_stack_live.urlopen",
+                   side_effect=[_Response([self.live[61]], next2 + ", " + last3),
+                                _Response([later], next3, page=2),
+                                _Response([third], page=3)]) as lookup:
+            observed = fetch_live_open_prs()
+        self.assertEqual(lookup.call_count, 3)
+        self.assertIn("UNTRACKED_OPEN_PR:93",
+                      assess_live(self.snapshot, observed)["findings"])
+
     def test_redirected_effective_source_url_never_passes(self):
         canonical = f"{API}?state=open&per_page=100&page=1"
         for destination in (

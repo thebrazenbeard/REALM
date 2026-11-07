@@ -31,15 +31,16 @@ class _RefuseRedirect(HTTPRedirectHandler):
 urlopen = build_opener(_RefuseRedirect).open
 
 
-def has_next_page(link_header: str, current_page: int) -> bool:
-    """Read canonical Link pagination evidence, including on short pages."""
+def _validated_pagination(link_header: str, current_page: int):
+    """Return (has_next, last_page) after validating canonical Link entries."""
     if not isinstance(link_header, str):
         raise ValueError("malformed GitHub pagination Link header")
     if not link_header.strip():
-        return False
+        return False, None
     root = urlsplit(API)
     seen = set()
-    has_next = False
+    next_page = None
+    last_page = None
     for raw in link_header.split(","):
         match = _LINK.fullmatch(raw)
         if match is None:
@@ -62,11 +63,25 @@ def has_next_page(link_header: str, current_page: int) -> bool:
                 or not query["page"][0].isdecimal()
                 or int(query["page"][0]) < 1):
             raise ValueError("unexpected GitHub pagination query")
+        target_page = int(query["page"][0])
         if relation == "next":
-            if int(query["page"][0]) != current_page + 1:
+            if target_page != current_page + 1:
                 raise ValueError("cyclic/skipped GitHub pagination page")
-            has_next = True
-    return has_next
+            next_page = target_page
+        elif relation == "last":
+            last_page = target_page
+    if last_page is not None:
+        if last_page < current_page or (next_page is not None and
+                                        last_page < next_page):
+            raise ValueError("contradictory GitHub pagination last page")
+        if last_page > current_page and next_page is None:
+            raise ValueError("GitHub pagination last page lacks next relation")
+    return next_page is not None, last_page
+
+
+def has_next_page(link_header: str, current_page: int) -> bool:
+    """Read canonical Link pagination evidence, including on short pages."""
+    return _validated_pagination(link_header, current_page)[0]
 
 
 def canonical_origin(value: str) -> bool:
@@ -131,7 +146,10 @@ def fetch_live_open_prs(api: str = API):
     if api != API:
         raise ValueError("noncanonical GitHub API endpoint")
     observed = {}
+    advertised_last_page = None
     for page in range(1, 11):
+        if advertised_last_page is not None and page > advertised_last_page:
+            raise ValueError("GitHub pagination passed advertised last page")
         uri = f"{api}?state=open&per_page=100&page={page}"
         req = Request(uri, headers={"User-Agent": "REALM-source-review-gate",
                                     "Accept": "application/vnd.github+json"})
@@ -152,7 +170,17 @@ def fetch_live_open_prs(api: str = API):
                 links = [value] if value else []
             if not isinstance(links, (list, tuple)):
                 raise ValueError("malformed GitHub pagination headers")
-            further = has_next_page(", ".join(links), page)
+            further, last_page = _validated_pagination(", ".join(links), page)
+            if last_page is not None:
+                if (advertised_last_page is not None and
+                        last_page != advertised_last_page):
+                    raise ValueError("GitHub pagination last page changed")
+                advertised_last_page = last_page
+            if advertised_last_page is not None:
+                if further and page + 1 > advertised_last_page:
+                    raise ValueError("GitHub next exceeds advertised last page")
+                if not further and page < advertised_last_page:
+                    raise ValueError("GitHub pagination ended before last page")
             payload = json.load(response)
         if not isinstance(payload, list):
             raise ValueError("GitHub API did not return PR list")
