@@ -280,6 +280,7 @@ class WorldClock:
             # trigger after acknowledgment can otherwise erase a pouch or
             # gather history while leaving the roster attestation intact.
             node_before = pouch_before = None
+            first_roster_event_floor = None
             node_gathered = defaultdict(int)
             pouch_gathered = defaultdict(int)
             gather_events = {}
@@ -287,10 +288,14 @@ class WorldClock:
                 event = _event(row)
                 if event.kind == "npc_roster_gather":
                     if node_before is None:
+                        first_roster_event_floor = db.execute(
+                            "SELECT COALESCE(MAX(id),0) FROM main.events"
+                        ).fetchone()[0]
                         node_before = {
-                            (r["room_id"], r["material"]): r["remaining"]
+                            (r["room_id"], r["material"]): (r["remaining"], r["batch_yield"])
                             for r in db.execute(
-                                "SELECT room_id,material,remaining FROM main.gathering_nodes"
+                                "SELECT room_id,material,remaining,batch_yield "
+                                "FROM main.gathering_nodes"
                             )
                         }
                         pouch_before = {
@@ -371,31 +376,42 @@ class WorldClock:
                         or main_event["payload_json"] != _payload(event.payload)):
                     raise ValueError("Roster UTC completion changed before commit")
             if node_before is not None:
-                # Reject same-batch changes to roster-owned resource keys that
-                # cannot be accounted for by the signed gather quantities.
-                for (room, material), units in node_gathered.items():
-                    stock = db.execute(
-                        "SELECT remaining FROM main.gathering_nodes "
-                        "WHERE room_id=? AND material=?", (room, material),
-                    ).fetchone()
-                    if stock is None or stock["remaining"] != (
-                        node_before[(room, material)] - units
-                    ):
-                        raise ValueError("Roster gathered node stock changed before commit")
-                for (actor, material), units in pouch_gathered.items():
-                    pouch = db.execute(
-                        "SELECT quantity FROM main.material_pouches "
-                        "WHERE actor=? AND material=?", (actor, material),
-                    ).fetchone()
-                    if pouch is None or pouch["quantity"] != (
-                        pouch_before.get((actor, material), 0) + units
-                    ):
-                        raise ValueError("Roster material pouch changed before commit")
-                for event_id, expected in gather_events.items():
-                    actual = db.execute(
+                # Full post-roster deltas prohibit extra, ungranted rows even
+                # when all originally signed actors and receipts remain valid.
+                # Ordinary say/move events are unaffected; additional gathers
+                # require a separate governed tick or equivalent attestation.
+                expected_nodes = dict(node_before)
+                for key, units in node_gathered.items():
+                    stock, batch_yield = expected_nodes[key]
+                    expected_nodes[key] = (stock - units, batch_yield)
+                actual_nodes = {
+                    (r["room_id"], r["material"]): (r["remaining"], r["batch_yield"])
+                    for r in db.execute(
+                        "SELECT room_id,material,remaining,batch_yield "
+                        "FROM main.gathering_nodes"
+                    )
+                }
+                if actual_nodes != expected_nodes:
+                    raise ValueError("Roster resource inventory changed outside signed plan")
+                expected_pouches = dict(pouch_before)
+                for key, units in pouch_gathered.items():
+                    expected_pouches[key] = expected_pouches.get(key, 0) + units
+                actual_pouches = {
+                    (r["actor"], r["material"]): r["quantity"]
+                    for r in db.execute(
+                        "SELECT actor,material,quantity FROM main.material_pouches"
+                    )
+                }
+                if actual_pouches != expected_pouches:
+                    raise ValueError("Roster pouch inventory changed outside signed plan")
+                all_new_gathers = {
+                    r["id"]: tuple(r)
+                    for r in db.execute(
                         "SELECT id,actor,room_id,kind,payload_json FROM main.events "
-                        "WHERE id=?", (event_id,),
-                    ).fetchone()
-                    if actual is None or tuple(actual) != expected:
-                        raise ValueError("Roster gather history changed before commit")
+                        "WHERE id>? AND kind='gather'",
+                        (first_roster_event_floor,),
+                    )
+                }
+                if all_new_gathers != gather_events:
+                    raise ValueError("Roster gather history contains ungranted effects")
             return processed
