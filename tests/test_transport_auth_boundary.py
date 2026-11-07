@@ -4,6 +4,7 @@ All worlds are disposable; these tests do not make Telnet publicly secure.
 """
 
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import closing
 from pathlib import Path
 import sqlite3
 import sys
@@ -40,7 +41,7 @@ class TransportAuthBoundaryTests(unittest.TestCase):
         self.assertIsNotNone(telnet.join_exclusive("Alice"))
         with self.assertRaisesRegex(ValueError, "(?i)transport|auth"):
             Gateway(self.path, world_id="test", adopt_unbound_world=True)
-        with sqlite3.connect(self.path) as db:
+        with closing(sqlite3.connect(self.path)) as db:
             self.assertIsNone(db.execute(
                 "SELECT value FROM world_meta WHERE key='world_id'"
             ).fetchone())
@@ -49,7 +50,7 @@ class TransportAuthBoundaryTests(unittest.TestCase):
         gateway = Gateway(self.path, world_id="test")
         gateway.credentials.provision("Alice")
         gateway.join("Alice")
-        with sqlite3.connect(self.path) as db:
+        with closing(sqlite3.connect(self.path)) as db, db:
             db.execute("DELETE FROM world_meta WHERE key='transport_auth_mode'")
         with self.assertRaisesRegex(ValueError, "(?i)transport|auth|credential"):
             Engine(self.path).join("Alice", transport_auth_mode="shared-token-demo")
