@@ -26,6 +26,21 @@ The server binds only `127.0.0.1`. It requires exact Host/Origin checks and its 
 4. Acknowledge that you reviewed the visible proposals, then **Compile reviewed draft**. Download the server's exact canonical JSON bytes without reformatting them. The file remains **unimported and unauthenticated**.
 5. Changing upload inputs invalidates the previous preview. Changing reviewed details requires fresh acknowledgement.
 
+**Existing worldpack route:** If you already have an authored `realm.worldpack.v1` JSON
+file, use the separate **Preview authored worldpack** form and the same ephemeral
+token. This accepts one UTF-8 `.json` file up to **512 KiB** and shows exact
+validated room/item/directed-exit counts, authored room descriptions and links.
+The `/api/v1/creator/existing-preview` endpoint reuses the strict lossless
+in-memory validator; it never regenerates rooms, rewrites exits, imports SQLite,
+or authenticates author/canon/release. For inspection, the browser replaces
+invisible Unicode format controls in displayed names/descriptions with explicit
+`\uXXXX` (or `\u{XXXXXX}`) escapes and counts these in a visible warning;
+**the original authored worldpack bytes, hashes and server response stay unchanged**.
+The resulting preview is **UNVERIFIED** and **UNREVIEWED**, and it has no
+compile/deploy button. Keep source rights evidence
+and any game-world release approval in a separate private, host-authenticated
+workflow.
+
 The browser and server process source bytes in memory only; there is no upload directory, database write, external API call or telemetry. **Your manual worldpack download is an intentional local file write.** No private fiction is included in this repository.
 
 ## Trust and release limits

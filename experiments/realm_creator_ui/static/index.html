@@ -57,6 +57,28 @@
       </form>
     </section>
 
+    <section class="panel" aria-labelledby="existing-title">
+      <div class="panel-heading">
+        <div><span class="overline">ALTERNATE / EXISTING WORLDPACK</span><h2 id="existing-title">Preview authored worldpack</h2></div>
+        <span class="tag">UNVERIFIED</span>
+      </div>
+      <p>Already have a REALM worldpack JSON? Preview its existing rooms, items and exits without regenerating, importing, approving, or altering it. Use the ephemeral token above.</p>
+      <form id="existing-form">
+        <label for="existing-file" class="file-label">Existing worldpack JSON
+          <input id="existing-file" type="file" accept=".json,application/json" required>
+          <span class="hint">One UTF-8 JSON file, 512 KiB maximum. Processed in this localhost session only.</span>
+        </label>
+        <div class="form-footer">
+          <p>Preview verifies structure only. Authorship, rights, canon, and release remain unverified.</p>
+          <button type="submit">Preview existing worldpack</button>
+        </div>
+      </form>
+      <div id="existing-result" hidden>
+        <p id="existing-summary" class="section-copy" aria-live="polite"></p>
+        <div id="existing-rooms" class="room-list"></div>
+      </div>
+    </section>
+
     <section class="panel review-panel" id="review-region" aria-labelledby="review-title" hidden>
       <div class="panel-heading">
         <div><span class="overline">STEP 02 / HUMAN REVIEW</span><h2 id="review-title">Shape what players encounter</h2></div>

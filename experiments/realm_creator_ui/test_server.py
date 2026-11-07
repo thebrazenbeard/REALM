@@ -70,6 +70,55 @@ class CreatorServerHTTPTests(unittest.TestCase):
         self.assertIn("default-src 'none'", headers["Content-Security-Policy"])
         self.assertNotIn("Access-Control-Allow-Origin", headers)
 
+    def test_existing_worldpack_http_preview_is_lossless_and_unapproved(self):
+        from experiments.realm_creator_ui.test_existing_pack import PACK
+        raw = json.dumps(PACK, ensure_ascii=False).encode("utf-8")
+        payload = {
+            "source_id": "local_existing_pack",
+            "worldpack_base64": base64.b64encode(raw).decode("ascii"),
+        }
+        status, result, headers = self.request("/api/v1/creator/existing-preview", payload)
+        self.assertEqual(status, 200)
+        self.assertEqual(result["preview"]["worldpack"], PACK)
+        self.assertEqual(result["counts"], {"rooms": 2, "items": 1, "directed_exits": 2})
+        self.assertEqual(result["preview"]["provenance"]["source_sha256"],
+                         hashlib.sha256(raw).hexdigest())
+        self.assertEqual(result["preview"]["canon_status"], "UNREVIEWED")
+        self.assertFalse(result["preview"]["approval_authenticated"])
+        self.assertFalse(result["preview"]["world_imported"])
+        self.assertEqual(headers["Cache-Control"], "no-store")
+
+    def test_existing_worldpack_upload_rejects_malformed_and_cross_origin(self):
+        from experiments.realm_creator_ui.test_existing_pack import PACK
+        raw = json.dumps(PACK).encode("utf-8")
+        payload = {"source_id": "local_existing_pack",
+                   "worldpack_base64": base64.b64encode(raw).decode("ascii")}
+        status, _, _ = self.request("/api/v1/creator/existing-preview", payload,
+                                    extra_headers={"Origin": "http://evil.example"})
+        self.assertEqual(status, 403)
+        bad_cases = [
+            {**payload, "worldpack_base64": "!not-base64!"},
+            {**payload, "claimed_approval": True},
+            {**payload, "worldpack_base64": base64.b64encode(b"not json").decode()},
+        ]
+        for bad in bad_cases:
+            with self.subTest(bad=bad):
+                status, _, _ = self.request("/api/v1/creator/existing-preview", bad)
+                self.assertEqual(status, 400)
+        oversized = {**payload, "worldpack_base64":
+                     base64.b64encode(b"x" * (512 * 1024 + 1)).decode("ascii")}
+        status, _, _ = self.request("/api/v1/creator/existing-preview", oversized)
+        self.assertEqual(status, 413)
+        duplicate = (
+            b'{"source_id":"local_existing_pack","source_id":"forged",'
+            b'"worldpack_base64":"' + payload["worldpack_base64"].encode("ascii") + b'"}'
+        )
+        status, _, _ = self.request("/api/v1/creator/existing-preview", raw=duplicate)
+        self.assertEqual(status, 400)
+        status, _, _ = self.request("/api/v1/creator/existing-preview",
+                                    raw=b'{"source_id":' + b"9" * 6000 + b'}')
+        self.assertEqual(status, 400)
+
     def test_rejects_missing_or_wrong_host_token_and_origin(self):
         cases = [
             {"X-REALM-CREATOR-TOKEN": "not-authorized"},

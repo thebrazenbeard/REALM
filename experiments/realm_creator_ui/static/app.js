@@ -16,6 +16,11 @@
     compile: get("compile-button"),
     status: get("status"),
     download: get("download-pack"),
+    existingForm: get("existing-form"),
+    existingFile: get("existing-file"),
+    existingResult: get("existing-result"),
+    existingSummary: get("existing-summary"),
+    existingRooms: get("existing-rooms"),
   };
   const FILE_LIMIT = 8;
   const EACH_BYTES = 256 * 1024;
@@ -28,6 +33,18 @@
   let currentDownloadUrl = null;
   let formRevision = 0;
   let reviewRevision = 0;
+  let existingRevision = 0;
+
+  function clearExisting() {
+    ui.existingResult.hidden = true;
+    ui.existingSummary.textContent = "";
+    ui.existingRooms.replaceChildren();
+  }
+
+  function invalidateExisting() {
+    existingRevision += 1;
+    clearExisting();
+  }
 
   function setStatus(message) {
     ui.status.textContent = message;
@@ -148,6 +165,64 @@
     return node;
   }
 
+  const FORMAT_CONTROLS = /\p{Cf}/gu;
+
+  function visibleControls(value, tally) {
+    return String(value).replace(FORMAT_CONTROLS, (character) => {
+      tally.count += 1;
+      const point = character.codePointAt(0);
+      const hex = point.toString(16).padStart(4, "0");
+      return point <= 0xffff ? "\\u" + hex : "\\u{" + hex + "}";
+    });
+  }
+
+  function renderExisting(data) {
+    const preview = data && data.preview;
+    const pack = preview && preview.worldpack;
+    const counts = data && data.counts;
+    if (!pack || pack.schema !== "realm.worldpack.v1" ||
+        !Array.isArray(pack.rooms) || !Array.isArray(pack.items) ||
+        !counts || preview.review_status !== "REVIEW_REQUIRED" ||
+        preview.canon_status !== "UNREVIEWED" ||
+        preview.provenance?.source_status !== "UNVERIFIED" ||
+        preview.approval_authenticated !== false || preview.world_imported !== false ||
+        counts.rooms !== pack.rooms.length || counts.items !== pack.items.length ||
+        counts.directed_exits !== pack.rooms.reduce((sum, room) =>
+          sum + Object.keys(room.exits || {}).length, 0)) {
+      throw new Error("Server returned no valid, unreviewed existing worldpack preview.");
+    }
+    clearExisting();
+    const tally = { count: 0 };
+    const visible = (value) => visibleControls(value, tally);
+    const visibleTitle = visible(pack.name);
+    const visibleWorldId = visible(pack.world_id);
+    for (const room of pack.rooms) {
+      const card = element("article", ui.existingRooms);
+      card.className = "room-card";
+      element("h3", card, visible(room.name));
+      element("p", card, "Authored ID: " + visible(room.id));
+      element("p", card, visible(room.description));
+      for (const [direction, destination] of Object.entries(room.exits || {})) {
+        element("p", card, visible(direction) + " → " + visible(destination));
+      }
+    }
+    if (pack.items.length) {
+      const itemSection = element("section", ui.existingRooms);
+      element("h4", itemSection, "Existing authored items");
+      for (const item of pack.items) {
+        element("p", itemSection, visible(item.id) + " · " + visible(item.name) +
+          " in " + visible(item.room));
+        element("p", itemSection, visible(item.description));
+      }
+    }
+    ui.existingSummary.textContent = visibleTitle + " (" + visibleWorldId + "): " +
+      counts.rooms + " rooms · " + counts.items + " items · " +
+      counts.directed_exits + " directed exits. UNVERIFIED source / UNREVIEWED canon. " +
+      "No import, approval or server change." +
+      (tally.count ? " WARNING: format controls escaped: " + tally.count : "");
+    ui.existingResult.hidden = false;
+  }
+
   function renderReview(data) {
     if (!data || !data.draft || !data.region ||
         data.region.status !== "REVIEW_REQUIRED" ||
@@ -198,6 +273,7 @@
   }
 
   function onFormChanged() {
+    invalidateExisting();
     formRevision += 1;
     const hadPreview = Boolean(current);
     clearPreview();
@@ -211,6 +287,44 @@
     field.addEventListener("change", onFormChanged);
   }
   ui.sourceFiles.addEventListener("change", onFormChanged);
+
+  ui.existingFile.addEventListener("change", invalidateExisting);
+  ui.existingForm.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    invalidateExisting();
+    const revision = existingRevision;
+    const files = Array.from(ui.existingFile.files || []);
+    const tokenAtStart = ui.token.value.trim();
+    try {
+      assertToken();
+      if (files.length !== 1) throw new Error("Choose exactly one worldpack JSON file.");
+      const file = files[0];
+      if (!/\.json$/i.test(file.name) || file.size < 1 || file.size > 512 * 1024) {
+        throw new Error("Worldpack must be a nonempty JSON file at most 512 KiB.");
+      }
+      const bytes = new Uint8Array(await file.arrayBuffer());
+      if (bytes.length !== file.size) throw new Error("File changed while reading.");
+      try {
+        new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+      } catch {
+        throw new Error("Worldpack must be valid UTF-8 JSON.");
+      }
+      if (existingRevision !== revision || ui.existingFile.files[0] !== file ||
+          ui.token.value.trim() !== tokenAtStart) return;
+      const output = await send("/api/v1/creator/existing-preview", {
+        source_id: "local_existing_pack", worldpack_base64: bytesToBase64(bytes),
+      });
+      if (existingRevision !== revision || ui.existingFile.files[0] !== file ||
+          ui.token.value.trim() !== tokenAtStart) return;
+      renderExisting(output);
+      setStatus("Existing authored worldpack preview only. UNVERIFIED source, UNREVIEWED canon, NOT imported.");
+    } catch (error) {
+      if (existingRevision === revision) {
+        clearExisting();
+        setStatus("Existing worldpack preview failed: " + error.message);
+      }
+    }
+  });
 
   ui.form.addEventListener("submit", async (event) => {
     event.preventDefault();
@@ -318,8 +432,12 @@
   });
 
   if (window && window.addEventListener) {
-    window.addEventListener("pagehide", clearDownload);
+    window.addEventListener("pagehide", () => {
+      clearDownload();
+      clearExisting();
+    });
   }
   clearPreview();
+  clearExisting();
   setStatus("Local Creator ready. Enter the ephemeral host token, select UTF-8 sources, then preview.");
 })();
