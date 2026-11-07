@@ -261,11 +261,17 @@ def dispatch(message: object, bridge: RealmMCPBridge) -> dict[str, object] | Non
         # authentication material must remain outside the tool transcript.
         safe = str(exc) if isinstance(exc, RealmMCPError) else "game action unavailable or rejected"
         return _jsonrpc_result(request_id, {"content": [{"type": "text", "text": safe}], "isError": True})
-    if len(json.dumps(response, ensure_ascii=False).encode("utf-8")) > MAX_RESULT_BYTES:
+    narrative = response.get("text")
+    if type(narrative) is not str:
+        narrative = json.dumps(response, ensure_ascii=False)
+    result = _jsonrpc_result(request_id, {"content": [{"type": "text", "text": narrative}],
+                                          "structuredContent": response, "isError": False})
+    # Bound the *actual* stdio envelope, not the inner game result: text and
+    # structuredContent duplicate data, and ensure_ascii escapes Unicode.
+    if len(json.dumps(result, ensure_ascii=True, separators=(",", ":")).encode("utf-8")) > MAX_RESULT_BYTES:
         return _jsonrpc_result(request_id, {"content": [{"type": "text", "text": "game result exceeds plugin limit"}],
                                             "isError": True})
-    return _jsonrpc_result(request_id, {"content": [{"type": "text", "text": response.get("text", json.dumps(response, ensure_ascii=False))}],
-                                         "structuredContent": response, "isError": False})
+    return result
 
 
 def serve_stdio(bridge: RealmMCPBridge, source: IO[bytes], destination: IO[str]) -> None:

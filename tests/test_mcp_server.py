@@ -12,9 +12,10 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 
 from realm.gateway import Gateway
-from realm.mcp_server import RealmMCPBridge, RealmMCPError, TOOLS, dispatch, serve_stdio
+from realm.mcp_server import MAX_RESULT_BYTES, RealmMCPBridge, RealmMCPError, TOOLS, dispatch, serve_stdio
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -240,6 +241,34 @@ class MCPServerTests(unittest.TestCase):
         answer = dispatch(request, self.bridge)
         self.assertTrue(answer["result"]["isError"])
         self.assertNotIn(self.token, json.dumps(answer))
+
+    def test_large_game_results_are_bounded_by_actual_stdio_wire_size(self):
+        request = {"jsonrpc": "2.0", "id": 17, "method": "tools/call",
+                   "params": {"name": "realm_look", "arguments": {}}}
+        crowded_feed = {"ok": True, "events": [
+            {"id": i, "kind": "say", "actor": "Vera", "room": "atrium",
+             "at": "2026-11-07T12:00:00Z", "text": "Vera: " + "x" * 280}
+            for i in range(1, 101)], "cursor": 100}
+        scenarios = {"ascii room": {"ok": True, "text": "x" * 40000},
+                     "unicode room": {"ok": True, "text": "😀" * 11000},
+                     "crowded feed": crowded_feed}
+        for label, response in scenarios.items():
+            with self.subTest(case=label), patch.object(
+                    self.bridge, "call", return_value=response):
+                # The structured response is copied into BOTH text and
+                # structuredContent, and stdio escapes Unicode to ASCII.
+                reply = dispatch(request, self.bridge)
+                self.assertTrue(reply["result"]["isError"])
+                wire = json.dumps(reply, ensure_ascii=True, separators=(",", ":")).encode("utf-8")
+                self.assertLessEqual(len(wire), MAX_RESULT_BYTES)
+                output = io.StringIO()
+                serve_stdio(self.bridge, io.BytesIO((json.dumps(request) + "\n").encode()), output)
+                self.assertLessEqual(len(output.getvalue().encode("utf-8")), MAX_RESULT_BYTES + 1)
+                self.assertTrue(json.loads(output.getvalue())["result"]["isError"])
+        with patch.object(self.bridge, "call", return_value={"ok": True, "text": "A small room."}):
+            small = dispatch(request, self.bridge)["result"]
+            self.assertFalse(small["isError"])
+            self.assertEqual(small["structuredContent"]["text"], "A small room.")
 
     def test_typed_play_calls_work_over_real_stdio_subprocess(self):
         calls = [
