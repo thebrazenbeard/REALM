@@ -17,22 +17,28 @@ performance on unseen worlds.
   `allowed_commands`. Each character should have its own instance.
 - `realm_adapter.py`: host-owned turn adapter. A trusted observer supplies a
   *detached* JSON state, the policy proposes a command, and REALM's
-  `ResidentController.validate` / `commit` performs the authority checks and
-  database mutation. An optional **trusted** outcome evaluator can feed back
-  bounded rewards after commit **only** when a host-owned `receipt_exists`
-  witness confirms that the action ID was absent before this commit. Without
-  that witness, the action may still commit but learning is not claimed.
-- `tests/`: offline contract tests. Their fake resident controller is **not**
-  evidence of a running world integration.
+  `ResidentController.validate` / `commit_with_receipt` performs host-gated
+  transaction commit. Optional learning is allowed **only when the Engine
+  reports a newly created receipt from the same SQLite transaction**. A
+  legacy controller may still act, but never authorizes learning from a
+  precommit receipt lookup.
+- `turn_scheduler.py`: bounded, synchronous host-controlled turn loop. Stops
+  immediately on completed reach/take goals, objective changes, stalls, and
+  turn limits. Does not start a resident service or create characters.
+- `state_store.py`: opt-in, host-triggered checkpoint save/restore of the
+  per-actor/world policy, including receipt history. Requires a trusted
+  private directory; SHA detects corruption, not malicious rewriting.
+- `tests/`: contract tests **and real Engine tests** using disposable SQLite
+  databases. No live world or ongoing autonomous service is involved.
 
 The observer, goal, candidate-command enumeration, actor provisioning, reward
-function, tick scheduling, receipt allocation and persistent learning-storage
-contract are intentionally **host responsibilities**. No resident is created
-or scheduled by these modules. Required policy observation fields:
+function, tick timing, receipt allocation and checkpoint authorization remain
+**host responsibilities**. No resident is created or background-scheduled by
+these modules. Required policy observation fields:
 `world_id`, `room`, `exits`, `items`, `inventory`, `goal` (`kind` = `explore`,
 `reach` or `take`; optional `target`), and `allowed_commands`.
 
-## Offline check
+## Offline checks
 
 From this directory:
 
@@ -41,24 +47,33 @@ python -m unittest discover -s tests -v
 python -O -m unittest discover -s tests -q
 ```
 
+From REALM repository root, also run:
+
+```sh
+python -m unittest discover -s experiments/original_npc/tests -q
+python -m unittest discover -s tests -q
+node --test tests/browser/test-client.cjs tests/browser/test-map.cjs
+```
+
 No network access, models, remote inference or GPU is necessary. No model
 weights, secrets, or world data are bundled.
 
 ## Qualification gates before a host integration
 
-1. Run this adapter against REALM's **actual** `Engine` and
-   `ResidentController` in a disposable world; verify real event receipts and
-   actor/world isolation, not only fakes.
+1. Extend the passed **actual** `Engine` / `ResidentController` disposable-world
+   smoke to unfamiliar maps, multi-character interaction, and realistic goals.
 2. Use a trusted event-time visibility observer and allow only commands the
    engine can currently validate; make each resident's objectives explicit.
 3. Compare learned and frozen policies over unseen worldpacks with fixed seeds
    and separate train/evaluation maps. Measure legal action rate, objective
    completion, regret and failed-action loops, including 8 residents × 20
    turns and interrupted/retried turns.
-4. Persist learned data and pending action IDs through a host-owned verified
-   scheme; current retry caching is only in-process. Serialize each resident's
-   action submission across host workers: a precommit receipt lookup is **not**
-   an atomic freshness proof if multiple writers race with the same ID.
+4. Wire the new checkpoint API and scheduler into an explicitly provisioned
+   live host. Checkpoints can now survive restart in tests, but pending
+   in-flight decisions and host receipt allocation are still in-process.
+   The Engine now determines receipt creation transactionally; hosts must still
+   bind the asserted actor/world to the actual connected Engine and serialize
+   their checkpoint writers.
 5. Qualify the trust boundary: model Python running in-process is **not**
    sandboxed. A hostile plugin cannot be made safe by handing it a JSON copy.
 

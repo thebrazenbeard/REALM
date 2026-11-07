@@ -1,5 +1,23 @@
 # Disposable REALM engine integration receipt (2026-11-06)
 
+## Current follow-up — atomic receipts and restartable policy (2026-11-06)
+
+The original **28-test** receipt below remains historical evidence against
+REALM main `09fc7cf6`. It is superseded for current implementation claims by
+the subsequent draft source patch: `Engine.act_with_receipt` and
+`ResidentController.commit_with_receipt` return transaction-coupled receipt
+creation status. A concurrent pair of same-actor calls under SQLite's
+`BEGIN IMMEDIATE` lock cannot both report a newly inserted receipt; the NPC
+adapter trains only on `receipt_created=True`. Legacy precommit witnesses
+are not sufficient and no longer enable learner updates.
+
+New bounded source tests: REALM core **111/111**, original NPC **47/47**,
+and Node/browser **20/20** passed, including real disposable-world atomic
+race, two-turn goal completion and explicit policy save/reload tests. This
+is **not** a running Lappy service or evidence of unseen-game proficiency.
+The host's actor/world binding, event-time visibility, private checkpoint
+ACLs, and tick timing remain to be integrated and qualified.
+
 **Evidence class:** test against source-exact REALM Python modules, not a
 running Lappy REALM service and not a production world qualification.
 
@@ -72,5 +90,6 @@ and do not touch configured live-world paths.
 - Host event-time privacy, actor authorization and scheduling in an actual
   live service; the test observer is trusted fixture code with direct SQL
   access, not a runtime observer API.
-- Cross-process persistence of learning and pending action decisions.
+- Live-host use of checkpoint persistence and recovery of pending in-flight
+  action decisions; the new checkpoint API itself has offline save/reload tests.
 - Windows/Lappy-specific SQLite handle lifetime or service deployment.

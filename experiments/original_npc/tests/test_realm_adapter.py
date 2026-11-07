@@ -3,6 +3,7 @@
 import sys
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -42,6 +43,13 @@ class FakeResidentController:
             response = "No exit leads that way."
         self.receipts[action_id] = (command, response)
         return response
+
+
+class AtomicFakeResidentController(FakeResidentController):
+    def commit_with_receipt(self, proposal, *, action_id):
+        existed = action_id in self.receipts
+        response = self.commit(proposal, action_id=action_id)
+        return SimpleNamespace(response=response, receipt_created=not existed)
 
 
 class Policy:
@@ -129,7 +137,7 @@ class ResidentHostTests(unittest.TestCase):
         seen["allowed_commands"].append("take token")
         self.assertNotIn("take token", self.snapshot["allowed_commands"])
 
-    def test_trusted_reward_controls_learning_and_receipt(self):
+    def test_legacy_precommit_witness_cannot_enable_learning(self):
         def eval_result(before, command, after, response):
             return 1.0 if before["room"] != after["room"] and "Corridor" in response else -1.0
 
@@ -138,15 +146,79 @@ class ResidentHostTests(unittest.TestCase):
             receipt_exists=lambda rid: rid in self.controller.receipts,
         )
         result = host.step(action_id="host-learn-1")
-        self.assertEqual("learned_with_host_witness", result.learning_status)
-        self.assertEqual(1, len(self.policy.learning))
-        before, command, after, reward, rid = self.policy.learning[0]
-        self.assertEqual(("atrium", "north", "corridor", 1.0, "host-learn-1"),
-                         (before["room"], command, after["room"], reward, rid))
+        self.assertEqual("receipt_unverified", result.learning_status)
+        self.assertEqual(0, len(self.policy.learning))
+        self.assertEqual("corridor", self.controller.room)
         host.step(action_id="host-learn-1")
+        self.assertEqual(0, len(self.policy.learning))
+
+    def test_legacy_false_negative_witness_does_not_train_on_replayed_commit(self):
+        # Models a concurrent host having inserted the exact receipt after a
+        # legacy receipt_exists=False probe but before this host commits.
+        prior = self.controller.commit({"command": "north"}, action_id="racy-id")
+        self.assertIn("Corridor", prior)
+        host = ResidentTurnHost(
+            self.controller, self.observe, self.policy,
+            outcome_evaluator=lambda *_: 1.0,
+            receipt_exists=lambda action_id: False,
+        )
+        replay = host.step(action_id="racy-id")
+        self.assertEqual(prior, replay.response)
+        self.assertEqual("receipt_unverified", replay.learning_status)
+        self.assertEqual([], self.policy.learning)
+        self.assertEqual(1, len(self.controller.events))
+
+    def test_atomic_commit_reports_new_receipt_then_replay_without_relearning(self):
+        self.controller = AtomicFakeResidentController()
+        witness_calls = []
+        def legacy_witness(action_id):
+            witness_calls.append(action_id)
+            raise AssertionError("Atomic path must never run legacy precommit witness")
+
+        host = ResidentTurnHost(
+            self.controller, self.observe, self.policy,
+            outcome_evaluator=lambda *_: 1.0, receipt_exists=legacy_witness,
+        )
+        first = host.step(action_id="atomic-1")
+        self.assertEqual("learned_with_atomic_receipt", first.learning_status)
         self.assertEqual(1, len(self.policy.learning))
+        self.assertEqual([], witness_calls)
+
+        replay_policy = Policy("north")
+        restarted = ResidentTurnHost(
+            self.controller, self.observe, replay_policy,
+            outcome_evaluator=lambda *_: 1.0, receipt_exists=legacy_witness,
+        )
+        second = restarted.step(action_id="atomic-1")
+        self.assertEqual("replayed_receipt", second.learning_status)
+        self.assertEqual(first.response, second.response)
+        self.assertEqual([], replay_policy.learning)
+        self.assertEqual(1, len(self.controller.events))
+        self.assertEqual([], witness_calls)
+
+    def test_invalid_atomic_commit_provenance_is_rejected_not_learned(self):
+        for invalid in (
+            SimpleNamespace(response="ok", receipt_created="true"),
+            SimpleNamespace(response=7, receipt_created=True),
+            SimpleNamespace(response="ok"),
+        ):
+            with self.subTest(invalid=invalid):
+                class MalformedAtomic(FakeResidentController):
+                    def commit_with_receipt(self, proposal, *, action_id):
+                        return invalid
+
+                controller = MalformedAtomic()
+                policy = Policy("north")
+                host = ResidentTurnHost(
+                    controller, self.observe, policy,
+                    outcome_evaluator=lambda *_: 1.0,
+                )
+                with self.assertRaisesRegex(ValueError, "invalid provenance"):
+                    host.step(action_id="invalid-atomic")
+                self.assertEqual([], policy.learning)
 
     def test_nonfinite_or_failing_reward_cannot_claim_learning(self):
+        self.controller = AtomicFakeResidentController()
         host = ResidentTurnHost(self.controller, self.observe, self.policy,
                                 outcome_evaluator=lambda *_: float("nan"),
                                 receipt_exists=lambda rid: rid in self.controller.receipts)
@@ -173,8 +245,9 @@ class ResidentHostTests(unittest.TestCase):
             receipt_exists=witness,
         )
         first = original.step(action_id="durable-1")
-        self.assertEqual("learned_with_host_witness", first.learning_status)
+        self.assertEqual("receipt_unverified", first.learning_status)
         self.assertEqual(1, len(self.controller.events))
+        self.assertEqual([], self.policy.learning)
 
         # Emulate a process restart: new adapter and policy, existing durable
         # Engine receipt. The same command returns its stored response.

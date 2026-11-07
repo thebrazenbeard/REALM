@@ -70,10 +70,15 @@ def _observation(raw: Mapping) -> dict:
 class OriginalNPCPolicy:
     """Original learned action ranker with only host-observed room transitions."""
 
-    def __init__(self, seed: int = 0):
+    def __init__(self, seed: int = 0, *, world_id: str | None = None,
+                 actor_id: str | None = None):
         if type(seed) is not int or not 0 <= seed < 2**32:
             raise ValueError("seed must be a nonnegative 32-bit integer")
+        if (world_id is None) != (actor_id is None):
+            raise ValueError("world and actor bindings must be supplied together")
         self.seed = seed
+        self._world_id = _text(world_id, "world_id") if world_id is not None else None
+        self._actor_id = _text(actor_id, "actor_id") if actor_id is not None else None
         self._values = {}
         self._visits = {}
         self._edges = {}
@@ -100,6 +105,8 @@ class OriginalNPCPolicy:
 
     def propose(self, observation: Mapping) -> dict[str, str]:
         obs = _observation(observation)
+        if self._world_id is not None and obs["world_id"] != self._world_id:
+            raise ValueError("policy world binding mismatch")
         def visible(command: str) -> bool:
             verb, _, arg = command.partition(" ")
             direction = arg.lower() if verb.lower() == "go" else verb.lower()
@@ -138,6 +145,8 @@ class OriginalNPCPolicy:
         prior, later = _observation(before), _observation(after)
         if prior["world_id"] != later["world_id"]:
             raise ValueError("world mismatch")
+        if self._world_id is not None and prior["world_id"] != self._world_id:
+            raise ValueError("policy world binding mismatch")
         if command not in prior["allowed_commands"]:
             raise ValueError("command not explicitly authorized")
         if isinstance(reward, bool) or not isinstance(reward, (float, int)) or not math.isfinite(reward) or abs(reward) > 10:
@@ -173,3 +182,122 @@ class OriginalNPCPolicy:
             "edges": {encoded(key): v for key, v in sorted(self._edges.items())},
             "receipts": len(self._receipts),
         }
+
+    def export_checkpoint(self) -> dict[str, object]:
+        """Host-requested, complete JSON-safe state; never writes on its own.
+
+        Only actor/world-bound policy instances may be persisted. This includes
+        the original receipt evidence, so a restart cannot silently retrain an
+        already-consumed action receipt.
+        """
+        if self._world_id is None or self._actor_id is None:
+            raise ValueError("checkpoint requires explicit world/actor binding")
+        world = self._world_id
+        if any(key[0] != world for key in self._values):
+            raise ValueError("cross-world policy values")
+        if any(key[0] != world for key in self._visits):
+            raise ValueError("cross-world policy visits")
+        if any(key[0] != world for key in self._edges):
+            raise ValueError("cross-world policy edges")
+        if any(key[0] != world for key in self._receipts):
+            raise ValueError("cross-world policy receipts")
+        return {
+            "schema": "realm-npc-checkpoint-v1",
+            "world_id": world,
+            "actor_id": self._actor_id,
+            "seed": self.seed,
+            "values": [list(key[1:]) + [value] for key, value in sorted(self._values.items())],
+            "visits": [list(key[1:]) + [count] for key, count in sorted(self._visits.items())],
+            "edges": [list(key[1:]) + [dest] for key, dest in sorted(self._edges.items())],
+            "receipts": [list(key[1:]) + list(evidence)
+                         for key, evidence in sorted(self._receipts.items())],
+        }
+
+    @classmethod
+    def from_checkpoint(cls, payload: Mapping, *, world_id: str,
+                        actor_id: str) -> "OriginalNPCPolicy":
+        """Strict restoration of validated host-custodied state, not authority.
+
+        A checkpoint is untrusted data; it cannot change the host's expected
+        world/actor binding. A hash in an outer file is corruption detection,
+        not authentication against an attacker who can rewrite the file.
+        """
+        world = _text(world_id, "world_id")
+        actor = _text(actor_id, "actor_id")
+        expected = {"schema", "world_id", "actor_id", "seed", "values",
+                    "visits", "edges", "receipts"}
+        if not isinstance(payload, Mapping) or set(payload) != expected:
+            raise ValueError("invalid checkpoint fields")
+        if payload["schema"] != "realm-npc-checkpoint-v1":
+            raise ValueError("checkpoint schema mismatch")
+        if payload["world_id"] != world or payload["actor_id"] != actor:
+            raise ValueError("checkpoint world/actor binding mismatch")
+        learned = cls(payload["seed"], world_id=world, actor_id=actor)
+
+        def bounded_rows(name: str, limit: int, width: int) -> list:
+            rows = payload[name]
+            if not isinstance(rows, list) or len(rows) > limit:
+                raise ValueError(f"invalid {name} count")
+            if any(not isinstance(row, list) or len(row) != width for row in rows):
+                raise ValueError(f"invalid {name} row")
+            return rows
+
+        def room(value: object) -> str:
+            return _text(value, "checkpoint room")
+
+        def command(value: object) -> str:
+            if not isinstance(value, str) or not _valid_command(value):
+                raise ValueError("invalid checkpoint command")
+            return value
+
+        def action_key(row: list) -> tuple:
+            origin = room(row[0])
+            kind, target = row[1:3]
+            if not isinstance(kind, str) or kind not in {"explore", "reach", "take"}:
+                raise ValueError("invalid checkpoint goal")
+            if not isinstance(target, str) or len(target) > 128 or not all(c.isprintable() for c in target):
+                raise ValueError("invalid checkpoint target")
+            return (world, origin, kind, target, command(row[3]))
+
+        for row in bounded_rows("values", 16384, 5):
+            key = action_key(row)
+            value = row[4]
+            if (key in learned._values or type(value) not in (float, int)
+                    or not math.isfinite(value) or abs(value) > 10):
+                raise ValueError("invalid or duplicate checkpoint value")
+            learned._values[key] = float(value)
+
+        for row in bounded_rows("visits", 16384, 5):
+            key = action_key(row)
+            count = row[4]
+            if key in learned._visits or type(count) is not int or not 1 <= count <= 4096:
+                raise ValueError("invalid or duplicate checkpoint visits")
+            learned._visits[key] = count
+        if set(learned._values) != set(learned._visits):
+            raise ValueError("checkpoint values/visits disagree")
+
+        for row in bounded_rows("edges", 4096, 3):
+            origin, move, dest = room(row[0]), command(row[1]), room(row[2])
+            verb = move.partition(" ")[0].casefold()
+            if verb not in _DIRECTIONS | _SHORT | {"go"}:
+                raise ValueError("checkpoint edge must be movement")
+            key = (world, origin, move)
+            if key in learned._edges:
+                raise ValueError("duplicate checkpoint edge")
+            learned._edges[key] = dest
+
+        for row in bounded_rows("receipts", 4096, 5):
+            rid, source, move, dest, reward = row
+            key = (world, _text(rid, "receipt_id"))
+            if (key in learned._receipts or type(reward) not in (int, float)
+                    or not math.isfinite(reward) or abs(reward) > 10):
+                raise ValueError("invalid or duplicate checkpoint receipt")
+            learned._receipts[key] = (room(source), command(move), room(dest), float(reward))
+
+        if sum(learned._visits.values()) != len(learned._receipts):
+            raise ValueError("checkpoint receipt and visit totals disagree")
+        observed_moves = {(r[0], r[1], r[2]) for r in learned._receipts.values()}
+        if any((key[1], key[2], dest) not in observed_moves
+               for key, dest in learned._edges.items()):
+            raise ValueError("checkpoint edge not supported by a receipt")
+        return learned

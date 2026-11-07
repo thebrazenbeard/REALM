@@ -2,6 +2,8 @@
 
 Compatible with REALM ``ResidentController.validate`` and ``commit`` on
 ``thebrazenbeard/REALM`` main 09fc7cf6fcd8f7826c315d69c045467f27a7c8c7.
+When available, ``commit_with_receipt`` provides same-transaction provenance
+of a newly inserted action receipt versus replay (REALM PR #49 candidate).
 This file intentionally does not import Engine, SQLite, or a model runtime.
 
 A trusted host creates/provisions the controller, supplies an authorized
@@ -24,6 +26,11 @@ class ResidentControllerLike(Protocol):
     def validate(self, proposal: Mapping[str, object]) -> object: ...
 
     def commit(self, proposal: Mapping[str, object], *, action_id: str) -> str: ...
+
+
+class AtomicCommitResultLike(Protocol):
+    response: str
+    receipt_created: bool
 
 
 class ResidentPolicyLike(Protocol):
@@ -68,9 +75,9 @@ class ResidentTurnHost:
         self._observer = observer
         self._policy = policy
         self._evaluator = outcome_evaluator
-        # Host-owned actor/world-scoped persisted receipt lookup. It must be
-        # coordinated with same-actor writers; a read by itself is not an
-        # atomic cross-process claim of first execution.
+        # Optional legacy diagnostic lookup, actor/world scoped by the host.
+        # A precommit read is NEVER proof that the subsequently committed
+        # action inserted a new receipt, even if a scheduler usually serializes.
         self._receipt_exists = receipt_exists
         self._pending: dict[str, tuple[str, dict[str, object]]] = {}
         self._completed: dict[str, TurnResult] = {}
@@ -150,20 +157,38 @@ class ResidentTurnHost:
         # A REALM ResidentController applies its separate verb and syntax gate.
         self._controller.validate(envelope)
         preexisting: bool | None = None
-        if self._receipt_exists is not None:
-            try:
-                preexisting = self._receipt_exists(action_id)
-            except Exception as exc:
-                raise ValueError("Trusted receipt witness failed before commit") from exc
-            if type(preexisting) is not bool:
-                raise ValueError("Trusted receipt witness must return bool")
-        response = self._controller.commit(envelope, action_id=action_id)
+        atomic_created: bool | None = None
+        atomic_commit = getattr(self._controller, "commit_with_receipt", None)
+        if atomic_commit is not None:
+            if not callable(atomic_commit):
+                raise ValueError("Resident atomic commit is not callable")
+            # The Engine identifies receipt creation under the same SQLite
+            # write lock as gameplay mutation. Never use a racy preflight
+            # receipt lookup when this authoritative transaction API exists.
+            committed: AtomicCommitResultLike = atomic_commit(envelope, action_id=action_id)
+            response = getattr(committed, "response", None)
+            atomic_created = getattr(committed, "receipt_created", None)
+            if not isinstance(response, str) or type(atomic_created) is not bool:
+                raise ValueError("Resident atomic commit returned invalid provenance")
+        else:
+            # Legacy controller: the host may provide a precommit witness,
+            # but it cannot eliminate races with independent host processes.
+            if self._receipt_exists is not None:
+                try:
+                    preexisting = self._receipt_exists(action_id)
+                except Exception as exc:
+                    raise ValueError("Trusted receipt witness failed before commit") from exc
+                if type(preexisting) is not bool:
+                    raise ValueError("Trusted receipt witness must return bool")
+            response = self._controller.commit(envelope, action_id=action_id)
         status = (
-            "replayed_receipt" if preexisting is True else
+            "replayed_receipt" if atomic_created is False or preexisting is True else
             "disabled" if self._evaluator is None else
-            "receipt_unverified" if preexisting is None else "disabled"
+            "receipt_unverified" if atomic_created is None else "disabled"
         )
-        if (self._evaluator is not None and preexisting is False
+        # Only transaction-coupled insertion provenance licenses learning.
+        # A legacy receipt_exists=False observation is intrinsically racy.
+        if (self._evaluator is not None and atomic_created is True
                 and callable(getattr(self._policy, "learn", None))):
             try:
                 after = self._snapshot()
@@ -175,7 +200,7 @@ class ResidentTurnHost:
                         copy.deepcopy(before), command, copy.deepcopy(after),
                         reward=float(reward), receipt_id=action_id,
                     )
-                    status = "learned_with_host_witness" if accepted else "not_learned"
+                    status = "learned_with_atomic_receipt" if accepted else "not_learned"
             except Exception:
                 # The world action already committed; never replay it because
                 # an optional learning/evaluation step failed.

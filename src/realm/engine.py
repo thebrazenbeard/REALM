@@ -7,6 +7,7 @@ import re
 import sqlite3
 import time
 from contextlib import closing
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from functools import lru_cache
 from pathlib import Path
@@ -102,6 +103,20 @@ def _pristine_schema(extra_sql: str = "") -> dict[str, tuple[str, str, str | Non
         return _schema_snapshot(db)
 
 
+@dataclass(frozen=True)
+class ActionReceiptResult:
+    """Engine transaction result, with receipt provenance from the same lock.
+
+    ``receipt_created`` is true only when this action inserted its receipt in
+    the SQLite transaction. A replay of an existing actor/action ID is false,
+    even if another worker committed it between this caller's observations.
+    This is local SQLite evidence, not a statement about model reasoning.
+    """
+
+    response: str
+    receipt_created: bool
+
+
 class Engine:
     """One database file is one isolated REALM instance.
 
@@ -194,9 +209,23 @@ class Engine:
         Action IDs are scoped to an actor and MUST be unique per logical command.
         This is local action deduplication, not network authentication.
         """
+        return self._act_result(name, raw_command, action_id=action_id).response
+
+    def act_with_receipt(self, name: str, raw_command: str, *, action_id: str) -> ActionReceiptResult:
+        """Execute through the regular Engine transaction and report new/replay.
+
+        An action ID is required. The receipt lookup, world mutation, and
+        receipt insertion happen under one SQLite ``BEGIN IMMEDIATE`` lock.
+        The legacy ``act`` API remains response-only.
+        """
+        if not isinstance(action_id, str) or not 1 <= len(action_id) <= 128:
+            raise ValueError("Action IDs must be nonempty strings up to 128 characters")
+        return self._act_result(name, raw_command, action_id=action_id)
+
+    def _act_result(self, name: str, raw_command: str, *, action_id: str | None) -> ActionReceiptResult:
         command = raw_command.strip()
         if not command:
-            return "Enter a command. Type 'help' for options."
+            return ActionReceiptResult("Enter a command. Type 'help' for options.", False)
         verb, _, arg = command.partition(" ")
         verb = verb.casefold()
         arg = arg.strip()
@@ -210,7 +239,7 @@ class Engine:
         if action_id is not None and (not isinstance(action_id, str) or not 1 <= len(action_id) <= 128):
             raise ValueError("Action IDs must be nonempty strings up to 128 characters")
         if verb in {"quit", "exit"}:
-            return "Goodbye. Your position is saved."
+            return ActionReceiptResult("Goodbye. Your position is saved.", False)
         with closing(self._connect()) as db, db:
             # Serialize competing actions such as two players taking one object.
             db.execute("BEGIN IMMEDIATE")
@@ -226,14 +255,14 @@ class Engine:
                 if receipt is not None:
                     if receipt["command"] != command:
                         raise ValueError("Action ID already used for a different command")
-                    return receipt["response"]
+                    return ActionReceiptResult(receipt["response"], False)
             response = self._perform(db, actor, room_id, verb, arg)
             if action_id is not None:
                 db.execute(
                     "INSERT INTO action_receipts (actor,action_id,command,response) VALUES (?,?,?,?)",
                     (actor, action_id, command, response),
                 )
-            return response
+            return ActionReceiptResult(response, action_id is not None)
 
     def _perform(self, db: sqlite3.Connection, actor: str, room_id: str, verb: str, arg: str) -> str:
             if verb in {"look", "l"}:

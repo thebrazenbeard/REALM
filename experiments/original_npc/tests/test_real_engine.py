@@ -9,7 +9,9 @@ import os
 import sqlite3
 import sys
 import tempfile
+import threading
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing
 from pathlib import Path
 
@@ -104,7 +106,7 @@ class ActualEngineNPCIntegrationTests(unittest.TestCase):
         self.assertIn("Corridor", first.response)
         self.assertEqual("corridor", self._room())
         self.assertEqual("atrium", self._room("Ember"))
-        self.assertEqual("learned_with_host_witness", first.learning_status)
+        self.assertEqual("learned_with_atomic_receipt", first.learning_status)
         self.assertEqual(1, self.policy.export_state()["receipts"])
         moss_events = len(self._rows("SELECT id FROM events WHERE actor='Moss'"))
         self.assertEqual(before_events + 2, moss_events)  # departure + arrival
@@ -118,7 +120,7 @@ class ActualEngineNPCIntegrationTests(unittest.TestCase):
         self.assertEqual("go east", second.command)
         self.assertIn("Workshop", second.response)
         self.assertEqual("workshop", self._room())
-        self.assertEqual("learned_with_host_witness", second.learning_status)
+        self.assertEqual("learned_with_atomic_receipt", second.learning_status)
         self.assertEqual(2, self.policy.export_state()["receipts"])
 
         # Every actual command is in the actor-scoped Engine receipt table.
@@ -153,7 +155,7 @@ class ActualEngineNPCIntegrationTests(unittest.TestCase):
         original = self._host(observer=speak_only_observer)
         first = original.step(action_id="restart-receipt-1")
         self.assertEqual("say The arch remembers.", first.command)
-        self.assertEqual("learned_with_host_witness", first.learning_status)
+        self.assertEqual("learned_with_atomic_receipt", first.learning_status)
         self.assertEqual(1, self.policy.export_state()["receipts"])
         speech_events = len(self._rows(
             "SELECT id FROM events WHERE actor=? AND kind='say'", ("Moss",),
@@ -177,6 +179,48 @@ class ActualEngineNPCIntegrationTests(unittest.TestCase):
             "SELECT action_id FROM action_receipts WHERE actor=? AND action_id=?",
             ("Moss", "restart-receipt-1"),
         )))
+
+    def test_two_concurrent_hosts_same_receipt_train_at_most_once(self):
+        barrier = threading.Barrier(2)
+
+        class BarrierPolicy(OriginalNPCPolicy):
+            def propose(self, observation):
+                proposal = super().propose(observation)
+                barrier.wait(timeout=5)
+                return proposal
+
+        def speaker_observer():
+            observation = self._observe()
+            observation["allowed_commands"] = ["say Only one event."]
+            return observation
+
+        policies = [BarrierPolicy(seed=21), BarrierPolicy(seed=22)]
+        hosts = [
+            self._host(observer=speaker_observer, policy=policies[i],
+                       engine=Engine(self.db_path))
+            for i in range(2)
+        ]
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            first_future = pool.submit(hosts[0].step, action_id="same-concurrent-receipt")
+            second_future = pool.submit(hosts[1].step, action_id="same-concurrent-receipt")
+            outcomes = [first_future.result(timeout=12), second_future.result(timeout=12)]
+
+        self.assertEqual(
+            ["learned_with_atomic_receipt", "replayed_receipt"],
+            sorted(result.learning_status for result in outcomes),
+        )
+        self.assertEqual(outcomes[0].response, outcomes[1].response)
+        self.assertEqual(
+            1,
+            len(self._rows(
+                "SELECT action_id FROM action_receipts WHERE actor=? AND action_id=?",
+                ("Moss", "same-concurrent-receipt"),
+            )),
+        )
+        self.assertEqual(
+            1, len(self._rows("SELECT id FROM events WHERE actor='Moss' AND kind='say'")),
+        )
+        self.assertEqual(1, sum(p.export_state()["receipts"] for p in policies))
 
 
 if __name__ == "__main__":
