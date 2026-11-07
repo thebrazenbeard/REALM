@@ -6,12 +6,14 @@ import base64
 from contextlib import closing
 import hashlib
 import json
+import os
 from pathlib import Path
 import sqlite3
 import subprocess
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from workbridge_mcp52_driver import DriverError, call, config_from_file  # noqa: E402
@@ -33,6 +35,7 @@ for line in sys.stdin:
                 "arguments": row["params"]["arguments"],
                 "world_id": os.environ["REALM_WORLD_ID"],
                 "db": os.environ["REALM_DB_PATH"],
+                "allowed": os.environ["REALM_MCP_ALLOWED_TOOLS"],
                 "digest": hashlib.sha256(os.environ["REALM_PLAYER_TOKEN"].encode()).hexdigest()}) + "\\n")
         data = {"isError": False, "content": [{"type":"text", "text":"Ancient gate, covered in vines."}],
                 "structuredContent": {"ok": True, "text":"Ancient gate, covered in vines.", "cursor": 17}}
@@ -100,6 +103,36 @@ class WorkBridgeMCP52Tests(unittest.TestCase):
         self.assertFalse(inventory["mutating"])
         self.assertTrue(move["mutating"])
         self.assertEqual(self.calls()[-1]["arguments"], {"direction":"north", "action_id":"move-77"})
+
+    def test_child_allowlist_is_single_requested_tool_even_with_hostile_inherited_env(self):
+        with patch.dict(os.environ, {"REALM_MCP_ALLOWED_TOOLS": "realm_admin,realm_say"}):
+            call(config_from_file(self.configfile), {"tool": "realm_status", "arguments": {}})
+            call(config_from_file(self.configfile), {"tool": "realm_look", "arguments": {}})
+            call(config_from_file(self.configfile), {"tool": "realm_move", "arguments": {
+                "direction": "north", "action_id": "strict-single-tool-001"}})
+        self.assertEqual([row["allowed"] for row in self.calls()],
+                         ["realm_status", "realm_look", "realm_move"])
+        self.assertEqual(self.calls()[-1]["arguments"]["action_id"], "strict-single-tool-001")
+
+    def test_post_dispatch_iserror_is_uncertain_for_mutations_only(self):
+        self.server.write_text(
+            'import json,sys\n'
+            'for line in sys.stdin:\n'
+            ' row=json.loads(line)\n'
+            ' if row["method"]=="initialize": result={"serverInfo":{"name":"realm-local"}}\n'
+            ' elif row["method"]=="tools/list": result={"tools":[{"name":"realm_look"},{"name":"realm_move"}]}\n'
+            ' else: result={"isError":True,"content":[{"type":"text","text":"action unavailable"}]}\n'
+            ' print(json.dumps({"jsonrpc":"2.0","id":row["id"],"result":result}),flush=True)\n',
+            encoding="utf-8")
+        cases = (
+            ({"tool": "realm_look", "arguments": {}}, "MCP_ACTION_REJECTED"),
+            ({"tool": "realm_move", "arguments": {
+                "direction": "north", "action_id": "ambiguous-001"}}, "MCP_OUTCOME_INDETERMINATE"),
+        )
+        for request, expected in cases:
+            with self.subTest(request=request), self.assertRaises(DriverError) as caught:
+                call(config_from_file(self.configfile), request)
+            self.assertEqual(caught.exception.code, expected)
 
     def test_tool_and_actor_injection_denied(self):
         for request in (

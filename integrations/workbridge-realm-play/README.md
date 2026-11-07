@@ -53,6 +53,57 @@ The adapter reads the file locally and passes it to PR #52 via
 the target checkout, world, character, exact credential source, and host-bound
 invocation have been independently qualified.
 
+## Host-pinned, read-only REALM Play candidate (not installed)
+
+`host_pinned_readonly.py` is a **separate, narrow proposed host entrypoint**
+for an initial ChatGPT gameplay connection. It delegates to the existing
+WorkBridge MCP driver but permits only `realm_status` and `realm_look`, with
+empty arguments. Neither creates, joins, moves, speaks, submits an arbitrary
+game command, inspects history/feed/map, nor mutates the world. It rejects
+every other tool, extra game argument, duplicate JSON key and oversized
+payload before it reads the host-private config or token. A test covers an
+attempt to override the world/actor via request and process environment.
+
+Unlike the general-purpose driver below, this narrow entrypoint accepts
+**no `--config` option** and resolves a fixed `host_binding.json` adjacent to
+the *installed* wrapper. The binding uses the configuration schema above and
+must be provisioned privately by the host owner. It is excluded from Git.
+The wrapper rejects a mismatched actor/token/world during read-only
+preflight and checks the returned status world ID and player. The response
+still labels `game_text` and `game_data` as untrusted in-world content.
+`realm_look` is projected to **only** `ok` and the existing room `text`;
+the engine's global event `cursor` and any future metadata fields are
+omitted from both result surfaces. `realm_status` is projected to the pinned
+world/actor and its text is generated locally from those values, not copied
+from an untrusted backend content block. This prevents a metadata cursor
+from revealing off-room activity; it cannot sanitize arbitrary words embedded
+inside the game's room description without also altering game content.
+
+**Host policy remains mandatory.** The script alone is not an access-control
+list: the host must install immutable/protected copies of the wrapper and
+driver, a privately owned binding and token file, and a fixed-command tool
+allowlisting *only* this wrapper and its request payload. The ChatGPT-facing
+principal must have no generic shell/command runner, no option to invoke the
+broader driver, no write access to the installed Python files/config/token,
+and no permission to select a different command or working directory.
+The exact host tool capability and ACL require separate live readback.
+Do not publish or install this candidate solely because source tests pass.
+
+An example shape for a fixed WorkBridge invocation, where the host owns the
+script path and injects only an opaque generated request value, is:
+
+```text
+<protected-python> -B <protected-host-pinned-readonly.py> --request-b64=<game-request>
+```
+
+The nonsecret request JSON is either `{"tool":"realm_status","arguments":{}}`
+or `{"tool":"realm_look","arguments":{}}`; base64url is transport encoding,
+not authentication. Host-only world selection is entirely in the protected
+binding. Release gates: protected command + file ACL readback; pinned
+world/actor/token verification; unauthorized command/config bypass probes;
+real backend and plugin transport tests on disposable world; then explicit
+authorization before persistent-world play.
+
 ## One-shot invocation
 
 The host starts the script with its **fixed private** `--config` path, then
