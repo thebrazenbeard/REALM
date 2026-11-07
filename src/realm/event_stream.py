@@ -116,14 +116,19 @@ class FeedWaitHandler(GatewayHandler):
             return room, int(entry)
 
     def do_GET(self) -> None:  # noqa: N802
-        if urlsplit(self.path).path != "/api/v1/feed/wait":
+        path = urlsplit(self.path).path
+        if path not in {"/api/v1/feed/wait", "/api/v1/feed"}:
             super().do_GET()
             return
+        # The legacy endpoint must share event-time audience enforcement.
+        # Falling through to GatewayHandler would disclose pre-entry history.
         principal = self._gate()
         if principal is None:
             return
         try:
             after, wait_ms, claimed = self._query()
+            if path == "/api/v1/feed":
+                wait_ms = 0  # Preserve immediate legacy polling semantics.
         except ValueError as exc:
             self._send(400, {"ok": False, "error": str(exc)})
             return

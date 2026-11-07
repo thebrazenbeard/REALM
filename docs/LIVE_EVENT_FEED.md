@@ -51,12 +51,15 @@ an active service from another thread.
   and at most 32 globally (default 8); immediate zero-wait reads skip slots.
 
 **Scope:** authenticated player, bound world SQLite DB, and current room.
-The long-poll endpoint independently requires a provable latest `join`/`move`
-arrival in that room and suppresses every event before that arrival, including
-events occurring during any absence before re-entry. If no arrival is provable,
-it fails closed. The existing `/api/v1/feed` has broader historical current-room
-visibility; this endpoint does not change that pre-existing route or introduce a
-formal per-event recipient-grant ledger. Do not treat a cursor as permission.
+On the opt-in `FeedWaitServer`, BOTH `/api/v1/feed/wait` and legacy
+`/api/v1/feed` require a provable latest `join`/`move` arrival in the
+current room, and suppress events before that arrival, including absence
+windows before re-entry. Both fail closed without arrival evidence. The legacy
+route remains immediate (no wait), so an older client cannot bypass the feed's
+event-time room-entry protection. The ordinary `GatewayServer` retains its
+pre-existing broader current-room historical feed; do not expose that separate
+server as a privacy-qualified alternative. Neither route implements a formal
+per-event recipient-grant ledger. A cursor never grants permission.
 The existing v1 gateway provides no token expiry, public HTTPS/TLS, or anti-abuse
 identity registration. This remains for trusted **localhost** use only.
 Never expose it directly to the public Internet.
