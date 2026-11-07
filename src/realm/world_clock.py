@@ -189,7 +189,7 @@ class WorldClock:
         stamp = _stamp(now)
         with self._connect() as db:
             db.execute("BEGIN IMMEDIATE")
-            state = db.execute("SELECT last_utc FROM clock_state WHERE id=1").fetchone()
+            state = db.execute("SELECT last_utc FROM main.clock_state WHERE id=1").fetchone()
             if state is not None:
                 prior = datetime.fromisoformat(state["last_utc"])
                 elapsed = (now - prior).total_seconds()
@@ -198,7 +198,7 @@ class WorldClock:
                 if elapsed > _MAX_FORWARD_SECONDS and not acknowledge_forward_jump:
                     raise ClockSkewError("UTC advanced more than 24 hours; host acknowledgment required")
             rows = db.execute(
-                "SELECT * FROM clock_events WHERE processed_utc IS NULL AND due_utc <= ? "
+                "SELECT * FROM main.clock_events WHERE processed_utc IS NULL AND due_utc <= ? "
                 "ORDER BY due_utc, event_id LIMIT ?", (stamp, limit),
             ).fetchall()
             processed = []
@@ -206,7 +206,7 @@ class WorldClock:
                 event = _event(row)
                 handler(db, event)
                 updated = db.execute(
-                    "UPDATE clock_events SET processed_utc=? "
+                    "UPDATE main.clock_events SET processed_utc=? "
                     "WHERE event_id=? AND processed_utc IS NULL",
                     (stamp, event.event_id),
                 )
@@ -214,7 +214,7 @@ class WorldClock:
                     raise RuntimeError("A clock receipt changed during host transaction")
                 processed.append(event)
             db.execute(
-                "INSERT INTO clock_state(id,last_utc) VALUES(1,?) "
+                "INSERT INTO main.clock_state(id,last_utc) VALUES(1,?) "
                 "ON CONFLICT(id) DO UPDATE SET last_utc=excluded.last_utc",
                 (stamp,),
             )
