@@ -30,7 +30,9 @@ back together. Nested savepoint also rolls back partial writes on caught faults.
   `NpcRosterGatherResult` and verifies executed/WAIT counts plus each exact
   actor/action receipt **inside the same writer transaction** before acknowledging
   the clock event. Swallowed handler failures and fabricated/no-receipt outcomes
-  abort the entire tick batch; valid all-WAIT outcomes remain permitted.
+  abort the entire tick batch; valid WAIT entries in mixed rosters remain permitted.
+  The current allocation planner rejects zero harvestable sites, so an all-WAIT
+  plan is not currently executable through the proposal interface.
   Host code should still propagate failures rather than concealing them.
 - This is an accidental host-integration safeguard, not a replacement for
   host permit issuance, owner consent, or a protected external witness.
