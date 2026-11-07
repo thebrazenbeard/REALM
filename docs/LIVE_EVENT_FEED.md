@@ -47,15 +47,18 @@ an active service from another thread.
 - On bearer revocation/rotation while waiting, HTTP 401; stop returns 503.
   Invalid params return 400; occupied waiter slots return 429.
 - The request is read-only. Per-request reads are bounded by the base gateway's
-  100-event cap; semaphore slots are capped at 32, default 8.
+  100-event cap. Waiting connections have 2 slots per authenticated player
+  and at most 32 globally (default 8); immediate zero-wait reads skip slots.
 
-**Scope:** only the authenticated player's current room in the world's bound
-SQLite DB, as enforced by the current `Gateway.feed`. Room movement changes
-what the player is allowed to read. This is not historical audience-grant replay;
-do not treat prior room occupancy or cursor possession as a private authorization.
-The existing v1 gateway provides no token expiry, public HTTPS/TLS, anti-abuse
-identity registration, or historical per-recipient delivery ledger. The endpoint
-inherits those limits and therefore remains for trusted **localhost** use only.
+**Scope:** authenticated player, bound world SQLite DB, and current room.
+The long-poll endpoint independently requires a provable latest `join`/`move`
+arrival in that room and suppresses every event before that arrival, including
+events occurring during any absence before re-entry. If no arrival is provable,
+it fails closed. The existing `/api/v1/feed` has broader historical current-room
+visibility; this endpoint does not change that pre-existing route or introduce a
+formal per-event recipient-grant ledger. Do not treat a cursor as permission.
+The existing v1 gateway provides no token expiry, public HTTPS/TLS, or anti-abuse
+identity registration. This remains for trusted **localhost** use only.
 Never expose it directly to the public Internet.
 
 ## Client retry

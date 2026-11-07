@@ -171,6 +171,33 @@ class FeedWaitTests(unittest.TestCase):
         self.assertEqual(200, status)
         self.assertTrue(any("Private corridor message" in e["text"] for e in other["events"]))
 
+    def test_does_not_replay_room_speech_before_player_first_enters(self):
+        self.gateway.command("Vera", "north", "vera-enters")
+        self.gateway.command("Vera", "say Before Patrick arrived", "before-enter")
+        self.gateway.command("Patrick", "north", "patrick-enters")
+        status, feed = self.send(self.url(after=0, wait_ms=0))
+        self.assertEqual(200, status)
+        self.assertFalse(any("Before Patrick arrived" in e["text"] for e in feed["events"]))
+        self.assertTrue(any(e["actor"] == "Patrick" and e["kind"] == "move" for e in feed["events"]))
+
+    def test_does_not_replay_absence_window_on_reentry(self):
+        self.gateway.command("Vera", "north", "vera-enters")
+        self.gateway.command("Patrick", "north", "patrick-enters")
+        self.gateway.command("Patrick", "south", "patrick-exits")
+        self.gateway.command("Vera", "say During Patrick absence", "during-absence")
+        self.gateway.command("Patrick", "north", "patrick-reenters")
+        status, feed = self.send(self.url(after=0, wait_ms=0))
+        self.assertEqual(200, status)
+        self.assertFalse(any("During Patrick absence" in e["text"] for e in feed["events"]))
+        self.assertTrue(any(e["actor"] == "Patrick" and e["kind"] == "move" for e in feed["events"]))
+
+    def test_absent_arrival_evidence_fails_closed(self):
+        with closing(self.gateway.engine._connect()) as db, db:
+            db.execute("DELETE FROM events WHERE actor='Patrick' AND kind='join'")
+        status, result = self.send(self.url(after=0, wait_ms=0))
+        self.assertEqual(400, status)
+        self.assertIn("No provable current-room arrival", result["error"])
+
     def test_world_binding_stops_cross_world_replay(self):
         with self.assertRaisesRegex(ValueError, "different world_id"):
             Gateway(self.db, world_id="two")
@@ -190,6 +217,34 @@ class FeedWaitTests(unittest.TestCase):
                     server_limit.release()
         finally:
             self.server.feed_slots.release()
+
+    def test_one_player_cannot_starve_another_waiter(self):
+        cursor = self.gateway.cursor()
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            first = pool.submit(self.send, self.url(after=cursor, wait_ms=1200))
+            second = pool.submit(self.send, self.url(after=cursor, wait_ms=1200))
+            time.sleep(0.18)
+            with self.server.player_wait_lock:
+                self.assertEqual(2, self.server.player_wait_counts.get("Patrick"))
+            status, _ = self.send(self.url(after=cursor, wait_ms=50))
+            self.assertEqual(429, status)
+            # Vera must still receive an actual *waiting* slot, not just a
+            # synchronous zero-wait bypass.
+            status, response = self.send(self.url(after=cursor, wait_ms=90), token="Vera")
+            self.assertEqual(200, status)
+            self.assertEqual([], response["events"])
+            self.assertEqual(200, first.result(timeout=2)[0])
+            self.assertEqual(200, second.result(timeout=2)[0])
+        self.assertEqual({}, self.server.player_wait_counts)
+
+    def test_rapid_reconnect_releases_all_waiter_slots(self):
+        cursor = self.gateway.cursor()
+        for _ in range(20):
+            status, response = self.send(self.url(after=cursor, wait_ms=1))
+            self.assertEqual(200, status)
+            self.assertEqual([], response["events"])
+        self.assertEqual({}, self.server.player_wait_counts)
+        self.assertEqual(8, self.server.feed_slots._value)
 
     def test_get_query_cannot_inject_gameplay_commands(self):
         before = self.gateway.cursor()
