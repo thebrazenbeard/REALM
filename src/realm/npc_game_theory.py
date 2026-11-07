@@ -49,6 +49,9 @@ def choose_economic_site(
     p_same is Laplace-smoothed opponent *past successful gather* frequency
     (not proof of opponent intent or a current-round secret). The factor 1/2
     assumes fair random ordering on collisions; REALM does not enforce it.
+    Complementary tie choices are limited to exact *two-actor* symmetric
+    scores, not an N-player equilibrium, coalition policy, or guarantee of
+    collision-freedom after dynamic world changes.
     This function never executes the proposal or creates gameplay authority.
     """
     if type(expected_world_id) is not str or not expected_world_id:
@@ -152,7 +155,13 @@ def choose_economic_site(
         scores = [Fraction(numerator, denominator) for numerator in numerators]
         max_score = max(scores)
         winners = [idx for idx, score in enumerate(scores) if score == max_score]
-        selected = random.Random(seed).choice(winners)
+        # Symmetric pairwise planners sharing a host seed must not draw the
+        # same tied site merely because their PRNG state starts identically.
+        # Sort by site identity so different offered tuple orders agree.
+        winners.sort(key=lambda idx: (sites[idx].room_id, sites[idx].material))
+        start = random.Random(seed).randrange(len(winners))
+        offset = 1 if actor_id.casefold() > rival_id.casefold() and len(winners) > 1 else 0
+        selected = winners[(start + offset) % len(winners)]
         evidence = json.dumps({
             "schema": "realm.npc.economic_snapshot.v1", "world_id": expected_world_id,
             "actor": actor_id, "opponent": rival_id,

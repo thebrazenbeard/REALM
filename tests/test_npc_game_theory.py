@@ -110,6 +110,76 @@ class HostGameTheoryBridgeTests(unittest.TestCase):
         self.assertEqual(self.crafting.perform("Ada", "gather wood", action_id="host-ada-gather"), response)
         self.assertEqual(self.pouch("Ada", "wood"), 3)
 
+    def test_symmetric_two_actor_tie_does_not_self_coordinate_on_one_scarce_site(self):
+        # Identical seed and tie: raw PRNG draws previously collided, leaving
+        # half the harvest unused. Real receipts now witness both full batches.
+        with closing(sqlite3.connect(self.db)) as db, db:
+            db.execute("UPDATE gathering_nodes SET remaining=3")
+        event_id = self.watermark()
+        proposals = [
+            choose_economic_site(
+                self.db, expected_world_id="strategy_fixture",
+                actor=actor, opponent=rival, sites=SITES,
+                observed_through_event=event_id, seed=23,
+            ) for actor, rival in (("Ada", "Ben"), ("Ben", "Ada"))
+        ]
+        self.assertEqual(proposals[0].forecast_numerator * proposals[1].forecast_denominator,
+                         proposals[1].forecast_numerator * proposals[0].forecast_denominator)
+        self.assertNotEqual(proposals[0].site, proposals[1].site)
+        reordered = choose_economic_site(
+            self.db, expected_world_id="strategy_fixture", actor="Ben", opponent="Ada",
+            sites=tuple(reversed(SITES)), observed_through_event=event_id, seed=23,
+        )
+        self.assertEqual(reordered.site, proposals[1].site)
+        for actor, choice in zip(("Ada", "Ben"), proposals):
+            if choice.site.room_id == "corridor":
+                self.engine.act(actor, "north", action_id=f"{actor}-move")
+            response = self.crafting.perform(
+                actor, f"gather {choice.site.material}", action_id=f"{actor}-gather",
+            )
+            self.assertIn("x3", response)
+            self.assertEqual(self.pouch(actor, choice.site.material), 3)
+        self.assertEqual(self.pouch("Ada", "stone") + self.pouch("Ada", "wood")
+                         + self.pouch("Ben", "stone") + self.pouch("Ben", "wood"), 6)
+
+    def test_strict_payoff_advantage_is_not_overridden_by_tie_coordination(self):
+        with closing(sqlite3.connect(self.db)) as db, db:
+            db.execute("UPDATE gathering_nodes SET remaining=1 WHERE material='wood'")
+        offered = [
+            choose_economic_site(
+                self.db, expected_world_id="strategy_fixture", actor=a, opponent=b,
+                sites=SITES, observed_through_event=self.watermark(), seed=23,
+            ) for a, b in (("Ada", "Ben"), ("Ben", "Ada"))
+        ]
+        self.assertEqual([choice.site for choice in offered], [SITES[0], SITES[0]])
+
+    def test_three_five_eight_actor_competition_has_bounded_real_payoffs(self):
+        # Existing strategy is pairwise, not a global multi-agent auction.
+        actors = ["Ada", "Ben"] + [f"Bot{i}" for i in range(6)]
+        for actor in actors[2:]:
+            self.engine.join(actor)
+        for n in (3, 5, 8):
+            plans = lambda: [choose_economic_site(
+                self.db, expected_world_id="strategy_fixture", actor=actors[i],
+                opponent=actors[(i + 1) % n], sites=SITES,
+                observed_through_event=self.watermark(), seed=23,
+            ).site for i in range(n)]
+            first = plans()
+            self.assertEqual(first, plans())
+            # Two offered sites cannot assign eight distinct sites; explicitly
+            # preserve the pairwise scope rather than imply Nash/equilibrium.
+            self.assertGreaterEqual(n - len(set(first)), n - 2)
+            if n == 8:
+                payouts = []
+                for actor, site in zip(actors, first):
+                    if site.room_id == "corridor":
+                        self.engine.act(actor, "north", action_id=f"{actor}-move-eight")
+                    self.crafting.perform(actor, f"gather {site.material}",
+                                          action_id=f"{actor}-eight-gather")
+                    payouts.append(self.pouch(actor, site.material))
+                self.assertLessEqual(sum(payouts), 15)  # 6 stone + 9 wood
+                self.assertGreaterEqual(sum(payout == 0 for payout in payouts), 3)
+
     def test_abundant_stock_makes_a_colliding_second_gather_costless(self):
         # Host fixture stocks 9, Ben gathers 3, leaving 6; both actors can
         # obtain a full batch even if they collide on stone next.
