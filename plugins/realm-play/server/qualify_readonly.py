@@ -107,6 +107,9 @@ def qualify(env: dict[str, str]) -> dict:
     # Eliminate a parent PYTHONPATH override to keep the engine import rooted
     # in the host-selected REALM_ROOT resolved by the plugin launcher.
     child_env.pop("PYTHONPATH", None)
+    # Avoid propagating a parent-requested broad engine scope. The plugin
+    # launcher independently pins its two-tool scope on every invocation.
+    child_env.pop("REALM_MCP_ALLOWED_TOOLS", None)
     try:
         result = subprocess.run(
             [sys.executable, "-I", "-B", str(LAUNCHER)],

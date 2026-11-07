@@ -1,4 +1,4 @@
-"""Bounded two-character play through the real, local plugin stdio launcher.
+"""Trusted full-engine integration without widening the plugin's tool scope.
 
 This is a deterministic gameplay integration test, NOT an AI reasoning or
 autonomous-learning evaluation. It exercises 21 distinct committed player
@@ -20,8 +20,11 @@ import unittest
 
 PLUGIN_REPO = Path(__file__).resolve().parents[3]
 BACKEND_ROOT = Path(os.environ.get("REALM_PR52_ROOT", str(PLUGIN_REPO))).resolve()
-LAUNCHER = PLUGIN_REPO / "plugins" / "realm-play" / "server" / "realm_mcp.py"
 BACKEND_SOURCE = BACKEND_ROOT / "src" / "realm" / "mcp_server.py"
+TRUSTED_ENGINE_TOOLS = (
+    "realm_status,realm_join,realm_look,realm_inventory,realm_move,"
+    "realm_command,realm_say,realm_feed,realm_map"
+)
 
 if BACKEND_SOURCE.is_file():
     sys.path.insert(0, str(BACKEND_ROOT / "src"))
@@ -88,16 +91,19 @@ class TwoPlayerSessionTests(unittest.TestCase):
                         for index, (tool, args, _) in enumerate(steps))
 
         environment = os.environ.copy()
-        for key in ("REALM_DB", "REALM_ACTOR", "PYTHONPATH", "REALM_PLAYER_TOKEN"):
+        for key in ("REALM_DB", "REALM_ACTOR", "PYTHONPATH", "REALM_PLAYER_TOKEN",
+                    "REALM_MCP_ALLOWED_TOOLS"):
             environment.pop(key, None)
         environment.update({
             "REALM_ROOT": str(BACKEND_ROOT),
             "REALM_DB_PATH": str(self.database),
             "REALM_WORLD_ID": "two_player_test",
             "REALM_PLAYER_TOKEN": self.tokens[actor],
+            "REALM_MCP_ALLOWED_TOOLS": TRUSTED_ENGINE_TOOLS,
+            "PYTHONPATH": str(BACKEND_ROOT / "src"),
         })
         completed = subprocess.run(
-            [sys.executable, "-B", str(LAUNCHER)],
+            [sys.executable, "-B", "-m", "realm.mcp_server"],
             input="".join(json.dumps(item) + "\n" for item in requests),
             capture_output=True, text=True, env=environment,
             cwd=PLUGIN_REPO, timeout=20, check=False,

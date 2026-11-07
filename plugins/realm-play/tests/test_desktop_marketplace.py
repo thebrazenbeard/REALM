@@ -31,9 +31,9 @@ class DesktopMarketplaceTests(unittest.TestCase):
         mcp = json.loads((PLUGIN / "mcp.json").read_text(encoding="utf-8"))
         interface = manifest["extensions"]["com.openai"]["interface"]
         self.assertIn("Desktop", manifest["description"])
-        self.assertIn("nine tools", interface["longDescription"])
-        self.assertIn("two-tool", interface["longDescription"])
-        self.assertIn("host-enforced", interface["longDescription"])
+        self.assertIn("realm_status and realm_look", interface["longDescription"])
+        self.assertIn("allowlist", interface["longDescription"])
+        self.assertIn("older engines", interface["longDescription"])
         self.assertLessEqual(len(interface["shortDescription"]), 30)
         self.assertNotIn("apps", manifest["extensions"]["com.openai"])
         self.assertEqual({"realm-local"}, set(mcp["mcpServers"]))

@@ -128,6 +128,7 @@ class ReadonlyQualificationTests(unittest.TestCase):
         def fake_run(*args, **kwargs):
             self.assertEqual([sys.executable, "-I", "-B", str(SCRIPT.parent / "realm_mcp.py")],
                              args[0])
+            self.assertNotIn("REALM_MCP_ALLOWED_TOOLS", kwargs["env"])
             captured["messages"] = [json.loads(line) for line in kwargs["input"].decode().splitlines()]
             return subprocess.CompletedProcess(args[0], 0, stdout=stdout, stderr=b"")
 
