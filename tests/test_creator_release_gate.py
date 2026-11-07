@@ -82,6 +82,16 @@ class ReleaseGateTests(unittest.TestCase):
         with sqlite3.connect(self.ledger) as db:
             self.assertEqual(db.execute("SELECT count(*) FROM creator_release_staging").fetchone()[0], 1)
 
+    def test_staging_db_handle_closes_for_immediate_unlink_and_reopen(self):
+        self.stage()
+        # Windows raises WinError32 if any SQLite connection still holds it.
+        self.ledger.unlink()
+        self.assertFalse(self.ledger.exists())
+        # A physically erased ledger cannot witness global replay prevention.
+        # This second staging is intentional evidence of the documented hold.
+        again = self.stage()
+        self.assertFalse(again["unchanged"])
+
     def test_forged_or_tampered_approval_cannot_create_ledger(self):
         raw, manifest, approval, mac = fixture()
         tampered = json.loads(approval)
