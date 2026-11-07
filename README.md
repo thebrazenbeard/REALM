@@ -53,6 +53,9 @@ The current integration candidate supports:
 - Loopback HTTP with **host-provisioned, player-bound bearer credentials**;
   commands, room feeds, and map queries derive the character from the token
   (see `docs/GATEWAY_PROTOCOL.md`).
+- A local stdio MCP adapter with an explicit, fail-closed host tool allowlist;
+  the proposed ChatGPT pilot is limited to `realm_status` and `realm_look`
+  (see `docs/MCP_HOST_ALLOWLIST.md`; host deployment is not yet qualified).
 - A Pages-compatible static browser client under `docs/`, including a live map
   display. GitHub Pages does not run the game server.
 - A separately gated loopback-only Telnet adapter (`TERMINAL.md`). Its local
