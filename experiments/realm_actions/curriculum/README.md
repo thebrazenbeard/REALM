@@ -9,8 +9,11 @@ The source of truth for executable action rules is the current local REALM
 `Engine` and `ResidentController`. Every scenario has a new disposable SQLite
 world. Only the host controls resident identity, policy, action IDs, state
 mutation and receipts. Targets use visible object names, not inaccessible DB
-IDs; committed proposals are replayed with the same host action ID. This is
-evidence that target actions can be committed, **not** evidence of inference.
+IDs; the generator checks that the requested objective actually changed (or
+read) authoritative world state as expected and that replay did not alter any
+player/item state or total event/receipt counts. A receipt alone can also
+record a *failed* action, and is not counted as success here. This remains
+evidence about authored fixtures, **not** evidence of inference.
 
 ## Regenerate and test ($0, standard Python, no dependencies)
 
