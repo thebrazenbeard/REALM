@@ -8,6 +8,7 @@ independent owner witness and protected custody are required for real release.
 """
 from __future__ import annotations
 
+from contextlib import closing
 import hashlib
 import hmac
 import json
@@ -156,7 +157,9 @@ def _validate_approval(approval: dict, preview: dict, manifest_sha: str,
 def _stage_ledger(db_path: Path, approval: dict, approval_sha: str) -> bool:
     db_path.parent.mkdir(parents=True, exist_ok=True)
     try:
-        with sqlite3.connect(db_path, timeout=10.0) as db:
+        # The sqlite3.Connection context manager manages transactions only;
+        # Windows keeps its DB file locked until the handle is closed.
+        with closing(sqlite3.connect(db_path, timeout=10.0)) as db, db:
             db.execute("PRAGMA trusted_schema=OFF")
             db.execute("BEGIN IMMEDIATE")
             tables = list(db.execute(
