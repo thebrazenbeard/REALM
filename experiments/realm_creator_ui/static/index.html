@@ -1,0 +1,85 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="referrer" content="no-referrer">
+  <title>REALM Creator · Local world forge</title>
+  <link rel="stylesheet" href="/styles.css">
+  <script src="/app.js" defer></script>
+</head>
+<body>
+  <main class="shell">
+    <header class="masthead">
+      <div class="brandline"><span class="brand-mark">✦</span><span>REALM <strong>CREATOR</strong></span></div>
+      <span class="local-pill"><span class="dot"></span>LOCAL PREVIEW ONLY</span>
+    </header>
+
+    <section class="hero" aria-labelledby="page-title">
+      <div class="eyebrow">THE WORLD FORGE <span class="rule"></span> ALPHA / 01</div>
+      <h1 id="page-title">Your lore.<br><em>A world taking shape.</em></h1>
+      <p>Bring your source notes. Identify locations, examine their provenance, edit every room and proposed connection, then export a review-only REALM worldpack.</p>
+      <div class="notice" role="note"><strong>No automatic canon.</strong> This standalone localhost tool does not persist uploaded documents, authenticate canonical approval, import a world, or deploy a server.</div>
+    </section>
+
+    <div class="stages" aria-label="Creation stages">
+      <div><span class="step-number">01</span><span>UPLOAD SOURCES</span></div>
+      <div><span class="step-number">02</span><span>REVIEW PROPOSALS</span></div>
+      <div><span class="step-number">03</span><span>EXPORT DRAFT</span></div>
+    </div>
+
+    <section class="panel" aria-labelledby="upload-title">
+      <div class="panel-heading">
+        <div><span class="overline">STEP 01 / SOURCE INTAKE</span><h2 id="upload-title">Establish the world</h2></div>
+        <span class="tag">UNREVIEWED</span>
+      </div>
+      <form id="preview-form">
+        <div class="field-grid">
+          <label for="world-id">World ID <span class="detail">unique, no spaces</span>
+            <input id="world-id" name="world_id" autocomplete="off" pattern="[A-Za-z][A-Za-z0-9_-]{0,63}" maxlength="64" value="my_world" required>
+          </label>
+          <label for="world-name">World name <span class="detail">display title</span>
+            <input id="world-name" name="name" autocomplete="off" maxlength="120" placeholder="The Unwritten Expanse" required>
+          </label>
+        </div>
+        <label for="source-files" class="file-label">Source documents
+          <input id="source-files" name="sources" type="file" accept=".txt,.md,.markdown,text/plain,text/markdown" multiple required>
+          <span class="hint">1–8 UTF-8 text or Markdown files · 256 KiB each · 1 MiB combined · files remain in this local session</span>
+        </label>
+        <label for="host-token">Ephemeral host token <span class="detail">printed when the localhost Creator server starts</span>
+          <input id="host-token" name="host_token" type="password" autocomplete="off" spellcheck="false" placeholder="Paste the local Creator token" required>
+          <span class="hint">Never stored in browser storage. Not a REALM player token.</span>
+        </label>
+        <div class="form-footer">
+          <p>The source establishes evidence, not facts about geography. Location headings are candidates only.</p>
+          <button id="preview-button" type="submit">Generate preview <span aria-hidden="true">→</span></button>
+        </div>
+      </form>
+    </section>
+
+    <section class="panel review-panel" id="review-region" aria-labelledby="review-title" hidden>
+      <div class="panel-heading">
+        <div><span class="overline">STEP 02 / HUMAN REVIEW</span><h2 id="review-title">Shape what players encounter</h2></div>
+        <span class="tag warn">PROPOSAL ONLY</span>
+      </div>
+      <p class="section-copy">Each source excerpt below is unreviewed. Write a scene description for every location. Suggested exits start unchecked because they were invented for gameplay, not proven by your source.</p>
+      <div id="room-editor" class="room-list"></div>
+      <label for="review-ack" class="review-check">
+        <input id="review-ack" type="checkbox">
+        <span>I personally reviewed these descriptions and chose any proposed routes. I understand this acknowledgement is <strong>not authenticated approval</strong> or canon.</span>
+      </label>
+      <div class="form-footer">
+        <p>Only a validated, unimported worldpack is returned.</p>
+        <button id="compile-button" type="button" disabled>Compile reviewed draft <span aria-hidden="true">→</span></button>
+      </div>
+      <div class="export">
+        <span class="overline">STEP 03 / EXPORT</span>
+        <a id="download-pack" href="#" hidden>Download unimported worldpack JSON</a>
+        <p>This file is not installed. Hosting and canon still require separate authority and checks.</p>
+      </div>
+    </section>
+    <p class="status" id="status" role="status" aria-live="polite"></p>
+    <footer class="footer">REALM · Roleplaying Engine for Autonomous Living MUDs <span>LOCAL-FIRST / $0</span></footer>
+  </main>
+</body>
+</html>
