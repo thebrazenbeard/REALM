@@ -37,6 +37,11 @@ back together. Nested savepoint also rolls back partial writes on caught faults.
   Failed/missing or forged results roll back the entire tick batch, including
   any tentative actor effects or extra receipts. A partial WAIT roster is valid;
   all-WAIT is denied because the present planner requires harvestable stock.
+  After all callbacks, clock receipt updates and the clock-state write, the tick
+  rechecks every selected roster against authoritative MAIN event/UTC, actor
+  receipts and the complete attestation snapshot (including both MACs).
+  A MAIN trigger that deletes or corrupts an earlier attestation therefore
+  aborts the whole batch before commit, even if a later generic event caused it.
   Host code should still propagate failures rather than concealing them.
 - After upgrading existing worlds, the trusted host must rerun opt-in
   `WorldClock.enable()` to create the additive attestation table before using

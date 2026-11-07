@@ -430,5 +430,114 @@ class RosterUtcTests(unittest.TestCase):
         self.assertEqual(self.clock.tick(NOW, lambda db, event: None), [])
 
 
+    def test_postverify_clock_update_trigger_cannot_delete_roster_attestation(self):
+        plan = self.proposal()
+        policy, mac = self.grant(plan)
+        with closing(sqlite3.connect(self.dbpath)) as db, db:
+            db.execute("""
+                CREATE TRIGGER main.delete_attest_after_clock_ack
+                AFTER UPDATE OF processed_utc ON clock_events
+                WHEN NEW.event_id='roster_test_1'
+                BEGIN
+                    DELETE FROM npc_roster_utc_attestations
+                    WHERE event_id=NEW.event_id;
+                END
+            """)
+        with self.assertRaises(ValueError):
+            self.run_grant(policy, mac)
+        self.assertEqual(self.counts(), (0, 0, 6))
+        self.assertIsNone(self.clock.lookup("roster_test_1").processed_at)
+
+    def test_postverify_clock_update_trigger_cannot_tamper_roster_digest(self):
+        plan = self.proposal()
+        policy, mac = self.grant(plan)
+        with closing(sqlite3.connect(self.dbpath)) as db, db:
+            db.execute("""
+                CREATE TRIGGER main.tamper_attest_digest_after_clock_ack
+                AFTER UPDATE OF processed_utc ON clock_events
+                WHEN NEW.event_id='roster_test_1'
+                BEGIN
+                    UPDATE npc_roster_utc_attestations
+                    SET outcome_sha256='0000000000000000000000000000000000000000000000000000000000000000'
+                    WHERE event_id=NEW.event_id;
+                END
+            """)
+        with self.assertRaises(ValueError):
+            self.run_grant(policy, mac)
+        self.assertEqual(self.counts(), (0, 0, 6))
+        self.assertIsNone(self.clock.lookup("roster_test_1").processed_at)
+
+    def test_postverify_clock_update_trigger_cannot_tamper_valid_mac(self):
+        plan = self.proposal()
+        policy, mac = self.grant(plan)
+        with closing(sqlite3.connect(self.dbpath)) as db, db:
+            db.execute("""
+                CREATE TRIGGER main.tamper_attest_mac_after_clock_ack
+                AFTER UPDATE OF processed_utc ON clock_events
+                WHEN NEW.event_id='roster_test_1'
+                BEGIN
+                    UPDATE npc_roster_utc_attestations
+                    SET execution_mac_hex='ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff'
+                    WHERE event_id=NEW.event_id;
+                END
+            """)
+        with self.assertRaises(ValueError):
+            self.run_grant(policy, mac)
+        self.assertEqual(self.counts(), (0, 0, 6))
+        self.assertIsNone(self.clock.lookup("roster_test_1").processed_at)
+
+
+    def test_postverify_clock_state_trigger_cannot_delete_roster_attestation(self):
+        plan = self.proposal()
+        policy, mac = self.grant(plan)
+        with closing(sqlite3.connect(self.dbpath)) as db, db:
+            db.execute("""
+                CREATE TRIGGER main.delete_attest_after_clock_state
+                AFTER INSERT ON clock_state
+                BEGIN DELETE FROM npc_roster_utc_attestations; END
+            """)
+        with self.assertRaises(ValueError):
+            self.run_grant(policy, mac)
+        self.assertEqual(self.counts(), (0, 0, 6))
+        self.assertIsNone(self.clock.lookup("roster_test_1").processed_at)
+
+    def test_postverify_later_generic_batch_event_cannot_delete_roster_attestation(self):
+        from realm.npc_roster_utc_policy import perform_host_roster_gather_in_transaction
+        plan = self.proposal()
+        policy, mac = self.grant(plan, event_id="a_roster")
+        self.clock.schedule("z_generic", due_at=NOW, kind="ordinary", payload={})
+        def handler(db, event):
+            if event.kind == "npc_roster_gather":
+                return perform_host_roster_gather_in_transaction(
+                    db, event, engine=self.engine, crafting=self.crafting,
+                    policy=policy, host_key=HOST_KEY, grant_mac_hex=mac, now_utc=NOW,
+                )
+            db.execute("DELETE FROM main.npc_roster_utc_attestations WHERE event_id='a_roster'")
+            return None
+        with self.assertRaises(ValueError):
+            self.clock.tick(NOW, handler)
+        self.assertEqual(self.counts(), (0, 0, 6))
+        self.assertIsNone(self.clock.lookup("a_roster").processed_at)
+        self.assertIsNone(self.clock.lookup("z_generic").processed_at)
+
+    def test_postverify_clock_trigger_cannot_change_expected_processed_utc(self):
+        plan = self.proposal()
+        policy, mac = self.grant(plan)
+        with closing(sqlite3.connect(self.dbpath)) as db, db:
+            db.execute("""
+                CREATE TRIGGER main.tamper_processed_utc_after_clock_ack
+                AFTER UPDATE OF processed_utc ON clock_events
+                WHEN NEW.event_id='roster_test_1'
+                BEGIN
+                    UPDATE clock_events SET processed_utc='2099-01-01T00:00:00.000000+00:00'
+                    WHERE event_id=NEW.event_id;
+                END
+            """)
+        with self.assertRaises(ValueError):
+            self.run_grant(policy, mac)
+        self.assertEqual(self.counts(), (0, 0, 6))
+        self.assertIsNone(self.clock.lookup("roster_test_1").processed_at)
+
+
 if __name__ == "__main__":
     unittest.main()
