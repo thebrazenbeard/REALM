@@ -209,13 +209,29 @@ class AtmosphereLedger:
                         loss_pa_l_per_tick=params["loss_pa_l_per_tick"], action_id=action_id)
                 else:
                     outcome = model.tick(action_id=action_id)
+                next_state_json = _json(model.snapshot(), _MAX_STATE_BYTES)
                 if db.execute("UPDATE main.atm_state SET version=?, state_json=? WHERE id=1 AND world_id=? AND version=?",
-                              (expected_version + 1, _json(model.snapshot(), _MAX_STATE_BYTES), world_id, expected_version)).rowcount != 1:
+                              (expected_version + 1, next_state_json, world_id, expected_version)).rowcount != 1:
                     raise RuntimeError("Concurrent atmosphere revision change")
                 result = {"version": expected_version + 1, "result": outcome}
                 response_json = _json(result, _MAX_STATE_BYTES)
                 db.execute("INSERT INTO main.atm_receipts(action_id,world_id,command_json,result_json) VALUES(?,?,?,?)",
                            (action_id, world_id, command, response_json))
+                # MAIN triggers can modify/delete either row after its DML
+                # succeeds. A returned ACK must match BOTH durable effects at
+                # the end of this nested action, not just rowcount/INSERT.
+                persisted_state = db.execute(
+                    "SELECT world_id,version,state_json FROM main.atm_state WHERE id=1"
+                ).fetchone()
+                persisted_receipt = db.execute(
+                    "SELECT world_id,command_json,result_json FROM main.atm_receipts WHERE action_id=?",
+                    (action_id,)
+                ).fetchone()
+                if (persisted_state is None or
+                    tuple(persisted_state) != (world_id, expected_version + 1, next_state_json) or
+                    persisted_receipt is None or
+                    tuple(persisted_receipt) != (world_id, command, response_json)):
+                    raise ValueError("Atmosphere state/receipt diverged before acknowledgment")
                 result = _read(response_json, _MAX_STATE_BYTES)
             db.execute("RELEASE SAVEPOINT atm_action")
             return result
