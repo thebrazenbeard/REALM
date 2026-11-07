@@ -1,0 +1,20 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+  "name": "realm-play",
+  "version": "0.2.1",
+  "description": "Use one authenticated, world-bound REALM gameplay backend through a local stdio MCP host.",
+  "author": {"name": "thebrazenbeard"},
+  "repository": "https://github.com/thebrazenbeard/REALM",
+  "extensions": {
+    "com.openai": {
+      "interface": {
+        "displayName": "REALM Play",
+        "shortDescription": "Play local REALM worlds",
+        "longDescription": "Local-only REALM tools for an authenticated player to observe and act through the game's authoritative Gateway and Engine. Requires the matching REALM source, an existing world, a host-provisioned player token and a compatible local MCP host. Does not connect ChatGPT Web to a remote machine.",
+        "developerName": "thebrazenbeard",
+        "capabilities": [],
+        "defaultPrompt": "Explore the host-configured REALM world with me. Confirm the player/world binding, observe before acting, and report only authoritative results."
+      }
+    }
+  }
+}
