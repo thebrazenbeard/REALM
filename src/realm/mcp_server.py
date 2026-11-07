@@ -2,8 +2,9 @@
 
 This process does not expose a network listener.  Its host supplies the world
 database, world ID and one player bearer token through the process environment;
-tool arguments can never select an actor, a database or an identity.  Gameplay
-continues to pass through the same Gateway and CommandRouter as HTTP clients.
+an explicit host tool allowlist is also required for the stdio process. Tool
+arguments can never select an actor, database, identity, or permitted tool set.
+Gameplay continues through the same Gateway and CommandRouter as HTTP clients.
 
 An MCP stdio client is a trusted local process with the authority of the bound
 player.  It must not expose these tools to an untrusted remote principal. The
@@ -115,6 +116,30 @@ TOOLS: tuple[dict[str, object], ...] = (
     _tool("realm_map", "Read the authored map visible at the bound character's current room; no fog of war yet.", {}),
 )
 _TOOL_NAMES = frozenset(tool["name"] for tool in TOOLS)
+_READ_ONLY_TOOL_NAMES = frozenset({"realm_status", "realm_look"})
+_ALLOWLIST_ENV = "REALM_MCP_ALLOWED_TOOLS"
+
+
+def _host_tool_allowlist(raw: str | None) -> frozenset[str]:
+    """Parse one explicit, trusted process-level allowlist without fallback.
+
+    A missing, empty, duplicate, unknown or whitespace-padded entry is an
+    invalid host configuration. In particular, absence must never grant the
+    entire registry by accident.
+    """
+    if type(raw) is not str or not raw:
+        raise RealmMCPError("explicit host tool allowlist required")
+    names = raw.split(",")
+    if (any(name not in _TOOL_NAMES or name != name.strip() for name in names)
+            or len(names) != len(set(names))):
+        raise RealmMCPError("invalid host tool allowlist")
+    return frozenset(names)
+
+
+def _validated_allowed_tools(names: object) -> frozenset[str]:
+    if type(names) is not frozenset or not names or not names.issubset(_TOOL_NAMES):
+        raise RealmMCPError("invalid host tool allowlist")
+    return names
 
 
 def _arguments(arguments: object, allowed: frozenset[str], required: frozenset[str] = frozenset()) -> dict[str, object]:
@@ -130,7 +155,12 @@ def _action_id(value: object) -> str:
 
 
 class RealmMCPBridge:
-    def __init__(self, path: str, world_id: str, token: str):
+    def __init__(self, path: str, world_id: str, token: str, *,
+                 allowed_tools: frozenset[str] = _READ_ONLY_TOOL_NAMES):
+        # Direct in-process users are read-only by default; the stdio entry
+        # point additionally requires an explicit host environment binding.
+        self.allowed_tools = _validated_allowed_tools(allowed_tools)
+        self.available_tools = tuple(tool for tool in TOOLS if tool["name"] in self.allowed_tools)
         self.db_path = _existing_bound_world(path, world_id, token)
         self._world_id = world_id
         self._token = token
@@ -154,8 +184,10 @@ class RealmMCPBridge:
         return actor
 
     def call(self, name: str, arguments: object) -> dict[str, object]:
-        if name not in _TOOL_NAMES:
-            raise RealmMCPError("unknown REALM tool")
+        if name not in self.allowed_tools:
+            # Do not revalidate the actor or enter Gateway for denied tools.
+            # Clients can invoke a tool by name without listing it first.
+            raise RealmMCPError("REALM tool is not permitted by host allowlist")
         actor = self._actor()
         if name == "realm_status":
             _arguments(arguments, frozenset())
@@ -253,7 +285,7 @@ def dispatch(message: object, bridge: RealmMCPBridge) -> dict[str, object] | Non
     if method == "ping":
         return _jsonrpc_result(request_id, {})
     if method == "tools/list":
-        return _jsonrpc_result(request_id, {"tools": TOOLS})
+        return _jsonrpc_result(request_id, {"tools": bridge.available_tools})
     if method != "tools/call":
         return _jsonrpc_error(request_id, -32601, "unknown MCP method")
     if (type(params) is not dict or type(params.get("name")) is not str
@@ -308,11 +340,14 @@ def serve_stdio(bridge: RealmMCPBridge, source: IO[bytes], destination: IO[str])
 
 def main() -> int:
     try:
+        allowed_tools = _host_tool_allowlist(os.environ.get(_ALLOWLIST_ENV))
         bridge = RealmMCPBridge(os.environ.get("REALM_DB_PATH", ""),
                                 os.environ.get("REALM_WORLD_ID", ""),
-                                os.environ.get("REALM_PLAYER_TOKEN", ""))
+                                os.environ.get("REALM_PLAYER_TOKEN", ""),
+                                allowed_tools=allowed_tools)
     except RealmMCPError:
-        print("REALM MCP requires an existing bound world and valid host-configured player credential", file=sys.stderr)
+        print("REALM MCP requires an existing bound world, valid host-configured player credential,"
+              " and explicit host tool allowlist", file=sys.stderr)
         return 2
     serve_stdio(bridge, sys.stdin.buffer, sys.stdout)
     return 0

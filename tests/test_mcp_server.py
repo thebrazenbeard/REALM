@@ -19,6 +19,9 @@ from realm.mcp_server import MAX_RESULT_BYTES, RealmMCPBridge, RealmMCPError, TO
 
 
 ROOT = Path(__file__).resolve().parents[1]
+ALL_TOOL_NAMES = frozenset(tool["name"] for tool in TOOLS)
+FULL_TOOL_ENV = ",".join(tool["name"] for tool in TOOLS)
+READ_ONLY_TOOL_NAMES = {"realm_status", "realm_look"}
 
 
 class MCPServerTests(unittest.TestCase):
@@ -29,7 +32,10 @@ class MCPServerTests(unittest.TestCase):
         self.database = self.directory / "realm.sqlite3"
         self.host = Gateway(self.database, world_id="sandbox")
         self.token = self.host.credentials.provision("Vera")
-        self.bridge = RealmMCPBridge(str(self.database), "sandbox", self.token)
+        # Ordinary engine coverage runs with explicit trusted local authority;
+        # production stdio must never get this authority implicitly.
+        self.bridge = RealmMCPBridge(str(self.database), "sandbox", self.token,
+                                     allowed_tools=ALL_TOOL_NAMES)
 
     def test_tool_registry_and_fixed_principal_without_player_argument(self):
         tools = {tool["name"]: tool for tool in TOOLS}
@@ -50,7 +56,8 @@ class MCPServerTests(unittest.TestCase):
         self.assertIn("The Atrium", self.bridge.call("realm_look", {})["text"])
         move = self.bridge.call("realm_command", {"command": "north", "action_id": "move-one"})
         self.assertIn("Corridor", move["text"])
-        reconnected = RealmMCPBridge(str(self.database), "sandbox", self.token)
+        reconnected = RealmMCPBridge(str(self.database), "sandbox", self.token,
+                                     allowed_tools=ALL_TOOL_NAMES)
         self.assertIn("Corridor", reconnected.call("realm_look", {})["text"])
 
     def test_typed_inventory_and_move_replay_do_not_duplicate_world_actions(self):
@@ -219,7 +226,8 @@ class MCPServerTests(unittest.TestCase):
         ]
         env = dict(os.environ)
         env.update({"REALM_DB_PATH": str(self.database), "REALM_WORLD_ID": "sandbox",
-                    "REALM_PLAYER_TOKEN": self.token, "PYTHONPATH": str(ROOT / "src")})
+                    "REALM_PLAYER_TOKEN": self.token, "PYTHONPATH": str(ROOT / "src"),
+                    "REALM_MCP_ALLOWED_TOOLS": FULL_TOOL_ENV})
         result = subprocess.run(
             [sys.executable, "-m", "realm.mcp_server"],
             input="".join(json.dumps(item) + "\n" for item in requests),
@@ -284,7 +292,8 @@ class MCPServerTests(unittest.TestCase):
                     for index, (name, arguments) in enumerate(calls, start=1)]
         env = dict(os.environ)
         env.update({"REALM_DB_PATH": str(self.database), "REALM_WORLD_ID": "sandbox",
-                    "REALM_PLAYER_TOKEN": self.token, "PYTHONPATH": str(ROOT / "src")})
+                    "REALM_PLAYER_TOKEN": self.token, "PYTHONPATH": str(ROOT / "src"),
+                    "REALM_MCP_ALLOWED_TOOLS": FULL_TOOL_ENV})
         result = subprocess.run([sys.executable, "-m", "realm.mcp_server"],
                                 input="".join(json.dumps(item) + "\n" for item in requests),
                                 capture_output=True, text=True, env=env, timeout=15)
@@ -368,9 +377,121 @@ class MCPServerTests(unittest.TestCase):
                                 "params": {"protocolVersion": ["unsupported"]}}, self.bridge)
         self.assertEqual(bad_version["result"]["protocolVersion"], "2025-06-18")
 
+    def test_direct_bridge_defaults_to_read_only_and_cannot_implicitly_join(self):
+        restricted = RealmMCPBridge(str(self.database), "sandbox", self.token)
+        listed = dispatch({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}, restricted)
+        self.assertEqual([tool["name"] for tool in listed["result"]["tools"]],
+                         ["realm_status", "realm_look"])
+        self.assertEqual(restricted.call("realm_status", {})["player"], "Vera")
+        with self.assertRaisesRegex(RealmMCPError, "not permitted"):
+            restricted.call("realm_join", {})
+        reply = dispatch({"jsonrpc": "2.0", "id": 2, "method": "tools/call",
+                          "params": {"name": "realm_look", "arguments": {}}}, restricted)
+        self.assertTrue(reply["result"]["isError"])
+        with closing(sqlite3.connect(self.database)) as db:
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM players").fetchone()[0], 0)
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM action_receipts").fetchone()[0], 0)
+
+    def test_host_allowlist_hides_and_denies_all_seven_tools_even_by_direct_call(self):
+        self.bridge.call("realm_join", {})
+        restricted = RealmMCPBridge(str(self.database), "sandbox", self.token)
+        denied = {
+            "realm_join": {},
+            "realm_inventory": {},
+            "realm_move": {"direction": "north", "action_id": "denied-move"},
+            "realm_command": {"command": "take token", "action_id": "denied-command"},
+            "realm_say": {"message": "Unauthorized speech", "action_id": "denied-say"},
+            "realm_feed": {"after": 0},
+            "realm_map": {},
+        }
+        self.assertEqual(set(denied), ALL_TOOL_NAMES - READ_ONLY_TOOL_NAMES)
+        with closing(sqlite3.connect(self.database)) as db:
+            before = tuple(db.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+                           for table in ("players", "events", "action_receipts"))
+        for index, (name, arguments) in enumerate(denied.items(), start=1):
+            with self.subTest(tool=name):
+                # Advertising is not the security boundary: explicitly bypass
+                # tools/list and invoke every hidden tool by its real name.
+                request = {"jsonrpc": "2.0", "id": index, "method": "tools/call",
+                           "params": {"name": name, "arguments": arguments,
+                                      "_meta": {"allowed_tools": list(ALL_TOOL_NAMES)}}}
+                response = dispatch(request, restricted)
+                self.assertTrue(response["result"]["isError"])
+                self.assertIn("not permitted", response["result"]["content"][0]["text"])
+                self.assertNotIn("structuredContent", response["result"])
+                with self.assertRaisesRegex(RealmMCPError, "not permitted"):
+                    restricted.call(name, arguments)
+        with closing(sqlite3.connect(self.database)) as db:
+            after = tuple(db.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+                          for table in ("players", "events", "action_receipts"))
+        self.assertEqual(after, before)
+        self.assertIn("Atrium", restricted.call("realm_look", {})["text"])
+
+    def test_real_stdio_read_only_allowlist_blocks_direct_hidden_tool_call(self):
+        self.bridge.call("realm_join", {})
+        denied = ["realm_join", "realm_inventory", "realm_move", "realm_command",
+                  "realm_say", "realm_feed", "realm_map"]
+        requests = [
+            {"jsonrpc": "2.0", "id": 1, "method": "tools/list",
+             "params": {"allowed_tools": list(ALL_TOOL_NAMES)}},
+            {"jsonrpc": "2.0", "id": 2, "method": "tools/call",
+             "params": {"name": "realm_status", "arguments": {}}},
+            {"jsonrpc": "2.0", "id": 3, "method": "tools/call",
+             "params": {"name": "realm_look", "arguments": {}}},
+        ]
+        requests.extend({"jsonrpc": "2.0", "id": index, "method": "tools/call",
+                         "params": {"name": name, "arguments": {}}}
+                        for index, name in enumerate(denied, start=4))
+        env = dict(os.environ)
+        env.update({"REALM_DB_PATH": str(self.database), "REALM_WORLD_ID": "sandbox",
+                    "REALM_PLAYER_TOKEN": self.token, "PYTHONPATH": str(ROOT / "src"),
+                    "REALM_MCP_ALLOWED_TOOLS": "realm_status,realm_look"})
+        with closing(sqlite3.connect(self.database)) as db:
+            before = tuple(db.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+                           for table in ("players", "events", "action_receipts"))
+        process = subprocess.run([sys.executable, "-m", "realm.mcp_server"],
+                                 input="".join(json.dumps(item) + "\n" for item in requests),
+                                 capture_output=True, text=True, env=env, timeout=15)
+        self.assertEqual(process.returncode, 0, process.stderr)
+        self.assertNotIn(self.token, process.stdout + process.stderr)
+        responses = [json.loads(line) for line in process.stdout.splitlines()]
+        self.assertEqual(len(responses), 10)
+        self.assertEqual([tool["name"] for tool in responses[0]["result"]["tools"]],
+                         ["realm_status", "realm_look"])
+        self.assertEqual(responses[1]["result"]["structuredContent"]["player"], "Vera")
+        self.assertIn("Atrium", responses[2]["result"]["content"][0]["text"])
+        for name, response in zip(denied, responses[3:]):
+            with self.subTest(tool=name):
+                self.assertTrue(response["result"]["isError"])
+                self.assertIn("not permitted", response["result"]["content"][0]["text"])
+        with closing(sqlite3.connect(self.database)) as db:
+            after = tuple(db.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+                          for table in ("players", "events", "action_receipts"))
+        self.assertEqual(after, before)
+
+    def test_missing_empty_or_malformed_host_allowlist_refuses_stdio_startup(self):
+        for allowlist in (None, "", "realm_status,", ",realm_look", "realm_status,,realm_look",
+                          "realm_status, realm_look", "realm_status,realm_status",
+                          "realm_status,not_a_tool", "*", "realm_status\nrealm_look"):
+            with self.subTest(allowlist=allowlist):
+                env = dict(os.environ)
+                env.update({"REALM_DB_PATH": str(self.database), "REALM_WORLD_ID": "sandbox",
+                            "REALM_PLAYER_TOKEN": self.token, "PYTHONPATH": str(ROOT / "src")})
+                env.pop("REALM_MCP_ALLOWED_TOOLS", None)
+                if allowlist is not None:
+                    env["REALM_MCP_ALLOWED_TOOLS"] = allowlist
+                process = subprocess.run([sys.executable, "-m", "realm.mcp_server"],
+                                         input='{"jsonrpc":"2.0","id":1,"method":"tools/list"}\n',
+                                         capture_output=True, text=True, env=env, timeout=15)
+                self.assertEqual(process.returncode, 2, process.stderr)
+                self.assertEqual(process.stdout, "")
+                self.assertNotIn(self.token, process.stderr)
+                self.assertIn("explicit host tool allowlist", process.stderr)
+
     def test_unconfigured_subprocess_fails_closed(self):
         env = dict(os.environ)
-        for name in ("REALM_DB_PATH", "REALM_WORLD_ID", "REALM_PLAYER_TOKEN"):
+        for name in ("REALM_DB_PATH", "REALM_WORLD_ID", "REALM_PLAYER_TOKEN",
+                     "REALM_MCP_ALLOWED_TOOLS"):
             env.pop(name, None)
         env["PYTHONPATH"] = str(ROOT / "src")
         result = subprocess.run([sys.executable, "-m", "realm.mcp_server"],
