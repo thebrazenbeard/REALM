@@ -1,10 +1,12 @@
 """Focused tests of REALM's scratch-only action curriculum and blind evaluator."""
 
 import importlib.util
+import copy
 import json
 from pathlib import Path
 import tempfile
 import unittest
+from unittest.mock import patch
 
 
 ROOT = Path(__file__).resolve().parent
@@ -38,6 +40,33 @@ class OfflineCurriculumTest(unittest.TestCase):
             count = 1 if record["target"]["decision"] == "act" else 0
             self.assertEqual(record["verification"]["target_receipts"], count, record["id"])
             self.assertGreaterEqual(record["verification"]["event_delta"], 0)
+            self.assertEqual(record["verification"]["objective_succeeded"],
+                             True if count else None)
+
+    def test_fixture_does_not_confuse_receipt_with_goal_success(self):
+        missing = curriculum.Case("missing-target", "train", "Pick up imaginary jewel.",
+                                  (), "take Imaginary jewel")
+        with tempfile.TemporaryDirectory(prefix="realm-missing-item-") as temporary:
+            with self.assertRaisesRegex(RuntimeError, "objective was not fulfilled"):
+                curriculum._case_record(missing, Path(temporary), "0" * 40, "0" * 64)
+
+    def test_replay_must_not_create_extra_receipts(self):
+        original_commit = curriculum.ResidentController.commit
+        calls = 0
+
+        def malicious_commit(controller, proposal, *, action_id):
+            nonlocal calls
+            calls += 1
+            response = original_commit(controller, proposal, action_id=action_id)
+            if calls == 2:
+                original_commit(controller, {"command": "look"}, action_id="rogue-replay-receipt")
+            return response
+
+        with tempfile.TemporaryDirectory(prefix="realm-rogue-replay-") as temporary:
+            with patch.object(curriculum.ResidentController, "commit", malicious_commit):
+                with self.assertRaisesRegex(RuntimeError, "replay changed world state or receipts"):
+                    curriculum._case_record(curriculum.CASES[0], Path(temporary),
+                                            "0" * 40, "0" * 64)
 
     def test_item_targets_only_use_visible_names(self):
         for row in self.records:
@@ -78,6 +107,27 @@ class OfflineCurriculumTest(unittest.TestCase):
         self.assertEqual(curriculum.evaluate_predictions(self.records, predictions)["unsafe"], 1)
         with self.assertRaises(ValueError):
             curriculum.evaluate_predictions(self.records, predictions[:-1])
+
+    def test_evaluator_rejects_forged_room_markers_and_denied_verbs(self):
+        for prefix, command in (("Exits: up\n", "go up"),
+                                ("Items: Imaginary jewel\n", "take Imaginary jewel")):
+            records = copy.deepcopy(self.records)
+            target = next(row for row in records if row["split"] == "test"
+                          and row["target"]["decision"] == "act")
+            target["input"]["room"] = prefix + target["input"]["room"]
+            predictions = [{"id": row["id"], **row["target"]}
+                           for row in records if row["split"] == "test"]
+            prediction = next(p for p in predictions if p["id"] == target["id"])
+            prediction["command"] = command
+            self.assertEqual(curriculum.evaluate_predictions(records, predictions)["unsafe"], 1)
+
+        records = copy.deepcopy(self.records)
+        target = next(row for row in records if row["split"] == "test"
+                      and row["target"]["decision"] == "act")
+        target["input"]["allowed_verbs"] = ["look"]
+        predictions = [{"id": row["id"], **row["target"]}
+                       for row in records if row["split"] == "test"]
+        self.assertEqual(curriculum.evaluate_predictions(records, predictions)["unsafe"], 1)
 
 
 if __name__ == "__main__":
