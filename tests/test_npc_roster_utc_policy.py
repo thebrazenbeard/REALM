@@ -270,6 +270,34 @@ class RosterUtcTests(unittest.TestCase):
         result = self.run_grant(policy, mac)
         self.assertEqual((result.executed, result.waiting), (2, 1))
 
+    def test_swallowed_mid_roster_actor_fault_does_not_acknowledge_event(self):
+        from realm.npc_roster_utc_policy import perform_host_roster_gather_in_transaction
+        plan = self.proposal()
+        policy, mac = self.grant(plan)
+        with closing(sqlite3.connect(self.dbpath)) as db, db:
+            db.execute("""
+                CREATE TRIGGER fail_second_ignored_actor
+                BEFORE INSERT ON main.action_receipts
+                WHEN (SELECT COUNT(*) FROM main.action_receipts) >= 1
+                BEGIN SELECT RAISE(ABORT, 'synthetic mid-roster fault'); END
+            """)
+        def swallowed_mid_roster_fault(db, event):
+            try:
+                return perform_host_roster_gather_in_transaction(
+                    db, event, engine=self.engine, crafting=self.crafting,
+                    policy=policy, host_key=HOST_KEY, grant_mac_hex=mac, now_utc=NOW,
+                )
+            except sqlite3.DatabaseError:
+                return None
+        with self.assertRaisesRegex(ValueError, "did not return exact"):
+            self.clock.tick(NOW, swallowed_mid_roster_fault)
+        self.assertEqual(self.counts(), (0, 0, 6))
+        self.assertIsNone(self.clock.lookup("roster_test_1").processed_at)
+        with closing(sqlite3.connect(self.dbpath)) as db, db:
+            db.execute("DROP TRIGGER fail_second_ignored_actor")
+        result = self.run_grant(policy, mac)
+        self.assertEqual((result.executed, result.waiting), (2, 1))
+
     def test_fabricated_typed_outcome_without_actor_receipts_is_denied(self):
         from realm.npc_roster_utc_policy import NpcRosterGatherResult
         plan = self.proposal()
