@@ -106,7 +106,7 @@ class LocalTelnetServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
         with self._join_lock:
             if key in self._active_names:
                 return None
-            greeting = self.engine.join(name)
+            greeting = self.engine.join(name, transport_auth_mode="shared-token-demo")
             self._active_names.add(key)
             return greeting
 
@@ -229,7 +229,9 @@ class LocalTelnetHandler(socketserver.BaseRequestHandler):
                 self._send("REALM> ")
                 continue
             try:
-                result = self.server.engine.act(name, command)
+                result = self.server.engine.act(
+                    name, command, transport_auth_mode="shared-token-demo"
+                )
             except ValueError as error:
                 result = f"Command rejected: {error}"
             self._send(f"{result}\n")

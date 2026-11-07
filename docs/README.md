@@ -26,7 +26,7 @@ this does **not** qualify remote hosting or real-browser rendering.
 | --- | --- | --- |
 | GET | `/api/v1/health` | `{ "ok": true, "world_id": "..." }` |
 | POST | `/api/v1/join` | Request `{ "player": "..." }`; response `{ "text": "...", "cursor": 0 }` |
-| POST | `/api/v1/command` | Request `{ "player": "...", "command": "look", "action_id": "..." }`; response `{ "text": "...", "cursor": 0 }` |
+| POST | `/api/v1/command` | Request `{ "player": "...", "command": "look", "action_id": "..." }`; response `{ "text": "..." }` |
 | GET | `/api/v1/room?player=...` | `{ "text": "..." }` |
 | GET | `/api/v1/feed?player=...&after=0` | `{ "events": [{ "id": 1, "kind": "say", "actor": "...", "text": "...", "room": "...", "at": "..." }], "cursor": 1 }` |
 
