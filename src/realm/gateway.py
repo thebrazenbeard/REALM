@@ -17,7 +17,8 @@ from urllib.parse import parse_qs, urlsplit
 
 from .auth import CredentialStore
 from .engine import (Engine, _EVENT_DELIVERY_SCHEMA_SQL, _SEED_EXITS,
-                     _SEED_ITEMS, _SEED_ROOMS, _pristine_schema, _schema_snapshot)
+                     _SEED_ITEMS, _SEED_ROOMS, _claim_transport_auth_mode,
+                     _pristine_schema, _schema_snapshot)
 from .geography import Geography, MapUnavailable
 from .router import CommandRouter
 
@@ -63,9 +64,11 @@ class Gateway:
             if bound is not None:
                 if bound[0] != world_id:
                     raise ValueError("world database is already bound to a different world_id")
+                _claim_transport_auth_mode(db, "player-bearer-http")
                 return
             if self._has_unbound_world_data(db) and not adopt_unbound_world:
                 raise ValueError("unbound existing world database requires explicit local adoption")
+            _claim_transport_auth_mode(db, "player-bearer-http")
             db.execute(
                 "INSERT INTO world_meta (key,value) VALUES ('world_id',?)", (world_id,)
             )
