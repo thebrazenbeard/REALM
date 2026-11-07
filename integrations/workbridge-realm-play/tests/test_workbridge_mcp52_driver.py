@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+from contextlib import closing
 import hashlib
 import json
 from pathlib import Path
@@ -51,12 +52,13 @@ class WorkBridgeMCP52Tests(unittest.TestCase):
         self.token = "TEST_TOKEN_0123456789012345"
         self.tokenfile = self.root / "private_token.txt"
         self.tokenfile.write_text(self.token + "\n", encoding="ascii")
-        with sqlite3.connect(self.db) as conn:
+        with closing(sqlite3.connect(self.db)) as conn:
             conn.execute("CREATE TABLE world_meta(key TEXT PRIMARY KEY,value TEXT NOT NULL)")
             conn.execute("CREATE TABLE player_credentials(player_name TEXT, token_digest TEXT)")
             conn.execute("INSERT INTO world_meta VALUES('world_id','testing')")
             conn.execute("INSERT INTO player_credentials VALUES('Vera', ?)",
                          (hashlib.sha256(self.token.encode()).hexdigest(),))
+            conn.commit()
         self.config = {"schema":"realm.workbridge-mcp52.v1", "python_executable":sys.executable,
                        "realm_root":str(self.repo), "world_db":str(self.db),
                        "expected_world_id":"testing", "expected_actor":"Vera",

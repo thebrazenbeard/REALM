@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+from contextlib import closing
 from pathlib import Path
 import sqlite3
 import sys
@@ -47,7 +48,7 @@ class RealMCP52Integration(unittest.TestCase):
             first_move = call(config, move_request)
             second_move = call(config, move_request)
             self.assertTrue(first_move["ok"] and second_move["ok"])
-            with sqlite3.connect(db_path) as db:
+            with closing(sqlite3.connect(db_path)) as db:
                 self.assertEqual(db.execute(
                     "SELECT COUNT(*) FROM action_receipts WHERE actor='Vera' AND action_id='workbridge-move-001'"
                 ).fetchone()[0], 1)
@@ -55,7 +56,7 @@ class RealMCP52Integration(unittest.TestCase):
                                  "corridor")
 
             def count_speech():
-                with sqlite3.connect(db_path) as db:
+                with closing(sqlite3.connect(db_path)) as db:
                     return db.execute("SELECT COUNT(*) FROM events WHERE kind='say'").fetchone()[0]
 
             before = count_speech()
