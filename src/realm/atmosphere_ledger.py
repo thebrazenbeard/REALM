@@ -195,6 +195,15 @@ class AtmosphereLedger:
                     raise ValueError("Atmosphere action replay conflict")
                 result = _read(prior["result_json"], _MAX_STATE_BYTES)
             else:
+                # Keep unrelated receipts intact. MAIN triggers on our own
+                # INSERT may add a forged future replay or alter a prior
+                # action without touching the just-inserted receipt.
+                before_receipts = {
+                    row["action_id"]: (row["world_id"], row["command_json"], row["result_json"])
+                    for row in db.execute(
+                        "SELECT action_id,world_id,command_json,result_json FROM main.atm_receipts"
+                    )
+                }
                 state = db.execute("SELECT world_id,version,state_json FROM main.atm_state WHERE id=1").fetchone()
                 if state is None or state["world_id"] != world_id:
                     raise RuntimeError("Atmosphere world state missing")
@@ -227,10 +236,19 @@ class AtmosphereLedger:
                     "SELECT world_id,command_json,result_json FROM main.atm_receipts WHERE action_id=?",
                     (action_id,)
                 ).fetchone()
+                persisted_receipts = {
+                    row["action_id"]: (row["world_id"], row["command_json"], row["result_json"])
+                    for row in db.execute(
+                        "SELECT action_id,world_id,command_json,result_json FROM main.atm_receipts"
+                    )
+                }
+                expected_receipts = dict(before_receipts)
+                expected_receipts[action_id] = (world_id, command, response_json)
                 if (persisted_state is None or
                     tuple(persisted_state) != (world_id, expected_version + 1, next_state_json) or
                     persisted_receipt is None or
-                    tuple(persisted_receipt) != (world_id, command, response_json)):
+                    tuple(persisted_receipt) != (world_id, command, response_json) or
+                    persisted_receipts != expected_receipts):
                     raise ValueError("Atmosphere state/receipt diverged before acknowledgment")
                 result = _read(response_json, _MAX_STATE_BYTES)
             db.execute("RELEASE SAVEPOINT atm_action")
