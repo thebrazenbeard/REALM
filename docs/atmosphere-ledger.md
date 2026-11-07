@@ -30,11 +30,19 @@ even if the enclosing host catches a late SQL error and commits.
 For a newly committed atmosphere action, a final same-transaction readback
 requires the exact `main.atm_state` version/snapshot and `main.atm_receipts`
 command/result to match the requested operation after SQLite INSERT triggers.
-Post-write deletion or rewrite of either effect fails closed and rolls back the
+The complete receipt map must also equal the pre-action map plus exactly one
+new receipt, rejecting forged future receipts and edits to prior actions while
+preserving legitimate existing receipt rows. This currently costs
+O(number of stored atmosphere receipts) per new action; the performance and
+storage growth of long-lived worlds require separate qualification.
+Post-write deletion, rewrite, or extra insertion fails closed and rolls back the
 nested action; unrelated host audit rows remain permitted. This is an
 **action-end** guard, not a guarantee that an enclosing host transaction cannot
-subsequently mutate or roll back rows. A host composing additional effects must
-revalidate its final full transaction before acknowledging the larger tick.
+subsequently mutate or roll back rows. An installed trigger on a *later* host
+audit event can still erase an atmosphere receipt before the outer commit.
+A host composing additional effects must revalidate its final full transaction
+before acknowledging the larger tick. No such caller finalizer is supplied by
+this draft.
 
 - Exact action-ID repeats return their original JSON result; command changes
   at the same ID fail closed. Fresh stale versions reject. Cross-file and
