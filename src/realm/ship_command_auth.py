@@ -12,6 +12,7 @@ worlds nor runs background ship movement.
 from __future__ import annotations
 
 import sqlite3
+from datetime import datetime, timezone
 from contextlib import closing
 from pathlib import Path
 
@@ -106,6 +107,28 @@ class AuthenticatedShipCommands:
         joined = db.execute("SELECT 1 FROM main.players WHERE id=?", (actor,)).fetchone()
         if joined is None:
             raise PermissionError("Ship pilot must first join this world")
+        if scoped:
+            # Both tick state and departure are observed under the SAME writer.
+            # Geography schedules integer UTC seconds; compare that exact event
+            # instant to the full-precision persisted tick, never a floored tick.
+            # A tick in the same fractional second conservatively rejects.
+            has_clock = db.execute(
+                "SELECT 1 FROM main.sqlite_master WHERE type='table' "
+                "AND name='clock_state'"
+            ).fetchone()
+            if has_clock:
+                last = db.execute(
+                    "SELECT last_utc FROM main.clock_state WHERE id=1"
+                ).fetchone()
+                if last:
+                    try:
+                        last_tick = datetime.fromisoformat(str(last[0]).replace("Z", "+00:00"))
+                    except (ValueError, TypeError) as exc:
+                        raise RuntimeError("Invalid persisted world clock timestamp") from exc
+                    if last_tick.tzinfo is None:
+                        raise RuntimeError("Persisted world clock timestamp has no timezone")
+                    if datetime.fromtimestamp(now, timezone.utc) < last_tick.astimezone(timezone.utc):
+                        raise RuntimeError("Host UTC precedes last processed world tick")
         # Geography verifies exact owner equality and records this true actor.
         # Delegated crew roles are not yet supported: never impersonate owner.
         departure = depart_and_schedule_in_transaction(

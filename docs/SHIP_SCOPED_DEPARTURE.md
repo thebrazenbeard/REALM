@@ -16,7 +16,10 @@ ship movement, idempotent receipt, and UTC arrival event.
 - The departure uses host UTC seconds and a host-configured route duration.
   No ALQS/QSD propulsion speed or fictional constant is invented.
 - The WorldClock must be explicitly enabled. A disabled clock returns JSON
-  HTTP 409 and leaves the ship docked.
+  HTTP 409 and leaves the ship docked. If the persisted UTC tick is ahead of
+  the host-derived event UTC second (including a fractional-second later
+  tick), retroactive departure is denied with 409. This monotonic guard applies
+  to the scoped HTTP path only, not legacy trusted host/Geography APIs.
 - The same active token and stable action ID replay one existing result.
   A revoked token cannot replay and retrieve a past receipt.
 - Credential revocation/rotation uses the same world SQLite writer lock.

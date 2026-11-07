@@ -7,6 +7,7 @@ import sqlite3
 import tempfile
 import threading
 import time
+from datetime import datetime, timedelta, timezone
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
 from unittest.mock import patch
 
@@ -237,6 +238,42 @@ class ScopedShipHTTPTests(unittest.TestCase):
                     now=int(time.time()), action_id="spoof", scoped=True,
                 )
             db.rollback()
+        self.assertEqual("docked", self.gateway.geography.ship_status("vesta")["state"])
+
+    def test_persisted_utc_clock_ahead_of_host_denies_retroactive_departure(self):
+        token = self.gateway.scoped_credentials.provision(
+            "Captain", capabilities=("ship:depart",)
+        )
+        self.clock.tick(
+            datetime.now(timezone.utc) + timedelta(seconds=120),
+            lambda _db, _event: None,
+        )
+        status, payload = self.request(token)
+        self.assertEqual(409, status, payload)
+        self.assertEqual("docked", self.gateway.geography.ship_status("vesta")["state"])
+        with closing(sqlite3.connect(self.db_path)) as db:
+            self.assertEqual(0, db.execute(
+                "SELECT COUNT(*) FROM main.geo_ship_events WHERE kind='depart'"
+            ).fetchone()[0])
+
+    def test_subsecond_processed_tick_blocks_rounded_down_host_utc(self):
+        token = self.gateway.scoped_credentials.provision(
+            "Captain", capabilities=("ship:depart",)
+        )
+        host_utc = datetime.now(timezone.utc).replace(microsecond=0)
+        self.clock.tick(
+            host_utc + timedelta(milliseconds=500),
+            lambda _db, _event: None,
+        )
+
+        class FrozenHostDatetime(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return host_utc if tz else host_utc.replace(tzinfo=None)
+
+        with patch("realm.gateway.datetime", FrozenHostDatetime):
+            status, payload = self.request(token, action_id="subsecond")
+        self.assertEqual(409, status, payload)
         self.assertEqual("docked", self.gateway.geography.ship_status("vesta")["state"])
 
     def test_nonowner_with_ship_capability_cannot_depart(self):
