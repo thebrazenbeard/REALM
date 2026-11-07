@@ -160,6 +160,25 @@ class FeedWaitTests(unittest.TestCase):
         self.assertEqual(200, status)
         self.assertTrue(body["ok"])
 
+    def test_legacy_feed_cannot_bypass_event_time_room_entry(self):
+        self.gateway.command("Vera", "north", "legacy-vera-enters")
+        self.gateway.command("Vera", "say Secret before Patrick enters", "legacy-before")
+        self.gateway.command("Patrick", "north", "legacy-patrick-enters")
+        for path in ("/api/v1/feed?after=0", self.url(after=0, wait_ms=0)):
+            status, body = self.send(path)
+            self.assertEqual(200, status)
+            self.assertFalse(any("Secret before Patrick enters" in event["text"]
+                                 for event in body["events"]))
+
+        self.gateway.command("Patrick", "south", "legacy-patrick-exits")
+        self.gateway.command("Vera", "say Secret while Patrick absent", "legacy-absent")
+        self.gateway.command("Patrick", "north", "legacy-patrick-returns")
+        for path in ("/api/v1/feed?after=0", self.url(after=0, wait_ms=0)):
+            status, body = self.send(path)
+            self.assertEqual(200, status)
+            self.assertFalse(any("Secret while Patrick absent" in event["text"]
+                                 for event in body["events"]))
+
     def test_room_isolation_even_with_cross_room_cursor(self):
         before = self.gateway.cursor()
         self.gateway.command("Vera", "north", "move-private")
