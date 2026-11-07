@@ -283,15 +283,15 @@ class RosterUtcTests(unittest.TestCase):
         self.assertEqual(self.counts(), (0, 0, 6))
         self.assertIsNone(self.clock.lookup("roster_test_1").processed_at)
 
-    def test_valid_wait_only_roster_acknowledges_without_action_receipts(self):
+    def test_valid_mixed_wait_roster_acknowledges_exact_action_receipt(self):
         with closing(sqlite3.connect(self.dbpath)) as db, db:
-            db.execute("UPDATE main.gathering_nodes SET remaining=0")
+            db.execute("UPDATE main.gathering_nodes SET remaining=0 WHERE material='copper'")
         plan = self.proposal()
-        self.assertTrue(all(a.site is None for a in plan.assignments))
+        self.assertEqual(sum(a.site is None for a in plan.assignments), 2)
         policy, mac = self.grant(plan)
         result = self.run_grant(policy, mac)
-        self.assertEqual((result.executed, result.waiting, result.responses), (0, 3, ()))
-        self.assertEqual(self.counts(), (0, 0, 0))
+        self.assertEqual((result.executed, result.waiting, len(result.responses)), (1, 2, 1))
+        self.assertEqual(self.counts(), (1, 1, 0))
         self.assertIsNotNone(self.clock.lookup("roster_test_1").processed_at)
 
     def test_two_competing_signed_rosters_roll_back_complete_tick_batch(self):
