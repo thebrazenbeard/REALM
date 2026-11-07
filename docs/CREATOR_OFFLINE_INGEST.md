@@ -41,7 +41,7 @@ restricted.** This module does not read Wreckforge sources autonomously.
 
 Input constraints: 1 MiB maximum source bytes; no .zip generic ingestion or
 PDF, no wildcard/directory crawl; DOCX uses only word/document.xml, checks
-archive member count/paths/compression ratio/size, disallows XML DOCTYPE/ENTITY,
+archive member count/duplicate names/paths/compression ratio/size, disallows XML DOCTYPE/ENTITY,
 and parses text without executing instructions found in it. Labeled candidate
 count and repeated evidence are bounded. Plain-file reads may change between
 stat/read; the output always hashes the bytes actually read, not the filename.

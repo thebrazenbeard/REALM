@@ -40,8 +40,13 @@ def _docx_paragraphs(source: bytes) -> list[str]:
             infos = archive.infolist()
             if not infos or len(infos) > MAX_ARCHIVE_MEMBERS:
                 raise CandidateError("DOCX member count is invalid")
+            seen_names: set[str] = set()
             for info in infos:
                 name = info.filename
+                normalized_name = PurePosixPath(name).as_posix().casefold()
+                if normalized_name in seen_names:
+                    raise CandidateError("DOCX archive has duplicate member names")
+                seen_names.add(normalized_name)
                 parts = PurePosixPath(name).parts
                 if (
                     not name or name.startswith("/") or "\\" in name

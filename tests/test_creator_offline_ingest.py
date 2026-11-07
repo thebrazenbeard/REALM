@@ -74,6 +74,18 @@ class CreatorOfflineTests(unittest.TestCase):
         self.assertEqual(out["candidates"][0]["name"], "Anchor")
         self.assertEqual(out["effect"], "REVIEW_ONLY_NO_IMPORT")
 
+    def test_rejects_duplicate_docx_members(self):
+        from warnings import catch_warnings, simplefilter
+
+        with catch_warnings():
+            simplefilter("ignore", UserWarning)
+            buffer = io.BytesIO()
+            with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as archive:
+                archive.writestr("word/document.xml", "<root/>")
+                archive.writestr("word/document.xml", "<root/>")
+        with self.assertRaises(CandidateError):
+            preview_source(self.file("duplicate.docx", buffer.getvalue()))
+
     def test_rejects_archive_traversal(self):
         data = docx_blob(["Planet: Safe"], extra={"../outside.txt": "danger"})
         with self.assertRaises(CandidateError):
