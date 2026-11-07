@@ -53,11 +53,25 @@ production clock through the HTTP API.
 **Security holds:** A stolen *currently valid* bearer remains indistinguishable
 from its authorized holder without device/key binding. SQLite+external-witness
 rollback together, filesystem-privileged modification, and cross-process clock
-rollback are outside the demonstrated guarantee. The delayed HTTP request-body
-revocation race is reduced by a second check just before dispatch, but a revoke
-between that check and the gameplay write still lacks an atomic transaction
-boundary. High-impact commands (especially Hardcore/ship) must not claim
-instantaneous in-flight revoke safety without a writer-transaction check.
+rollback are outside the demonstrated guarantee.
+
+On this **separate PR92-dependent draft**, scoped `/api/v1/join` and
+`/api/v1/command` recheck the bearer against `main.scoped_player_credentials`
+under the actual world SQLite `BEGIN IMMEDIATE` writer transaction, immediately
+before any join, core Engine action, or Crafting effect. A concurrent host
+rotation/revocation against the **same world database** therefore serializes
+before or after the complete gameplay write; it cannot win between the final
+credential check and the checked effect. Legacy local host-trusted APIs are
+unchanged, and legacy unscoped HTTP credentials retain their existing contract.
+
+This does **not** qualify PR86 ship commands, future action adapters that omit
+the writer guard, external services or separate-database writers, or any
+multi-process deployment outside the tested same-database boundary. If a host
+mutates SQLite and its witness independently or copies both to roll state back,
+the source-only checks do not provide protected external authority. Existing
+live feed historical visibility and Hardcore irreversible finality have separate
+release gates.
+
 The current room feed also has independent historical recipient-visibility
 limits; token lifecycle is **not** an event-time privacy fix. Keep the HTTP
 gateway loopback-only; this is not TLS/public-hosting qualification.

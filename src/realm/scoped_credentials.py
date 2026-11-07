@@ -263,6 +263,48 @@ class ScopedCredentialStore:
             return None
         return str(row[0])
 
+    def authenticate_in_writer(
+        self, db: sqlite3.Connection, token: str, *, required_capability: str
+    ) -> str | None:
+        """Check an active bearer inside the SAME world writer transaction.
+
+        Caller must own BEGIN IMMEDIATE through its final gameplay commit.
+        Concurrent host revoke/rotation then serializes before or after the
+        whole gameplay effect, never between credential check and effect.
+        This is not device binding, standalone ship auth, or cross-DB authority.
+        """
+        if not db.in_transaction:
+            raise CredentialStateError("Credential writer check requires an active transaction")
+        if not self._valid_token(token) or required_capability not in _ALLOWED_CAPABILITIES:
+            return None
+        main = next((row[2] for row in db.execute("PRAGMA database_list")
+                     if row[1] == "main"), None)
+        if not main or Path(main).resolve() != Path(self.engine.db_path).resolve():
+            raise CredentialStateError("Credential writer connection is not the bound world database")
+        self._check_world(db)
+        state = db.execute(
+            "SELECT revision,nonce,max_seen_us FROM main.scoped_auth_guard WHERE world_id=?",
+            (self.world_id,),
+        ).fetchone()
+        if state is None:
+            raise CredentialStateError("Missing credential guard")
+        self._check_witness(state)
+        now = self._now_us()
+        if now < int(state[2]):
+            raise CredentialStateError("UTC clock moved backwards; credentials denied")
+        self._observe_in_process(now)
+        row = db.execute(
+            "SELECT player_name,capabilities_json,issued_us,expires_us,revoked_us "
+            "FROM main.scoped_player_credentials WHERE world_id=? AND token_digest=?",
+            (self.world_id, self._digest(token)),
+        ).fetchone()
+        if (row is None or row[4] is not None or not row[2] <= now < row[3]
+                or required_capability not in json.loads(row[1])):
+            # Expiry tombstoning remains a separate host/store operation; a
+            # denied writer check must never mutate this gameplay transaction.
+            return None
+        return str(row[0])
+
     def _expire_once(self, token: str) -> None:
         with closing(self.engine._connect()) as db, db:
             now, state = self._begin(db)

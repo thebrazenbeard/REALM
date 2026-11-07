@@ -358,6 +358,180 @@ class ScopedCredentialTests(unittest.TestCase):
                 "SELECT COUNT(*) FROM main.events WHERE actor='Alice' AND kind='say'"
             ).fetchone()[0])
 
+    def test_revocation_after_post_recheck_is_atomic_with_command_effect(self):
+        """Revocation that wins the SQLite writer race blocks command mutation."""
+        gateway = Gateway(
+            Path(self.tmp.name) / "atomic-race.sqlite3", world_id="sandbox",
+            scoped_credentials=True, scoped_guard_path=Path(self.tmp.name) / "atomic-race.anchor",
+        )
+        token = gateway.scoped_credentials.provision("Alice")
+        gateway.join("Alice")
+        paused = threading.Event()
+        release = threading.Event()
+        remote = hasattr(gateway, "command_remote")
+        original_command = gateway.command_remote if remote else gateway.command
+
+        def delayed_command(*args, **kwargs):
+            # Reached only AFTER the HTTP handler's second credential check.
+            paused.set()
+            self.assertTrue(release.wait(4), "Delayed command never released")
+            return original_command(*args, **kwargs)
+
+        if remote:
+            gateway.command_remote = delayed_command
+        else:
+            gateway.command = delayed_command
+        server = GatewayServer(gateway, (), port=0)
+        server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+        server_thread.start()
+        self.addCleanup(lambda: (
+            server.shutdown(), server.server_close(), server_thread.join(timeout=2)
+        ))
+        body = json.dumps({"player": "Alice", "command": "say Revoked after recheck"}).encode()
+        result = {}
+
+        def send():
+            conn = http.client.HTTPConnection("127.0.0.1", server.server_port, timeout=6)
+            try:
+                conn.request("POST", "/api/v1/command", body=body, headers={
+                    "Authorization": "Bearer " + token,
+                    "Content-Type": "application/json",
+                })
+                response = conn.getresponse()
+                result["status"] = response.status
+                response.read()
+            finally:
+                conn.close()
+
+        thread = threading.Thread(target=send, daemon=True)
+        thread.start()
+        self.assertTrue(paused.wait(4), "Request did not pass its last pre-effect check")
+        self.assertTrue(gateway.scoped_credentials.revoke("Alice"))
+        release.set()
+        thread.join(timeout=6)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(401, result.get("status"))
+        with closing(sqlite3.connect(gateway.engine.db_path)) as db:
+            self.assertEqual(0, db.execute(
+                "SELECT COUNT(*) FROM main.events WHERE actor='Alice' AND kind='say'"
+            ).fetchone()[0])
+
+    def test_writer_guard_covers_crafting_join_and_invalid_auth(self):
+        gateway = Gateway(
+            Path(self.tmp.name) / "craft-race.sqlite3", world_id="sandbox",
+            scoped_credentials=True, scoped_guard_path=Path(self.tmp.name) / "craft-race.anchor",
+        )
+        token = gateway.scoped_credentials.provision("Alice")
+        self.assertTrue(gateway.join_remote("Alice", token)["ok"])
+        gateway.router.crafting.place_node("atrium", "iron", stock=4, batch_yield=1)
+        self.assertTrue(gateway.scoped_credentials.revoke("Alice"))
+        for command in ("say revoked", "gather iron", "craft fake", "resources"):
+            with self.subTest(command=command), self.assertRaises(PermissionError):
+                gateway.command_remote("Alice", command, "denied-" + command, token)
+        with self.assertRaises(PermissionError):
+            gateway.join_remote("Alice", token)
+        with closing(sqlite3.connect(gateway.engine.db_path)) as db:
+            self.assertEqual(4, db.execute(
+                "SELECT remaining FROM main.gathering_nodes WHERE material='iron'"
+            ).fetchone()[0])
+            self.assertEqual(0, db.execute(
+                "SELECT COUNT(*) FROM main.events WHERE actor='Alice' AND kind IN ('say','gather')"
+            ).fetchone()[0])
+            self.assertEqual(0, db.execute(
+                "SELECT COUNT(*) FROM main.action_receipts WHERE actor='Alice'"
+            ).fetchone()[0])
+        with self.assertRaises(PermissionError):
+            gateway.command_remote("Alice", "say forged", "forged", "x" * 43)
+
+    def test_revoke_serializes_after_inflight_writer_commit(self):
+        gateway = Gateway(
+            Path(self.tmp.name) / "order.sqlite3", world_id="sandbox",
+            scoped_credentials=True, scoped_guard_path=Path(self.tmp.name) / "order.anchor",
+        )
+        token = gateway.scoped_credentials.provision("Alice")
+        gateway.join_remote("Alice", token)
+        inside = threading.Event()
+        resume = threading.Event()
+        original = gateway.engine._perform
+
+        def pause_in_writer(*args):
+            inside.set()
+            self.assertTrue(resume.wait(4), "Writer did not resume")
+            return original(*args)
+
+        gateway.engine._perform = pause_in_writer
+        result = {}
+        action = threading.Thread(target=lambda: result.setdefault(
+            "action", gateway.command_remote("Alice", "say Before revocation", "a1", token)
+        ), daemon=True)
+        action.start()
+        self.assertTrue(inside.wait(4), "Game action did not enter its transaction")
+        revoked = threading.Event()
+        def revoke():
+            result["revoked"] = gateway.scoped_credentials.revoke("Alice")
+            revoked.set()
+        revoke_thread = threading.Thread(target=revoke, daemon=True)
+        revoke_thread.start()
+        self.assertFalse(revoked.wait(0.2), "Revoke overtook an active world writer")
+        resume.set()
+        action.join(timeout=5)
+        revoke_thread.join(timeout=5)
+        self.assertFalse(action.is_alive())
+        self.assertFalse(revoke_thread.is_alive())
+        self.assertTrue(result["action"]["ok"])
+        self.assertTrue(result["revoked"])
+        with closing(sqlite3.connect(gateway.engine.db_path)) as db:
+            self.assertEqual(1, db.execute(
+                "SELECT COUNT(*) FROM main.events WHERE actor='Alice' AND kind='say'"
+            ).fetchone()[0])
+        with self.assertRaises(PermissionError):
+            gateway.command_remote("Alice", "say After revocation", "a2", token)
+
+    def test_writer_guard_binds_actual_sqlite_main_not_claimed_world(self):
+        other = Gateway(Path(self.tmp.name) / "other-main.sqlite3", world_id="sandbox")
+        token = self.store.provision("Alice")
+        with closing(other.engine._connect()) as db:
+            db.execute("BEGIN IMMEDIATE")
+            with self.assertRaises(CredentialStateError):
+                self.store.authenticate_in_writer(
+                    db, token, required_capability="command:write"
+                )
+
+    def test_guarded_command_crash_rolls_back_and_rotation_denies_old_token(self):
+        gateway = Gateway(
+            Path(self.tmp.name) / "crash.sqlite3", world_id="sandbox",
+            scoped_credentials=True, scoped_guard_path=Path(self.tmp.name) / "crash.anchor",
+        )
+        old = gateway.scoped_credentials.provision("Alice")
+        gateway.join_remote("Alice", old)
+        new = gateway.scoped_credentials.rotate(old)
+        with self.assertRaises(PermissionError):
+            gateway.command_remote("Alice", "say old token", "old", old)
+        original = gateway.engine._perform
+
+        def fail_after_effect(*args):
+            original(*args)
+            raise RuntimeError("Synthetic writer crash before transaction commit")
+
+        gateway.engine._perform = fail_after_effect
+        with self.assertRaises(RuntimeError):
+            gateway.command_remote("Alice", "say Rollback", "retry", new)
+        with closing(sqlite3.connect(gateway.engine.db_path)) as db:
+            self.assertEqual(0, db.execute(
+                "SELECT COUNT(*) FROM main.events WHERE actor='Alice' AND kind='say'"
+            ).fetchone()[0])
+            self.assertEqual(0, db.execute(
+                "SELECT COUNT(*) FROM main.action_receipts WHERE actor='Alice'"
+            ).fetchone()[0])
+        gateway.engine._perform = original
+        self.assertTrue(gateway.command_remote(
+            "Alice", "say Rollback", "retry", new
+        )["ok"])
+        with closing(sqlite3.connect(gateway.engine.db_path)) as db:
+            self.assertEqual(1, db.execute(
+                "SELECT COUNT(*) FROM main.events WHERE actor='Alice' AND kind='say'"
+            ).fetchone()[0])
+
 
 if __name__ == "__main__":
     unittest.main()

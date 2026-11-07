@@ -13,6 +13,7 @@ import sqlite3
 from contextlib import closing
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from typing import Callable
 from urllib.parse import parse_qs, urlsplit
 
 from .auth import CredentialStore
@@ -64,6 +65,44 @@ class Gateway:
         except CredentialStateError:
             # A missing witness or clock rollback must fail closed, not expose a traceback.
             return None
+
+    def _scoped_writer_guard(
+        self, principal: str, token: str, capability: str
+    ) -> Callable[[sqlite3.Connection], None]:
+        """Revalidate under the action writer lock, on the actual world DB."""
+        if self.scoped_credentials is None:
+            raise PermissionError("Scoped world credential required")
+
+        def check(db: sqlite3.Connection) -> None:
+            try:
+                actor = self.scoped_credentials.authenticate_in_writer(
+                    db, token, required_capability=capability
+                )
+            except CredentialStateError as exc:
+                raise PermissionError("Active scoped bearer required") from exc
+            if actor is None or actor.casefold() != principal.casefold():
+                raise PermissionError("Active scoped bearer required")
+
+        return check
+
+    def join_remote(self, player: str, token: str) -> dict:
+        """HTTP-only scoped join: the final check and join share one writer."""
+        if not isinstance(player, str):
+            raise ValueError("Player must be a string")
+        guard = self._scoped_writer_guard(player, token, "world:join")
+        text = self.engine.join(player, writer_guard=guard)
+        return {"ok": True, "text": text, "cursor": self.cursor()}
+
+    def command_remote(self, player: str, command: str, action_id: str | None,
+                       token: str) -> dict:
+        """HTTP-only scoped command. Craft and core paths both check in-writer."""
+        if not isinstance(player, str) or not isinstance(command, str):
+            raise ValueError("Player and command must be strings")
+        if len(command) > 512:
+            raise ValueError("Command is too long")
+        guard = self._scoped_writer_guard(player, token, "command:write")
+        text = self.router.act(player, command, action_id=action_id, writer_guard=guard)
+        return {"ok": True, "text": text, "cursor": self.cursor()}
 
     def _bind_world_id(self, world_id: str, *, adopt_unbound_world: bool) -> None:
         """Persist the host's world identity before any gateway can serve it.
@@ -382,12 +421,25 @@ class GatewayHandler(BaseHTTPRequestHandler):
                 if self._principal() != principal:
                     self._send(401, {"ok": False, "error": "Active scoped bearer required"})
                     return
-            if path == "/api/v1/join":
+            if self.server.gateway.scoped_credentials is not None:
+                # This token is untrusted until revalidated INSIDE the engine's
+                # or crafting's BEGIN IMMEDIATE gameplay transaction.
+                _, _, presented = self.headers.get("Authorization", "").partition(" ")
+                if path == "/api/v1/join":
+                    result = self.server.gateway.join_remote(principal, presented)
+                else:
+                    result = self.server.gateway.command_remote(
+                        principal, obj.get("command"), obj.get("action_id"), presented
+                    )
+            elif path == "/api/v1/join":
                 result = self.server.gateway.join(principal)
             else:
                 result = self.server.gateway.command(
                     principal, obj.get("command"), obj.get("action_id")
                 )
+        except PermissionError:
+            self._send(401, {"ok": False, "error": "Active scoped bearer required"})
+            return
         except (ValueError, json.JSONDecodeError) as error:
             self._send(400, {"ok": False, "error": str(error)})
             return
