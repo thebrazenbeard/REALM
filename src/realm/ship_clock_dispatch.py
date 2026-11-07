@@ -35,6 +35,16 @@ def depart_and_schedule_in_transaction(
         raise RuntimeError("Existing SQLite transaction required")
     if not isinstance(action_id, str) or not 1 <= len(action_id) <= 128:
         raise ValueError("Stable departure action_id required")
+    # SQLite resolves unqualified names against TEMP first. A caller-supplied
+    # connection with TEMP shadows could spoof an owner/receipt or route an
+    # arrival event to a nonpersistent queue. Reject before ANY ship mutation.
+    shadow = db.execute(
+        "SELECT name FROM sqlite_temp_master WHERE type IN ('table','view') "
+        "AND name IN ('geo_ships','geo_links','geo_ship_events',"
+        "'geo_ship_receipts','clock_events','clock_state','world_meta') LIMIT 1"
+    ).fetchone()
+    if shadow is not None:
+        raise RuntimeError("TEMP shadow of world authority tables is forbidden")
     event_key = json.dumps(
         [ship_id, actor, action_id], ensure_ascii=True, separators=(",", ":")
     ).encode("ascii")

@@ -358,5 +358,97 @@ class ShipClockTests(unittest.TestCase):
         self.assertEqual("moon", self.geo.ship_status("vesta")["planet"])
         self.assertEqual("docked", self.geo.ship_status("vesta")["state"])
 
+    def test_temp_ship_owner_shadow_cannot_authorize_departure(self):
+        from realm.ship_clock_dispatch import depart_and_schedule_in_transaction
+        self.geo.register_ship("vesta", "Vesta", "Patrick", "earth")
+        with closing(sqlite3.connect(self.path)) as db:
+            db.row_factory = sqlite3.Row
+            db.execute("PRAGMA foreign_keys=ON")
+            db.execute("CREATE TEMP TABLE geo_ships AS "
+                       "SELECT * FROM main.geo_ships WHERE id='vesta'")
+            db.execute("UPDATE temp.geo_ships SET owner='Intruder'")
+            db.commit()
+            db.execute("BEGIN IMMEDIATE")
+            with self.assertRaises((PermissionError, RuntimeError)):
+                depart_and_schedule_in_transaction(
+                    self.clock, self.geo, db, "vesta", "moon", actor="Intruder",
+                    now=int(START.timestamp()), action_id="spoofed_owner",
+                )
+            db.commit()
+        self.assertEqual("docked", self.geo.ship_status("vesta")["state"])
+        with closing(sqlite3.connect(self.path)) as db:
+            self.assertEqual(0, db.execute(
+                "SELECT COUNT(*) FROM main.geo_ship_events WHERE ship_id='vesta'").fetchone()[0])
+
+    def test_temp_clock_shadow_cannot_strand_departing_ship(self):
+        from realm.ship_clock_dispatch import depart_and_schedule_in_transaction
+        self.geo.register_ship("vesta", "Vesta", "Patrick", "earth")
+        with closing(sqlite3.connect(self.path)) as db:
+            db.row_factory = sqlite3.Row
+            db.execute("PRAGMA foreign_keys=ON")
+            db.execute(
+                "CREATE TEMP TABLE clock_events("
+                "event_id TEXT PRIMARY KEY,due_utc TEXT NOT NULL,"
+                "kind TEXT NOT NULL,payload_json TEXT NOT NULL,processed_utc TEXT)"
+            )
+            db.execute("BEGIN IMMEDIATE")
+            try:
+                depart_and_schedule_in_transaction(
+                    self.clock, self.geo, db, "vesta", "moon", actor="Patrick",
+                    now=int(START.timestamp()), action_id="shadow_clock",
+                )
+            except RuntimeError as exc:
+                self.assertIn("shadow", str(exc).lower())
+            else:
+                self.assertEqual(1, db.execute(
+                    "SELECT COUNT(*) FROM main.clock_events WHERE kind='ship_arrival' "
+                "AND payload_json LIKE '%vesta%'"
+                ).fetchone()[0], "Successful departure must schedule in main, never TEMP")
+            db.commit()
+        with closing(sqlite3.connect(self.path)) as db:
+            state = self.geo.ship_status("vesta")["state"]
+            queued = db.execute(
+                "SELECT COUNT(*) FROM main.clock_events WHERE kind='ship_arrival' "
+                "AND payload_json LIKE '%vesta%'"
+            ).fetchone()[0]
+            self.assertEqual(state == "in_transit", queued == 1)
+
+    def test_forged_temp_receipt_cannot_skip_real_ship_update(self):
+        from realm.ship_clock_dispatch import depart_and_schedule_in_transaction
+        self.geo.register_ship("vesta", "Vesta", "Patrick", "earth")
+        with closing(sqlite3.connect(self.path)) as db:
+            db.row_factory = sqlite3.Row
+            db.execute("PRAGMA foreign_keys=ON")
+            db.execute("CREATE TEMP TABLE geo_ship_receipts AS "
+                       "SELECT * FROM main.geo_ship_receipts WHERE 0")
+            db.execute(
+                "INSERT INTO temp.geo_ship_receipts "
+                "(ship_id,actor,action_id,command,response_json) "
+                "VALUES(?,?,?,?,?)",
+                ("vesta", "Patrick", "receipt_spoof", "depart:moon", "{}"),
+            )
+            db.commit()
+            db.execute("BEGIN IMMEDIATE")
+            try:
+                depart_and_schedule_in_transaction(
+                    self.clock, self.geo, db, "vesta", "moon", actor="Patrick",
+                    now=int(START.timestamp()), action_id="receipt_spoof",
+                )
+            except RuntimeError as exc:
+                self.assertIn("shadow", str(exc).lower())
+            else:
+                self.assertEqual(1, db.execute(
+                    "SELECT COUNT(*) FROM main.geo_ship_receipts "
+                    "WHERE ship_id='vesta' AND action_id='receipt_spoof'"
+                ).fetchone()[0])
+            db.commit()
+        with closing(sqlite3.connect(self.path)) as db:
+            state = self.geo.ship_status("vesta")["state"]
+            receipts = db.execute(
+                "SELECT COUNT(*) FROM main.geo_ship_receipts "
+                "WHERE ship_id='vesta' AND action_id='receipt_spoof'"
+            ).fetchone()[0]
+            self.assertEqual(state == "in_transit", receipts == 1)
+
 if __name__ == "__main__":
     unittest.main()

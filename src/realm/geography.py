@@ -375,12 +375,12 @@ class Geography:
             db.execute("BEGIN IMMEDIATE")
             if self._place(db, planet_id)["kind"] != "planet":
                 raise ValueError("Ships must start at a planet")
-            db.execute("INSERT INTO geo_ships(id,name,owner,planet_id) VALUES(?,?,?,?)",
+            db.execute("INSERT INTO main.geo_ships(id,name,owner,planet_id) VALUES(?,?,?,?)",
                        (ship_id, name, owner, planet_id))
 
     def ship_status(self, ship_id: str) -> dict:
         with self._connect() as db:
-            row = db.execute("SELECT * FROM geo_ships WHERE id=?", (ship_id,)).fetchone()
+            row = db.execute("SELECT * FROM main.geo_ships WHERE id=?", (ship_id,)).fetchone()
             if row is None:
                 raise ValueError("Unknown ship")
             return {"id": row["id"], "name": row["name"], "owner": row["owner"],
@@ -396,7 +396,7 @@ class Geography:
         if not isinstance(action_id, str) or not 1 <= len(action_id) <= 128:
             raise ValueError("Action ID must be a nonempty string up to 128 characters")
         row = db.execute(
-            "SELECT command,response_json FROM geo_ship_receipts "
+            "SELECT command,response_json FROM main.geo_ship_receipts "
             "WHERE ship_id=? AND actor=? AND action_id=?", (ship_id, actor, action_id),
         ).fetchone()
         if row is None:
@@ -410,7 +410,7 @@ class Geography:
                        action_id: str | None, command: str, response: dict) -> None:
         if action_id is not None:
             db.execute(
-                "INSERT INTO geo_ship_receipts(ship_id,actor,action_id,command,response_json) "
+                "INSERT INTO main.geo_ship_receipts(ship_id,actor,action_id,command,response_json) "
                 "VALUES(?,?,?,?,?)",
                 (ship_id, actor, action_id, command, json.dumps(response, sort_keys=True)),
             )
@@ -436,7 +436,7 @@ class Geography:
     def _depart_on_connection(self, db: sqlite3.Connection, ship_id: str,
                               destination: str, actor: str, at: int,
                               action_id: str | None) -> dict:
-        ship = db.execute("SELECT * FROM geo_ships WHERE id=?", (ship_id,)).fetchone()
+        ship = db.execute("SELECT * FROM main.geo_ships WHERE id=?", (ship_id,)).fetchone()
         if ship is None:
             raise ValueError("Unknown ship")
         if ship["owner"] != actor:
@@ -448,17 +448,17 @@ class Geography:
         if ship["destination"] is not None:
             raise ValueError("Ship is already in transit")
         link = db.execute(
-            "SELECT seconds FROM geo_links WHERE origin=? AND destination=? AND mode='ship'",
+            "SELECT seconds FROM main.geo_links WHERE origin=? AND destination=? AND mode='ship'",
             (ship["planet_id"], destination),
         ).fetchone()
         if link is None:
             raise ValueError("No direct ship route is declared")
         arrival = at + link["seconds"]
         self._valid_epoch(arrival)
-        db.execute("UPDATE geo_ships SET destination=?,arrival_at=? WHERE id=? AND destination IS NULL",
+        db.execute("UPDATE main.geo_ships SET destination=?,arrival_at=? WHERE id=? AND destination IS NULL",
                    (destination, arrival, ship_id))
         payload = {"from": ship["planet_id"], "to": destination, "arrival_at": arrival}
-        db.execute("INSERT INTO geo_ship_events(occurred_at,ship_id,actor,kind,payload_json) VALUES(?,?,?,?,?)",
+        db.execute("INSERT INTO main.geo_ship_events(occurred_at,ship_id,actor,kind,payload_json) VALUES(?,?,?,?,?)",
                    (at, ship_id, actor, "depart", json.dumps(payload, sort_keys=True)))
         response = {"ship": ship_id, "state": "in_transit", **payload}
         self._store_receipt(db, ship_id, actor, action_id, command, response)
@@ -554,7 +554,7 @@ class Geography:
 
     def _arrive_on_connection(self, db: sqlite3.Connection, ship_id: str,
                               at: int, action_id: str | None) -> dict:
-        ship = db.execute("SELECT * FROM geo_ships WHERE id=?", (ship_id,)).fetchone()
+        ship = db.execute("SELECT * FROM main.geo_ships WHERE id=?", (ship_id,)).fetchone()
         if ship is None:
             raise ValueError("Unknown ship")
         command = "arrive"
@@ -565,10 +565,10 @@ class Geography:
             raise ValueError("Ship is already docked")
         if at < ship["arrival_at"]:
             raise ValueError("Ship has not reached its destination")
-        db.execute("UPDATE geo_ships SET planet_id=?,destination=NULL,arrival_at=NULL WHERE id=?",
+        db.execute("UPDATE main.geo_ships SET planet_id=?,destination=NULL,arrival_at=NULL WHERE id=?",
                    (ship["destination"], ship_id))
         payload = {"from": ship["planet_id"], "to": ship["destination"]}
-        db.execute("INSERT INTO geo_ship_events(occurred_at,ship_id,actor,kind,payload_json) VALUES(?,?,?,?,?)",
+        db.execute("INSERT INTO main.geo_ship_events(occurred_at,ship_id,actor,kind,payload_json) VALUES(?,?,?,?,?)",
                    (at, ship_id, "system", "arrive", json.dumps(payload, sort_keys=True)))
         response = {"ship": ship_id, "state": "docked", "planet": ship["destination"]}
         self._store_receipt(db, ship_id, "system", action_id, command, response)
