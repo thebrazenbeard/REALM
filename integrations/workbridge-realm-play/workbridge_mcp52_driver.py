@@ -148,6 +148,17 @@ def _rpc(method: str, request_id: int, params: dict | None = None) -> dict:
             **({"params": params} if params is not None else {})}
 
 
+def _post_dispatch_error(tool: str, code: str) -> DriverError:
+    """A batched tools/call may commit before a malformed/error reply arrives.
+
+    Only local validation and preflight, which run before subprocess launch,
+    can be treated as definite denials of a mutating request. The initializer,
+    tool list and tool call are written in one batch, so even a missing tool or
+    wrong server identity in the replies cannot prove no mutation occurred.
+    """
+    return DriverError("MCP_OUTCOME_INDETERMINATE" if tool in MUTATING else code)
+
+
 def call(config: dict, request: object, *, timeout: int = 12) -> dict:
     name, args = validate_request(request)
     token = token_from_file(Path(config["token_file"]))
@@ -156,6 +167,9 @@ def call(config: dict, request: object, *, timeout: int = 12) -> dict:
     env.update({"REALM_DB_PATH": config["world_db"],
                 "REALM_WORLD_ID": config["expected_world_id"],
                 "REALM_PLAYER_TOKEN": token,
+                # Every one-shot subprocess has exactly one admitted tool.
+                # Never inherit a wider host/caller-supplied MCP allowlist.
+                "REALM_MCP_ALLOWED_TOOLS": name,
                 "PYTHONPATH": str(Path(config["realm_root"]) / "src")})
     lines = [
         _rpc("initialize", 101, {"protocolVersion": "2025-06-18", "capabilities": {},
@@ -194,27 +208,27 @@ def call(config: dict, request: object, *, timeout: int = 12) -> dict:
     info = initialize_result.get("serverInfo") if type(initialize_result) is dict else None
     if (type(info) is not dict or info.get("name") != "realm-local"
             or "error" in replies[0]):
-        raise DriverError("MCP_IDENTITY_MISMATCH")
+        raise _post_dispatch_error(name, "MCP_IDENTITY_MISMATCH")
     discovered = replies[1].get("result")
     tools = discovered.get("tools") if type(discovered) is dict else None
     if (type(tools) is not list or name not in
             {t.get("name") for t in tools if type(t) is dict}):
-        raise DriverError("MCP_TOOL_MISSING")
+        raise _post_dispatch_error(name, "MCP_TOOL_MISSING")
     result = replies[2].get("result")
     if type(result) is not dict or result.get("isError") is not False:
-        raise DriverError("MCP_ACTION_REJECTED")
+        raise _post_dispatch_error(name, "MCP_ACTION_REJECTED")
     blocks = result.get("content")
     if (type(blocks) is not list or len(blocks) != 1
             or type(blocks[0]) is not dict or blocks[0].get("type") != "text"
             or type(blocks[0].get("text")) is not str):
-        raise DriverError("MCP_RESULT_INVALID")
+        raise _post_dispatch_error(name, "MCP_RESULT_INVALID")
     game_data = result.get("structuredContent")
     if type(game_data) is not dict or game_data.get("ok") is not True:
-        raise DriverError("MCP_RESULT_INVALID")
+        raise _post_dispatch_error(name, "MCP_RESULT_INVALID")
     # The backend uses the text block directly for text-bearing responses;
     # status, feed and map instead use a human-readable JSON fallback.
     if "text" in game_data and game_data["text"] != blocks[0]["text"]:
-        raise DriverError("MCP_RESULT_INVALID")
+        raise _post_dispatch_error(name, "MCP_RESULT_INVALID")
     return {"ok": True, "tool": name, "game_text": blocks[0]["text"],
             "game_data": game_data,
             "game_text_trust": "UNTRUSTED_IN_WORLD_CONTENT",
