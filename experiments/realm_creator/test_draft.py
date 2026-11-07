@@ -35,6 +35,63 @@ def approval_for(draft):
 
 
 class DraftContractTests(unittest.TestCase):
+    def test_extracted_plain_text_chapters_keep_line_provenance(self):
+        source = (b"Source preface.\n"
+                  b"CHAPTER 1 - The Approach\n"
+                  b"A salvage crew approaches.\n"
+                  b"\n"
+                  b"Chapter Two: The Wreck\n"
+                  b"An empty vessel drifts.\n")
+        draft = prepare_draft("source_test", "Source test", {"extract.txt": source})
+        self.assertEqual([proposal["heading"] for proposal in draft["proposals"]],
+                         ["Unclassified preamble", "CHAPTER 1 - The Approach",
+                          "Chapter Two: The Wreck"])
+        self.assertEqual([proposal["provenance"]["start_line"] for proposal in
+                          draft["proposals"]], [1, 2, 5])
+        self.assertTrue(all(proposal["status"] == "UNREVIEWED" and
+                            proposal["room_candidate"] is False for proposal in draft["proposals"]))
+
+    def test_unheaded_extraction_is_bounded_and_covers_every_line(self):
+        lines = [f"Source record {i:04d}: " + "data " * 25 for i in range(1, 301)]
+        source = ("\n".join(lines) + "\n").encode("utf-8")
+        draft = prepare_draft("source_test", "Source test", {"extract.txt": source})
+        proposals = draft["proposals"]
+        self.assertGreater(len(proposals), 1)
+        self.assertLessEqual(len(proposals), 64)
+        self.assertTrue(all(proposal["heading"].startswith("Unclassified source") for proposal
+                            in proposals))
+        ranges = [(proposal["provenance"]["start_line"],
+                   proposal["provenance"]["end_line"]) for proposal in proposals]
+        self.assertEqual(ranges[0][0], 1)
+        self.assertEqual(ranges[-1][1], len(lines))
+        self.assertTrue(all(right[0] == left[1] + 1 for left, right in zip(ranges, ranges[1:])))
+        self.assertTrue(all(proposal["excerpt_truncated"] for proposal in proposals))
+
+    def test_large_extracted_docx_text_size_without_real_corpus(self):
+        # Synthetic ~170-KiB plain-text extraction; no proprietary source included.
+        lines = [f"Line {i:04d} " + "x" * 143 for i in range(1, 1131)]
+        source = ("\n".join(lines) + "\n").encode("utf-8")
+        self.assertGreater(len(source), 160 * 1024)
+        self.assertLess(len(source), 256 * 1024)
+        draft = prepare_draft("source_test", "Source test", {"core_extract.txt": source})
+        self.assertGreater(len(draft["proposals"]), 30)
+        self.assertLessEqual(len(draft["proposals"]), 64)
+        self.assertEqual(draft["proposals"][-1]["provenance"]["end_line"], len(lines))
+        self.assertIsNone(draft["worldpack"])
+
+    def test_long_markdown_section_preserves_original_heading_provenance(self):
+        body = [f"Detail {i:03d}: " + "z" * 120 for i in range(120)]
+        draft = prepare_draft("source_test", "Source test",
+                              {"notes.md": ("# Derelict\n" + "\n".join(body)).encode()})
+        parts = draft["proposals"]
+        self.assertGreater(len(parts), 2)
+        self.assertTrue(parts[0]["heading"].startswith("Derelict"))
+        self.assertEqual(parts[0]["provenance"]["start_line"], 1)
+        for prior, following in zip(parts, parts[1:]):
+            self.assertEqual(following["provenance"]["start_line"],
+                             prior["provenance"]["end_line"] + 1)
+        self.assertEqual(parts[-1]["provenance"]["end_line"], len(body) + 1)
+
     def test_deterministic_provenance_no_canon_promotion(self):
         one = prepare_draft("driftspace_draft", "Driftspace draft", {"notes.md": SOURCE})
         two = prepare_draft("driftspace_draft", "Driftspace draft", {"notes.md": SOURCE})

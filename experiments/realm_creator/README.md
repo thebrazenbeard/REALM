@@ -9,9 +9,18 @@ UTF-8 `.txt`, `.md` or `.markdown` files (256 KiB each; 1 MiB total). It returns
 line references. Headings are *sections*, **not assumed rooms or factual lore**.
 Every section remains `UNREVIEWED`, `room_candidate=false`; long excerpts are
 flagged as truncated. Unicode bidi-format and invisible control characters
-are rejected at intake to limit display/name spoofing. This is not
-PDF/DOCX/ZIP ingestion or open-ended
-AI world generation.
+are rejected at intake to limit display/name spoofing. Markdown headings and
+explicit plaintext `Chapter`/`Part`/`Section` headings from extracted documents
+are recognized; unheaded or long sections are divided into line-aligned,
+roughly 4 KiB review segments, with inclusive source-line ranges and the
+original file digest retained. A single long line is kept whole rather than
+inventing inaccurate column provenance. At most 64 sections may result; if
+that cap is exceeded, intake rejects the file rather than dropping content.
+Only the first 600 characters of each section are displayed in the preview;
+reviewers need the private original to inspect the full cited range.
+This is **not** native PDF/DOCX/CSV/ZIP ingestion or open-ended AI world
+generation. A source-owner-approved UTF-8 text extraction is a valid input,
+but its provenance must be tied to the original artifact separately.
 
 `compile_approved_worldpack(draft, approval)` requires a matching draft hash,
 explicit review acknowledgement and host-authored rooms/exits linked to source

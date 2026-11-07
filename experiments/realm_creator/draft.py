@@ -22,8 +22,18 @@ MAX_FILE_BYTES = 256 * 1024
 MAX_TOTAL_BYTES = 1024 * 1024
 MAX_PROPOSALS = 64
 MAX_EXCERPT_CHARS = 600
+MAX_SECTION_CHARS = 4096
 _FILE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9 _.-]{0,99}\.(?:txt|md|markdown)$")
 _HEADING = re.compile(r"^#{1,3}[ \t]+(.+?)\s*#*\s*$")
+_PLAIN_HEADING = re.compile(
+    r"^(?:chapter|part|section)\s+"
+    r"(?:\d{1,3}(?:\.\d{1,3})?|[ivxlcdm]{1,12}|"
+    r"zero|one|two|three|four|five|six|seven|eight|nine|ten|"
+    r"eleven|twelve|thirteen|fourteen|fifteen|sixteen|seventeen|"
+    r"eighteen|nineteen|twenty)"
+    r"(?:\s*(?:[:.\-\u2013\u2014])\s*\S.*|\s+\S.*)?$",
+    re.IGNORECASE,
+)
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _PROPOSAL_ID = re.compile(r"^src-[0-9a-f]{16}$")
 
@@ -115,21 +125,63 @@ def _validate_draft(draft: object) -> dict:
     return obj
 
 
+def _heading_label(line: str) -> str | None:
+    """Recognize explicit Markdown or plain DOCX-extraction chapter headings."""
+    markdown = _HEADING.fullmatch(line)
+    if markdown:
+        return markdown.group(1).strip()[:100]
+    stripped = line.strip()
+    if 1 <= len(stripped) <= 100 and _PLAIN_HEADING.fullmatch(stripped):
+        return stripped
+    return None
+
+
+def _section_chunks(lines: list[str], label: str, body_start_line: int,
+                    *, heading_line: int | None = None) -> list[tuple[str, str, int, int]]:
+    """Chunk on whole lines, preserving the source's inclusive line ranges.
+
+    Exceptional individual long source lines are not split without a column
+    provenance schema. They remain reviewable through their original line.
+    """
+    if not lines:
+        line = heading_line or body_start_line
+        return [(label[:100], "", line, line)]
+    chunks: list[tuple[str, int, int]] = []
+    start = 0
+    chars = 0
+    for index, line in enumerate(lines):
+        width = len(line) + 1
+        if chars and chars + width > MAX_SECTION_CHARS:
+            chunks.append(("\n".join(lines[start:index]).strip(), start, index - 1))
+            start = index
+            chars = 0
+        chars += width
+    chunks.append(("\n".join(lines[start:]).strip(), start, len(lines) - 1))
+    result = []
+    for index, (content, first, last) in enumerate(chunks):
+        chunk_label = label[:100] if len(chunks) == 1 else (
+            f"{label[:70]} (segment {index + 1} of {len(chunks)})")
+        first_line = (heading_line if index == 0 and heading_line is not None
+                      else body_start_line + first)
+        result.append((chunk_label, content, first_line, body_start_line + last))
+    return result
+
+
 def _sections(text: str) -> list[tuple[str, str, int, int]]:
-    """Heuristic section extraction. A section is never presumed to be a room."""
+    """Reviewable bounded sections; never presumed to be rooms or canon."""
     lines = text.splitlines()
-    headings = [(i, match.group(1).strip()) for i, line in enumerate(lines, 1)
-                if (match := _HEADING.fullmatch(line))]
+    headings = [(index, label) for index, line in enumerate(lines)
+                if (label := _heading_label(line)) is not None]
     if not headings:
-        return [("Unclassified source", text.strip(), 1, max(1, len(lines)))]
-    results = []
-    if headings[0][0] > 1 and "\n".join(lines[:headings[0][0] - 1]).strip():
-        results.append(("Unclassified preamble", "\n".join(lines[:headings[0][0] - 1]).strip(),
-                        1, headings[0][0] - 1))
-    for index, (line, label) in enumerate(headings):
-        following = headings[index + 1][0] if index + 1 < len(headings) else len(lines) + 1
-        content = "\n".join(lines[line:following - 1]).strip()
-        results.append((label[:100], content, line, following - 1))
+        return _section_chunks(lines, "Unclassified source", 1)
+    results: list[tuple[str, str, int, int]] = []
+    if headings[0][0] > 0 and "\n".join(lines[:headings[0][0]]).strip():
+        results.extend(_section_chunks(lines[:headings[0][0]], "Unclassified preamble", 1))
+    for index, (line_index, label) in enumerate(headings):
+        next_index = (headings[index + 1][0] if index + 1 < len(headings)
+                      else len(lines))
+        results.extend(_section_chunks(lines[line_index + 1:next_index], label,
+                                       line_index + 2, heading_line=line_index + 1))
     return results
 
 
