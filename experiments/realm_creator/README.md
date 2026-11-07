@@ -22,6 +22,35 @@ This is **not** native PDF/DOCX/CSV/ZIP ingestion or open-ended AI world
 generation. A source-owner-approved UTF-8 text extraction is a valid input,
 but its provenance must be tied to the original artifact separately.
 
+### Incremental private corpus staging
+
+`corpus.new_corpus()` and `corpus.stage_batch()` provide a separate, strictly
+**private and unreviewed** staging path for projects larger than one draft.
+Sources are safe relative `.txt`, `.md`, `.markdown` or `.csv` paths. Each
+bounded batch accepts up to eight files, with the same 256 KiB/file and
+1 MiB/batch byte limits. It retains source-path identities, SHA-256 source
+revisions, record candidates, physical source-line ranges, batch receipts,
+and unresolved revision/cross-document conflict records. A large CSV may be
+staged over multiple CAS-checked batches by resubmitting the same source bytes;
+`candidates_staged` and `candidates_total` show when it is complete. Retried
+batch IDs with the same payload are idempotent; changing a batch's bytes or
+writing against a stale corpus hash is rejected. Numeric plain-text chapter
+headings are split into source-linked review sections; `.csv` rows are
+review candidates, never automatically rooms, planets, or accepted lore.
+
+This is a **data-transform library**, not a durable upload service. The caller
+must supply securely retained original bytes again for resumable sources, bind
+extractions to original DOCX/PDF custody, authenticate review and persist the
+ledger with real concurrency control. A plain hash is not an author signature.
+The current source parser also limits CSV candidates to 10,000 per source,
+physical source lines to 20,000, and aggregate staging to 100,000 candidates
+and 2,048 source revisions; larger inputs are rejected rather than truncated.
+Binary uploads, OCR, automated contradiction detection, complete manuscript
+semantic interpretation, and live-world expansion remain outside this module.
+Do not persist its private excerpts in a public repository, CI log or training
+dataset. `corpus.py` does not change the narrower single-draft API or its
+64-proposal limit.
+
 `compile_approved_worldpack(draft, approval)` requires a matching draft hash,
 explicit review acknowledgement and host-authored rooms/exits linked to source
 proposal IDs. It validates with the existing REALM `worldpack.v1` validator
