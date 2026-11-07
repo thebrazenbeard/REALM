@@ -29,6 +29,14 @@ On PowerShell, set `$env:PYTHONPATH='src'` before launching the module.
   that reservation is released on `quit`, EOF, timeout, or socket error. This
   is **not** durable account ownership or authenticated player identity. There
   is no account password, permission system, encryption, or moderation yet.
+- The first actual Telnet character join transactionally claims this SQLite
+  world for `shared-token-demo` identity. An authenticated HTTP gateway claims
+  `player-bearer-http` instead, so cross-adapter identity downgrade on the same
+  world is refused. Claims persist across restarts; switching modes requires
+  an explicitly reviewed offline migration. Existing HTTP credential tables
+  also block a missing-marker shared-token claim. This **does not** prevent
+  one Telnet token holder from impersonating a disconnected character or NPC
+  inside a standalone Telnet demo world. The in-DB marker is not tamper-proof.
 - No automatic live push of other players' actions in this initial adapter;
   issue `listen` to see durable room-local events. No SSH/GMCP protocol yet.
 - Access is capped to eight simultaneous local connections; oversized input
