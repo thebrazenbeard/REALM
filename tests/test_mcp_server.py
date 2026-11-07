@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from contextlib import closing
 import io
 import json
 import os
@@ -60,7 +61,7 @@ class MCPServerTests(unittest.TestCase):
         first = self.bridge.call("realm_move", args)
         self.assertIn("Corridor", first["text"])
         self.assertEqual(first, self.bridge.call("realm_move", args))
-        with sqlite3.connect(self.database) as db:
+        with closing(sqlite3.connect(self.database)) as db, db:
             self.assertEqual(db.execute("SELECT COUNT(*) FROM action_receipts").fetchone()[0], 2)
             self.assertEqual(db.execute("SELECT COUNT(*) FROM events WHERE kind='move'").fetchone()[0], 1)
         with self.assertRaisesRegex(ValueError, "Action ID"):
@@ -82,7 +83,7 @@ class MCPServerTests(unittest.TestCase):
         args = {"command": "north", "action_id": "move-1"}
         first = self.bridge.call("realm_command", args)
         self.assertEqual(first, self.bridge.call("realm_command", args))
-        with sqlite3.connect(self.database) as db:
+        with closing(sqlite3.connect(self.database)) as db, db:
             self.assertEqual(db.execute("SELECT COUNT(*) FROM action_receipts").fetchone()[0], 1)
             self.assertEqual(db.execute("SELECT room_id FROM players WHERE id='Vera'").fetchone()[0], "corridor")
         with self.assertRaisesRegex(ValueError, "Action ID"):
@@ -120,7 +121,7 @@ class MCPServerTests(unittest.TestCase):
     def test_wrong_world_refuses_without_rebinding_state(self):
         with self.assertRaisesRegex(RealmMCPError, "does not match"):
             RealmMCPBridge(str(self.database), "otherworld", self.token)
-        with sqlite3.connect(self.database) as db:
+        with closing(sqlite3.connect(self.database)) as db, db:
             self.assertEqual(db.execute("SELECT value FROM world_meta WHERE key='world_id'").fetchone()[0], "sandbox")
 
     def test_missing_world_does_not_seed_demo_file(self):
@@ -131,43 +132,43 @@ class MCPServerTests(unittest.TestCase):
 
     def test_rejected_partial_world_never_gets_initialized(self):
         partial = self.directory / "partial.sqlite3"
-        with sqlite3.connect(partial) as db:
+        with closing(sqlite3.connect(partial)) as db, db:
             db.execute("CREATE TABLE world_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
             db.execute("INSERT INTO world_meta VALUES ('world_id','sandbox')")
             before = db.execute("SELECT name FROM sqlite_master ORDER BY name").fetchall()
         with self.assertRaisesRegex(RealmMCPError, "incomplete or incompatible"):
             RealmMCPBridge(str(partial), "sandbox", self.token)
-        with sqlite3.connect(partial) as db:
+        with closing(sqlite3.connect(partial)) as db, db:
             self.assertEqual(db.execute("SELECT name FROM sqlite_master ORDER BY name").fetchall(), before)
             self.assertEqual(db.execute("SELECT COUNT(*) FROM world_meta").fetchone()[0], 1)
 
     def test_rejected_existing_world_does_not_recreate_missing_tables(self):
         self.host.credentials.revoke("Vera")
-        with sqlite3.connect(self.database) as db:
+        with closing(sqlite3.connect(self.database)) as db, db:
             db.execute("DROP TABLE geo_places")
             before = db.execute("SELECT name FROM sqlite_master ORDER BY name").fetchall()
         with self.assertRaisesRegex(RealmMCPError, "incomplete or incompatible"):
             RealmMCPBridge(str(self.database), "sandbox", self.token)
-        with sqlite3.connect(self.database) as db:
+        with closing(sqlite3.connect(self.database)) as db, db:
             self.assertEqual(db.execute("SELECT name FROM sqlite_master ORDER BY name").fetchall(), before)
             self.assertEqual(db.execute("SELECT COUNT(*) FROM rooms").fetchone()[0], 3)
 
     def test_wrong_token_does_not_change_qualified_world(self):
-        with sqlite3.connect(self.database) as db:
+        with closing(sqlite3.connect(self.database)) as db, db:
             before = db.execute("SELECT name FROM sqlite_master ORDER BY name").fetchall()
         with self.assertRaisesRegex(RealmMCPError, "invalid or revoked"):
             RealmMCPBridge(str(self.database), "sandbox", "x" * 32)
-        with sqlite3.connect(self.database) as db:
+        with closing(sqlite3.connect(self.database)) as db, db:
             self.assertEqual(db.execute("SELECT name FROM sqlite_master ORDER BY name").fetchall(), before)
             self.assertEqual(db.execute("SELECT COUNT(*) FROM players").fetchone()[0], 0)
 
     def test_valid_token_cannot_seed_empty_existing_room_table(self):
-        with sqlite3.connect(self.database) as db:
+        with closing(sqlite3.connect(self.database)) as db, db:
             db.execute("DELETE FROM rooms")
             before = db.execute("SELECT COUNT(*) FROM rooms").fetchone()[0]
         with self.assertRaisesRegex(RealmMCPError, "no authored or seeded rooms"):
             RealmMCPBridge(str(self.database), "sandbox", self.token)
-        with sqlite3.connect(self.database) as db:
+        with closing(sqlite3.connect(self.database)) as db, db:
             self.assertEqual(db.execute("SELECT COUNT(*) FROM rooms").fetchone()[0], before)
 
     def test_revoke_takes_effect_without_restart_and_never_leaks_token(self):
@@ -179,23 +180,23 @@ class MCPServerTests(unittest.TestCase):
 
     def test_rebinding_world_invalidates_live_bridge_before_effect(self):
         self.bridge.call("realm_join", {})
-        with sqlite3.connect(self.database) as db:
+        with closing(sqlite3.connect(self.database)) as db, db:
             db.execute("UPDATE world_meta SET value='otherworld' WHERE key='world_id'")
         with self.assertRaisesRegex(RealmMCPError, "does not match"):
             self.bridge.call("realm_move", {"direction": "north", "action_id": "invalid-world-move"})
-        with sqlite3.connect(self.database) as db:
+        with closing(sqlite3.connect(self.database)) as db, db:
             self.assertEqual(db.execute("SELECT room_id FROM players WHERE id='Vera'").fetchone()[0], "atrium")
             self.assertEqual(db.execute("SELECT COUNT(*) FROM action_receipts").fetchone()[0], 0)
 
     def test_rebinding_same_token_to_different_player_cannot_change_live_identity(self):
         self.assertEqual(self.bridge.call("realm_status", {})["player"], "Vera")
-        with sqlite3.connect(self.database) as db:
+        with closing(sqlite3.connect(self.database)) as db, db:
             db.execute("UPDATE player_credentials SET player_name='Patrick' WHERE player_name='Vera'")
         with self.assertRaisesRegex(RealmMCPError, "identity changed"):
             self.bridge.call("realm_status", {})
         with self.assertRaisesRegex(RealmMCPError, "identity changed"):
             self.bridge.call("realm_join", {})
-        with sqlite3.connect(self.database) as db:
+        with closing(sqlite3.connect(self.database)) as db, db:
             self.assertEqual(db.execute("SELECT COUNT(*) FROM players").fetchone()[0], 0)
 
     def test_overlong_or_nonprintable_speech_rejected_without_receipt(self):
@@ -203,7 +204,7 @@ class MCPServerTests(unittest.TestCase):
         for message in ("x" * 281, "hello\tworld", "hello\nworld", " hello", "hello "):
             with self.subTest(message=repr(message)), self.assertRaises(RealmMCPError):
                 self.bridge.call("realm_say", {"message": message, "action_id": "bad-speech"})
-        with sqlite3.connect(self.database) as db:
+        with closing(sqlite3.connect(self.database)) as db, db:
             self.assertEqual(db.execute("SELECT COUNT(*) FROM action_receipts").fetchone()[0], 0)
 
     def test_mcp_initialize_list_and_tool_call_on_stdin(self):
@@ -266,7 +267,7 @@ class MCPServerTests(unittest.TestCase):
         self.assertEqual(replies[2]["result"]["structuredContent"],
                          replies[3]["result"]["structuredContent"])
         self.assertIn("I made it.", replies[5]["result"]["content"][0]["text"])
-        with sqlite3.connect(self.database) as db:
+        with closing(sqlite3.connect(self.database)) as db, db:
             self.assertEqual(db.execute("SELECT COUNT(*) FROM action_receipts").fetchone()[0], 2)
             self.assertEqual(db.execute("SELECT COUNT(*) FROM events WHERE kind='move'").fetchone()[0], 1)
             self.assertEqual(db.execute("SELECT COUNT(*) FROM events WHERE kind='say'").fetchone()[0], 1)
@@ -279,7 +280,7 @@ class MCPServerTests(unittest.TestCase):
         serve_stdio(self.bridge, io.BytesIO(raw), destination)
         response = json.loads(destination.getvalue())
         self.assertEqual(response["error"]["code"], -32700)
-        with sqlite3.connect(self.database) as db:
+        with closing(sqlite3.connect(self.database)) as db, db:
             self.assertEqual(db.execute("SELECT COUNT(*) FROM players").fetchone()[0], 0)
 
     def test_deep_json_parser_recursion_cannot_crash_stdio_session(self):
@@ -292,7 +293,10 @@ class MCPServerTests(unittest.TestCase):
         serve_stdio(self.bridge, io.BytesIO(nested + ping), output)
         rows = [json.loads(line) for line in output.getvalue().splitlines()]
         self.assertEqual(len(rows), 2)
-        self.assertEqual(rows[0]["error"]["code"], -32700)
+        # Python's JSON decoder may reject this by depth (-32700), or
+        # successfully decode a deeply nested non-request value (-32600).
+        # The contract is rejection without terminating the subsequent ping.
+        self.assertIn(rows[0]["error"]["code"], (-32700, -32600))
         self.assertEqual(rows[1]["id"], 9)
         self.assertEqual(rows[1]["result"], {})
 
