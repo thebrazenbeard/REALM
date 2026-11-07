@@ -49,12 +49,14 @@ def schedule_in_transaction(
         raise ValueError("Connection must use sqlite3.Row row_factory")
     if db.execute("PRAGMA foreign_keys").fetchone()[0] != 1:
         raise RuntimeError("Shared scheduling requires enabled foreign keys")
+    # Host callbacks can create TEMP tables; SQLite otherwise resolves their
+    # names before main, leading to phantom event receipts after commit.
     if db.execute(
-        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='clock_events'"
+        "SELECT 1 FROM main.sqlite_master WHERE type='table' AND name='clock_events'"
     ).fetchone() is None:
         raise RuntimeError("World clock must be explicitly enabled")
     if db.execute(
-        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='clock_state'"
+        "SELECT 1 FROM main.sqlite_master WHERE type='table' AND name='clock_state'"
     ).fetchone() is None:
         raise RuntimeError("World clock must be explicitly enabled")
     # Reject a manually forged/partial event table masquerading as enable().
@@ -68,15 +70,15 @@ def schedule_in_transaction(
     ):
         columns = tuple(
             (row["name"], row["type"].upper(), row["notnull"], row["pk"])
-            for row in db.execute(f"PRAGMA table_info({table})")
+            for row in db.execute(f"PRAGMA main.table_info({table})")
         )
         if columns != expected:
             raise RuntimeError("World clock schema has not been explicitly enabled")
     bound = db.execute(
-        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='world_meta'"
+        "SELECT 1 FROM main.sqlite_master WHERE type='table' AND name='world_meta'"
     ).fetchone()
     if bound is None or db.execute(
-        "SELECT 1 FROM world_meta WHERE key='world_id' AND length(value)>0"
+        "SELECT 1 FROM main.world_meta WHERE key='world_id' AND length(value)>0"
     ).fetchone() is None:
         raise RuntimeError("World clock requires an initialized, bound world")
 
@@ -87,7 +89,7 @@ def schedule_in_transaction(
     due = _stamp(due_at)
     data = _payload(payload)
     existing = db.execute(
-        "SELECT * FROM clock_events WHERE event_id=?", (event_id,)
+        "SELECT * FROM main.clock_events WHERE event_id=?", (event_id,)
     ).fetchone()
     if existing is not None:
         if (existing["due_utc"], existing["kind"], existing["payload_json"]) != (
@@ -101,7 +103,7 @@ def schedule_in_transaction(
     db.execute("SAVEPOINT realm_clock_followup")
     try:
         db.execute(
-            "INSERT INTO clock_events(event_id,due_utc,kind,payload_json) VALUES(?,?,?,?)",
+            "INSERT INTO main.clock_events(event_id,due_utc,kind,payload_json) VALUES(?,?,?,?)",
             (event_id, due, kind, data),
         )
         result = DueEvent(event_id, datetime.fromisoformat(due),

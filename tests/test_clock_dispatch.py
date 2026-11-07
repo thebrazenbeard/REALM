@@ -186,6 +186,40 @@ class ClockDispatchTests(unittest.TestCase):
             self.assertEqual(0, check.execute(
                 "SELECT COUNT(*) FROM clock_events WHERE event_id='trapped'").fetchone()[0])
 
+    def test_temp_clock_events_shadow_cannot_steal_persistent_arrival(self):
+        # A same-connection TEMP schema with identical columns must not receive
+        # events that the independent WorldClock consumer will never see.
+        with closing(self._db()) as db:
+            db.execute("""CREATE TEMP TABLE clock_events (
+                event_id TEXT PRIMARY KEY, due_utc TEXT NOT NULL,
+                kind TEXT NOT NULL, payload_json TEXT NOT NULL,
+                processed_utc TEXT)""")
+            db.execute("BEGIN IMMEDIATE")
+            schedule_in_transaction(self.clock, db, "persistent-arrival",
+                                    due_at=BASE, kind="ship_arrival", payload={"ship": "vesta"})
+            self.assertEqual(1, db.execute(
+                "SELECT COUNT(*) FROM main.clock_events WHERE event_id='persistent-arrival'"
+            ).fetchone()[0])
+            self.assertEqual(0, db.execute(
+                "SELECT COUNT(*) FROM temp.clock_events"
+            ).fetchone()[0])
+            db.commit()
+        self.assertIsNotNone(self.clock.lookup("persistent-arrival"))
+
+    def test_temp_world_meta_and_clock_state_cannot_mask_main_bound_world(self):
+        with closing(self._db()) as db:
+            db.execute("CREATE TEMP TABLE world_meta(key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+            db.execute("""CREATE TEMP TABLE clock_state (
+                id INTEGER PRIMARY KEY CHECK(id = 1), last_utc TEXT NOT NULL)""")
+            db.execute("BEGIN IMMEDIATE")
+            schedule_in_transaction(self.clock, db, "trusted-main",
+                                    due_at=BASE, kind="test", payload={})
+            self.assertEqual(1, db.execute(
+                "SELECT COUNT(*) FROM main.clock_events WHERE event_id='trusted-main'"
+            ).fetchone()[0])
+            db.commit()
+        self.assertIsNotNone(self.clock.lookup("trusted-main"))
+
     def test_same_connection_followup_survives_clock_recreation(self):
         self.clock.schedule("origin", due_at=BASE, kind="npc", payload={})
         def host(db, _event):
