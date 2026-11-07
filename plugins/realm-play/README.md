@@ -5,6 +5,56 @@ to this ChatGPT Web session, or qualified against a played world. It does not
 install a service, expose a network port, provision a credential, or create a
 world automatically.
 
+## Private ChatGPT Desktop catalogue (source proposal only)
+
+The repository now supplies `.agents/plugins/marketplace.json`, a **repo-local**
+development catalogue pointing at `plugins/realm-play`. The entry is
+`AVAILABLE`, not an installation or activation receipt. The package remains
+named `realm-play` and uses local `stdio` in `mcp.json`; it contains no
+Platform tunnel ID, API key, remote URL or ChatGPT Web connection.
+
+[Official plugin packaging guidance](https://developers.openai.com/plugins/build/plugins)
+documents repository-local marketplaces and ChatGPT Desktop/Codex local
+installation. A desktop operator can, **after completing the safety gates
+below**, refresh the repository marketplace, restart ChatGPT Desktop and use a
+new *local* session to test discovery. A local stdio plugin cannot run in
+ordinary ChatGPT Web or mobile conversations. The user account's exact local
+plugin eligibility, Windows Python interpreter, and `REALM_ROOT` binding have
+not been independently qualified; do not treat this documentation as an
+installation instruction for the current host.
+
+**Do not install or invoke this source candidate as a live player yet.** The
+engine-owner strict-allowlist candidate `c791143a6f0b8d66bc1d3d45d5af71f4acaf4e41`
+enforces a host process-level allowlist. This plugin's launcher **always** sets
+`REALM_MCP_ALLOWED_TOOLS=realm_status,realm_look`, ignoring any inherited
+broader value, and refuses older engine code lacking the strict parser.
+This protects both `tools/list` and direct forbidden `tools/call` **when using
+that exact strict engine**; a prompt or catalogue alone provides no authority
+boundary. The compatible engine candidate is not yet merged or qualified on
+the user's actual host. Do not substitute broad Executor access.
+
+Before a bounded local pilot, verify all of these independently:
+
+1. Pin and inspect the exact engine and plugin Git heads, selected world,
+   authorized existing joined player, and host interpreter. Never write the
+   player token into plugin source or an issue/comment.
+2. Confirm the selected strict engine, launched through this plugin, advertises
+   **only** the two authorized tools,
+   rejects a direct `tools/call` for every excluded tool, and preserves this
+   rejection if the client bypasses `tools/list`.
+3. Run the existing no-gameplay-mutation qualification, then perform actual
+   ChatGPT Desktop tool discovery and harmless status/look round trips in a
+   new *local* session, confirming identity and world binding.
+4. Keep the deployment $0: no Platform tunnel, new API key, account upgrade,
+   paid inference, public listener or external host service is necessary for
+   the proposed local stdio approach. If the local account lacks permission,
+   report the limit rather than silently switching to a paid path.
+
+**Source-only acceptance:** the catalogue resolves to the packaged plugin;
+the strict engine enforces the pinned two-tool scope in disposable tests.
+Until exact source integration and host readback exist, the operational result
+is `NOT INSTALLED / NOT PLAYABLE IN CHATGPT`.
+
 This package is the **Plugin Creator frontend** for REALM's one authoritative
 gameplay backend: `src/realm/mcp_server.py` from [engine-side Draft PR #52](https://github.com/thebrazenbeard/REALM/pull/52).
 Its `server/realm_mcp.py` is only a source-path launcher. It must not contain a
@@ -25,12 +75,14 @@ Configure these values **privately in a trusted local MCP host**, not in Git,
 | `REALM_DB_PATH` | Absolute path to an existing, initialized world SQLite file. |
 | `REALM_WORLD_ID` | Expected persisted world ID; wrong-world startup fails. |
 | `REALM_PLAYER_TOKEN` | Private token for the exact host-authorized player, not an administrator credential. |
+| `REALM_MCP_ALLOWED_TOOLS` | Plugin-controlled fifth binding, **always** `realm_status,realm_look`; inherited values are replaced and cannot enable full gameplay through this launcher. |
 
 The plugin's `mcp.json` starts `python ${PLUGIN_ROOT}/server/realm_mcp.py` as a
 stdio subprocess. The launcher resolves `REALM_ROOT/src` and calls REALM's own
-`realm.mcp_server.main()`. The server refuses missing or malformed host binding
+`realm.mcp_server.main()`. The launcher refuses older adapters without strict
+host tool enforcement. The engine refuses missing or malformed host binding
 and reauthenticates the player on each tool invocation. Tool inputs cannot
-select an arbitrary database, world, token, or actor.
+select an arbitrary database, world, token, actor, or tool set.
 
 On Windows, the local host must invoke an actual installed Python interpreter,
 not the Microsoft Store `python` alias. Neither Python nor REALM is installed
@@ -38,7 +90,11 @@ automatically. Keep the host's filesystem and plugin configuration private.
 
 ## Gameplay contract
 
-The updated engine-side backend advertises nine tools:
+The full-game engine can advertise nine tools **only to a separately trusted
+engine host with an explicit full-game allowlist**. All nine are listed below
+for engine-contract reference. This desktop plugin's launcher advertises
+**only** `realm_status` and `realm_look`; the other seven are **not available
+through REALM Play**:
 
 - `realm_status` — verify the bound world/player identity.
 - `realm_join` — enter the game as the already credentialed player; a first
@@ -55,7 +111,8 @@ The updated engine-side backend advertises nine tools:
 - `realm_map` — inspect a map (currently **not qualified for fog-of-war
   privacy**; see below).
 
-For every `realm_command`, `realm_move`, and `realm_say`, the client must supply one
+In separately authorized future full-game integrations, for every
+`realm_command`, `realm_move`, and `realm_say`, the client must supply one
 nonempty, bounded `action_id`, freshly chosen **for that logical action** and
 reused unchanged after a timeout or uncertain response. A new ID for an
 uncertain retry can duplicate an already committed move or speech. The
@@ -142,14 +199,15 @@ may not be available to an individual Plus account. Free operation has
 **not** been verified, so the $0 rule forbids provisioning paid resources
 or starting a billed service without separate authorization.
 
-A tunnel supplies transport, **not** tool authority. Before exposing this
-backend to ChatGPT, enforce a host-side allowlist containing only
-`realm_status` and `realm_look`, with a pinned world and private player
-credential. The unrestricted nine-tool backend is not acceptable as a
-read-only pilot: `realm_command` can reach historical speech via `history`
-and `listen` even if `realm_feed` is hidden. Neither a plugin skill nor a
-prompt is a security boundary. The WorkBridge path in PR #53 is an alternate
-candidate, subject to the same host-enforced restrictions.
+A tunnel supplies transport, **not** tool authority. This plugin launcher
+pins `realm_status` and `realm_look` for the strict engine candidate; the
+unrestricted nine-tool engine is not an acceptable remote read-only pilot.
+For example, `realm_command` can reach historical speech via `history` and
+`listen` even if `realm_feed` is hidden. Neither a plugin skill nor a prompt
+is a security boundary. Before any separate ChatGPT transport, qualify the
+exact strict engine, pinned world, private player credential, and direct
+denial of all excluded tools. The WorkBridge path in PR #53 is an alternate
+transport candidate, subject to the same host-enforced restrictions.
 
 ## Boundaries
 

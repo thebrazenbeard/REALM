@@ -1,19 +1,19 @@
 {
   "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
   "name": "realm-play",
-  "version": "0.2.1",
-  "description": "Use one authenticated, world-bound REALM gameplay backend through a local stdio MCP host.",
+  "version": "0.2.3",
+  "description": "Desktop-only, source-only read-only REALM MCP pilot for one host-bound player.",
   "author": {"name": "thebrazenbeard"},
   "repository": "https://github.com/thebrazenbeard/REALM",
   "extensions": {
     "com.openai": {
       "interface": {
         "displayName": "REALM Play",
-        "shortDescription": "Play local REALM worlds",
-        "longDescription": "Local-only REALM tools for an authenticated player to observe and act through the game's authoritative Gateway and Engine. Requires the matching REALM source, an existing world, a host-provisioned player token and a compatible local MCP host. Does not connect ChatGPT Web to a remote machine.",
+        "shortDescription": "Observe REALM on desktop",
+        "longDescription": "Source-only desktop preview for a host-bound REALM player. Its local launcher pins the strict engine MCP tool allowlist to realm_status and realm_look, rejecting inherited broad scopes; older engines without enforcement are refused. Requires a compatible strict REALM engine source, an existing world, host-owned player token and working local Python MCP host. No join, movement, speech, inventory, map, feed, arbitrary game command, ChatGPT Web connectivity or remote service is provided.",
         "developerName": "thebrazenbeard",
         "capabilities": [],
-        "defaultPrompt": "Explore the host-configured REALM world with me. Confirm the player/world binding, observe before acting, and report only authoritative results."
+        "defaultPrompt": "If local REALM MCP tools are actually available and host-qualified, call realm_status and realm_look only to observe the bound player and world. Do not join, mutate, access history or map, or assume the plugin package grants host permission."
       }
     }
   }
