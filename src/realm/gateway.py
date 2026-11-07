@@ -19,6 +19,7 @@ from .auth import CredentialStore
 from .engine import Engine, _SEED_EXITS, _SEED_ITEMS, _SEED_ROOMS, _pristine_schema, _schema_snapshot
 from .geography import Geography, MapUnavailable
 from .router import CommandRouter
+from .scoped_credentials import CredentialStateError, ScopedCredentialStore
 
 
 MAX_BODY_BYTES = 4096
@@ -37,6 +38,8 @@ class Gateway:
     def __init__(
         self, db_path: str | Path, *, world_id: str = "demo",
         adopt_unbound_world: bool = False,
+        scoped_credentials: bool = False,
+        scoped_guard_path: str | Path | None = None,
     ):
         if not isinstance(world_id, str) or not _WORLD_ID.fullmatch(world_id):
             raise ValueError("world_id must start with a letter and contain 1–64 letters, digits, '_' or '-'")
@@ -45,7 +48,22 @@ class Gateway:
         self.geography = Geography(db_path)
         self.router = CommandRouter(self.engine)
         self.credentials = CredentialStore(self.engine)
+        self.scoped_credentials = (
+            ScopedCredentialStore(self.engine, world_id, guard_path=scoped_guard_path)
+            if scoped_credentials else None
+        )
         self.world_id = world_id
+
+    def authenticate_remote(self, token: str, *, required_capability: str) -> str | None:
+        if self.scoped_credentials is None:
+            return self.credentials.authenticate(token)
+        try:
+            return self.scoped_credentials.authenticate(
+                token, required_capability=required_capability
+            )
+        except CredentialStateError:
+            # A missing witness or clock rollback must fail closed, not expose a traceback.
+            return None
 
     def _bind_world_id(self, world_id: str, *, adopt_unbound_world: bool) -> None:
         """Persist the host's world identity before any gateway can serve it.
@@ -256,7 +274,20 @@ class GatewayHandler(BaseHTTPRequestHandler):
         scheme, separator, presented = auth.partition(" ")
         if separator != " " or scheme.casefold() != "bearer":
             return None
-        return self.server.gateway.credentials.authenticate(presented)
+        path = urlsplit(self.path).path
+        capability = {
+            "/api/v1/join": "world:join",
+            "/api/v1/command": "command:write",
+            "/api/v1/room": "room:read",
+            "/api/v1/map": "map:read",
+            "/api/v1/feed": "feed:read",
+            "/api/v1/feed/wait": "feed:read",
+        }.get(path)
+        if capability is None:
+            return None
+        return self.server.gateway.authenticate_remote(
+            presented, required_capability=capability
+        )
 
     def _gate(self, *, public_health: bool = False) -> str | None:
         if not self._origin_ok():
@@ -345,6 +376,12 @@ class GatewayHandler(BaseHTTPRequestHandler):
                 raise ValueError("Expected a JSON object")
             if not self._player_matches(obj.get("player"), principal):
                 return
+            if self.server.gateway.scoped_credentials is not None:
+                # Recheck after reading slow/streamed bodies. This reduces the
+                # revocation race, but is NOT atomic with the gameplay commit.
+                if self._principal() != principal:
+                    self._send(401, {"ok": False, "error": "Active scoped bearer required"})
+                    return
             if path == "/api/v1/join":
                 result = self.server.gateway.join(principal)
             else:
@@ -366,6 +403,10 @@ def main(argv: list[str] | None = None) -> int:
         help="Explicitly bind an existing pre-identity world database to --world-id (local operator only)",
     )
     parser.add_argument("--port", type=int, default=8768)
+    parser.add_argument(
+        "--scoped-credentials", action="store_true",
+        help="Opt in to bounded world-scoped credentials instead of legacy bearers",
+    )
     parser.add_argument("--demo-crafting", action="store_true", help="Install optional noncanonical gathering and recipe fixtures")
     parser.add_argument(
         "--allow-origin", action="append", default=[], metavar="ORIGIN",
@@ -373,13 +414,23 @@ def main(argv: list[str] | None = None) -> int:
     )
     operator = parser.add_mutually_exclusive_group()
     operator.add_argument("--provision-player", metavar="PLAYER", help="Provision a player token locally, then exit")
+    operator.add_argument("--provision-scoped-player", metavar="PLAYER", help="Host-issue a bounded player bearer, then exit")
     operator.add_argument("--rotate-player", metavar="PLAYER", help="Rotate a player token locally, then exit")
     operator.add_argument("--revoke-player", metavar="PLAYER", help="Revoke a player token locally, then exit")
     args = parser.parse_args(argv)
+    if args.scoped_credentials and (args.provision_player or args.rotate_player or args.revoke_player):
+        parser.error("legacy credential operator commands are unavailable in scoped mode")
+    if args.provision_scoped_player and not args.scoped_credentials:
+        parser.error("--provision-scoped-player requires --scoped-credentials")
     gateway = Gateway(
         args.db, world_id=args.world_id,
         adopt_unbound_world=args.adopt_unbound_world,
+        scoped_credentials=args.scoped_credentials,
     )
+    if args.provision_scoped_player:
+        print(f"New scoped token for {args.provision_scoped_player}: "
+              f"{gateway.scoped_credentials.provision(args.provision_scoped_player)}")
+        return 0
     if args.provision_player:
         print(f"New token for {args.provision_player}: {gateway.credentials.provision(args.provision_player)}")
         return 0
