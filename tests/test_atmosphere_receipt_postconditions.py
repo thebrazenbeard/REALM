@@ -44,6 +44,11 @@ class ReceiptPostconditionTests(unittest.TestCase):
         with closing(sqlite3.connect(self.path)) as db, db:
             db.execute(sql)
 
+    def _world_id(self):
+        with closing(sqlite3.connect(self.path)) as db:
+            row = db.execute("SELECT value FROM main.world_meta WHERE key='world_id'").fetchone()
+            return row[0] if row else None
+
     def test_late_trigger_cannot_delete_success_receipt(self):
         before = self._state()
         self._install("""CREATE TRIGGER atm_erase_ack AFTER INSERT ON atm_receipts
@@ -153,6 +158,63 @@ class ReceiptPostconditionTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self._open(expected_version=1)
         self.assertEqual(before, self._state())
+
+    def test_late_receipt_trigger_cannot_rebind_world_identity(self):
+        before = self._state()
+        self._install("""CREATE TRIGGER atm_rebind_world AFTER INSERT ON atm_receipts
+            WHEN NEW.action_id='opened' BEGIN
+              UPDATE world_meta SET value='otherWorld' WHERE key='world_id'; END""")
+        with self.assertRaises(ValueError):
+            self._open()
+        self.assertEqual(before, self._state())
+        self.assertEqual("synthetic", self._world_id())
+        self._install("DROP TRIGGER atm_rebind_world")
+        self.assertEqual(1, self._open()["version"])
+
+    def test_late_receipt_trigger_cannot_delete_world_identity(self):
+        before = self._state()
+        self._install("""CREATE TRIGGER atm_delete_world AFTER INSERT ON atm_receipts
+            WHEN NEW.action_id='opened' BEGIN
+              DELETE FROM world_meta WHERE key='world_id'; END""")
+        with self.assertRaises(ValueError):
+            self._open()
+        self.assertEqual(before, self._state())
+        self.assertEqual("synthetic", self._world_id())
+
+    def test_unrelated_world_metadata_update_remains_permitted(self):
+        self._install("""CREATE TRIGGER atm_unrelated_meta AFTER INSERT ON atm_receipts
+            WHEN NEW.action_id='opened' BEGIN
+              INSERT INTO world_meta(key,value) VALUES('audit_marker','ok'); END""")
+        self.assertEqual(1, self._open()["version"])
+        with closing(sqlite3.connect(self.path)) as db:
+            self.assertEqual(("ok",), db.execute(
+                "SELECT value FROM main.world_meta WHERE key='audit_marker'").fetchone())
+
+    def test_late_receipt_trigger_cannot_rewrite_worldpack_provenance(self):
+        self._install("INSERT INTO main.world_meta(key,value) VALUES('worldpack_sha256','original')")
+        before = self._state()
+        self._install("""CREATE TRIGGER atm_rewrite_worldpack AFTER INSERT ON atm_receipts
+            WHEN NEW.action_id='opened' BEGIN
+              UPDATE world_meta SET value='forged' WHERE key='worldpack_sha256'; END""")
+        with self.assertRaises(ValueError):
+            self._open()
+        self.assertEqual(before, self._state())
+        with closing(sqlite3.connect(self.path)) as db:
+            self.assertEqual(("original",), db.execute(
+                "SELECT value FROM main.world_meta WHERE key='worldpack_sha256'").fetchone())
+
+    def test_late_receipt_trigger_cannot_remove_world_start_binding(self):
+        self._install("INSERT INTO main.world_meta(key,value) VALUES('start_room','a')")
+        before = self._state()
+        self._install("""CREATE TRIGGER atm_delete_start AFTER INSERT ON atm_receipts
+            WHEN NEW.action_id='opened' BEGIN
+              DELETE FROM world_meta WHERE key='start_room'; END""")
+        with self.assertRaises(ValueError):
+            self._open()
+        self.assertEqual(before, self._state())
+        with closing(sqlite3.connect(self.path)) as db:
+            self.assertEqual(("a",), db.execute(
+                "SELECT value FROM main.world_meta WHERE key='start_room'").fetchone())
 
 
 if __name__ == "__main__":
