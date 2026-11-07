@@ -13,10 +13,15 @@ from research.pr_stack_live import (API, canonical_origin, assess_live,
 
 
 class _Response(io.BytesIO):
-    def __init__(self, value, link=""):
+    def __init__(self, value, link="", page=1, final_url=None, status=200):
         super().__init__(json.dumps(value).encode("utf-8"))
-        self.status = 200
+        self.status = status
         self.headers = {"Link": link}
+        self.final_url = (final_url if final_url is not None else
+                          f"{API}?state=open&per_page=100&page={page}")
+
+    def geturl(self):
+        return self.final_url
 
 
 class PRStackLiveTest(unittest.TestCase):
@@ -102,7 +107,7 @@ class PRStackLiveTest(unittest.TestCase):
         link = f'<{API}?state=open&per_page=100&page=2>; rel="next"'
         with patch("research.pr_stack_live.urlopen",
                    side_effect=[_Response([self.live[61]], link),
-                                _Response([later])]) as lookup:
+                                _Response([later], page=2)]) as lookup:
             observed = fetch_live_open_prs()
         self.assertEqual(lookup.call_count, 2)
         self.assertEqual(set(observed), {61, 92})
@@ -131,7 +136,7 @@ class PRStackLiveTest(unittest.TestCase):
         later = copy.deepcopy(self.live[61])
         later["number"] = 92
         with patch("research.pr_stack_live.urlopen",
-                   side_effect=[first, _Response([later])]) as lookup:
+                   side_effect=[first, _Response([later], page=2)]) as lookup:
             observed = fetch_live_open_prs()
         self.assertEqual(lookup.call_count, 2)
         self.assertEqual(len(observed), 28)
@@ -171,8 +176,94 @@ class PRStackLiveTest(unittest.TestCase):
         link = f'<{API}?state=open&per_page=100&page=2>; rel="next"'
         with patch("research.pr_stack_live.urlopen",
                    side_effect=[_Response([self.live[61]], link),
-                                _Response([self.live[61]])]):
+                                _Response([self.live[61]], page=2)]):
             with self.assertRaises(ValueError):
+                fetch_live_open_prs()
+
+    def test_redirected_effective_source_url_never_passes(self):
+        canonical = f"{API}?state=open&per_page=100&page=1"
+        for destination in (
+            "https://evil.example/fake",
+            "http://api.github.com/repos/thebrazenbeard/REALM/pulls",
+            "https://api.github.com/repos/other/OTHER/pulls",
+            f"{API}?state=open&per_page=100&page=2",
+            canonical + "&unexpected=1",
+            "",
+        ):
+            with self.subTest(destination=destination):
+                fake = _Response([self.live[61]], final_url=destination)
+                with patch("research.pr_stack_live.urlopen", return_value=fake):
+                    with self.assertRaises(RuntimeError):
+                        fetch_live_open_prs()
+
+    def test_redirect_handler_blocks_network_follow(self):
+        from urllib.request import BaseHandler, Request, build_opener
+        from urllib.response import addinfourl
+        from research.pr_stack_live import _RefuseRedirect, urlopen
+
+        class SyntheticTransport(BaseHandler):
+            handler_order = 100
+
+            def __init__(self, destination, code):
+                self.destination = destination
+                self.code = code
+                self.requests = []
+                self.responses = []
+
+            def https_open(self, request):
+                self.requests.append(request.full_url)
+                headers = Message()
+                headers.add_header("Location", self.destination)
+                response = addinfourl(io.BytesIO(b""), headers, request.full_url,
+                                      code=self.code)
+                response.msg = "Found"
+                self.responses.append(response)
+                return response
+
+            def http_open(self, request):
+                self.requests.append(request.full_url)
+                raise AssertionError("redirect reached foreign HTTP target")
+
+        canonical = f"{API}?state=open&per_page=100&page=1"
+        self.assertTrue(any(isinstance(handler, _RefuseRedirect)
+                            for handler in urlopen.__self__.handlers))
+        for destination in ("https://evil.example/steal",
+                            "http://evil.example/steal",
+                            f"{API}?state=open&per_page=100&page=2"):
+            for code in (301, 302, 303, 307, 308):
+                with self.subTest(destination=destination, code=code):
+                    transport = SyntheticTransport(destination, code)
+                    opener = build_opener(_RefuseRedirect, transport)
+                    try:
+                        with self.assertRaisesRegex(RuntimeError, "redirect refused"):
+                            opener.open(Request(canonical))
+                        self.assertEqual(transport.requests, [canonical])
+                    finally:
+                        for response in transport.responses:
+                            response.close()
+
+    def test_second_page_effective_url_checked_and_http_errors_closed(self):
+        link = f'<{API}?state=open&per_page=100&page=2>; rel="next"'
+        later = copy.deepcopy(self.live[61])
+        later["number"] = 92
+        for redirected in ("http://evil.example/pulls", f"{API}?page=2"):
+            with self.subTest(destination=redirected):
+                with patch("research.pr_stack_live.urlopen",
+                           side_effect=[_Response([self.live[61]], link),
+                                        _Response([later], page=2, final_url=redirected)]) as lookup:
+                    with self.assertRaises(RuntimeError):
+                        fetch_live_open_prs()
+                self.assertEqual(lookup.call_count, 2)
+        with patch("research.pr_stack_live.urlopen",
+                   return_value=_Response([self.live[61]], status=429)):
+            with self.assertRaises(RuntimeError):
+                fetch_live_open_prs()
+        incomplete = _Response([self.live[61]])
+        incomplete.seek(0)
+        incomplete.truncate(1)
+        incomplete.seek(0)
+        with patch("research.pr_stack_live.urlopen", return_value=incomplete):
+            with self.assertRaises(json.JSONDecodeError):
                 fetch_live_open_prs()
 
     def test_full_page_must_probe_next_page_and_noncanonical_api_refused(self):
@@ -182,7 +273,7 @@ class PRStackLiveTest(unittest.TestCase):
             value["number"] = n
             rows.append(value)
         with patch("research.pr_stack_live.urlopen",
-                   side_effect=[_Response(rows), _Response([])]) as lookup:
+                   side_effect=[_Response(rows), _Response([], page=2)]) as lookup:
             self.assertEqual(len(fetch_live_open_prs()), 100)
         self.assertEqual(lookup.call_count, 2)
         with self.assertRaises(ValueError):

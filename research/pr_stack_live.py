@@ -10,7 +10,7 @@ import re
 import sys
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
-from urllib.request import Request, urlopen
+from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 from research.pr_stack_gate import assess, git, live_tips, validate
 
@@ -18,6 +18,17 @@ REPO = "thebrazenbeard/REALM"
 API = "https://api.github.com/repos/thebrazenbeard/REALM/pulls"
 SHA = re.compile(r"^[0-9a-f]{40}$")
 _LINK = re.compile(r'^\s*<([^<>]+)>\s*;\s*rel="(next|prev|first|last)"\s*$')
+
+
+class _RefuseRedirect(HTTPRedirectHandler):
+    """Do not follow even a same-host redirect for authoritative PR data."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        raise RuntimeError("GitHub API redirect refused")
+
+
+# urllib.request.urlopen follows HTTP redirects; this dedicated opener does not.
+urlopen = build_opener(_RefuseRedirect).open
 
 
 def has_next_page(link_header: str, current_page: int) -> bool:
@@ -125,6 +136,10 @@ def fetch_live_open_prs(api: str = API):
         req = Request(uri, headers={"User-Agent": "REALM-source-review-gate",
                                     "Accept": "application/vnd.github+json"})
         with urlopen(req, timeout=15) as response:
+            # urllib follows redirects by default. The initial request URI is
+            # not proof of the endpoint that supplied the response body.
+            if response.geturl() != uri:
+                raise RuntimeError("GitHub API effective URL differs from canonical request")
             if response.status != 200:
                 raise RuntimeError(f"GitHub API HTTP {response.status}")
             # HTTP permits multiple Link header fields. HTTPMessage.get() only
