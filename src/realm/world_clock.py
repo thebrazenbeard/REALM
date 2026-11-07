@@ -102,7 +102,7 @@ def _event(row: sqlite3.Row) -> DueEvent:
 
 
 
-def _verify_roster_utc_ack(db: sqlite3.Connection, event: DueEvent, outcome: object) -> None:
+def _verify_roster_utc_ack(db: sqlite3.Connection, event: DueEvent, outcome: object) -> tuple[str, ...]:
     """Refuse to acknowledge a roster event without exact in-transaction receipts.
 
     The host's typed result is necessary but not sufficient: a swallowed handler
@@ -158,6 +158,9 @@ def _verify_roster_utc_ack(db: sqlite3.Connection, event: DueEvent, outcome: obj
             or any(not re.fullmatch(r"[0-9a-f]{64}", attest[key])
                    for key in ("grant_mac_hex", "execution_mac_hex"))):
         raise ValueError("Roster clock receipt lacks bound host execution attestation")
+    # Preserve both MAC fields exactly across later trigger/callback DML.
+    # The clock has no host key; the executor checked the grant before writing.
+    return tuple(attest)
 
 
 class WorldClock:
@@ -271,11 +274,13 @@ class WorldClock:
                 "ORDER BY due_utc, event_id LIMIT ?", (stamp, limit),
             ).fetchall()
             processed = []
+            roster_proofs = []
             for row in rows:
                 event = _event(row)
                 outcome = handler(db, event)
                 if event.kind == "npc_roster_gather":
-                    _verify_roster_utc_ack(db, event, outcome)
+                    initial_proof = _verify_roster_utc_ack(db, event, outcome)
+                    roster_proofs.append((event, outcome, initial_proof))
                 updated = db.execute(
                     "UPDATE clock_events SET processed_utc=? "
                     "WHERE event_id=? AND processed_utc IS NULL",
@@ -289,4 +294,26 @@ class WorldClock:
                 "ON CONFLICT(id) DO UPDATE SET last_utc=excluded.last_utc",
                 (stamp,),
             )
+            # Clock receipts, state updates and later events may fire MAIN triggers
+            # that invalidate a roster verified earlier in this tick. Run the
+            # final read-only postcondition after *all* transaction DML.
+            if roster_proofs:
+                final_state = db.execute(
+                    "SELECT last_utc FROM main.clock_state WHERE id=1"
+                ).fetchone()
+                if final_state is None or final_state["last_utc"] != stamp:
+                    raise ValueError("Roster tick lost authoritative UTC clock state")
+            for event, outcome, original_proof in roster_proofs:
+                if _verify_roster_utc_ack(db, event, outcome) != original_proof:
+                    raise ValueError("Roster attestation changed after initial verification")
+                main_event = db.execute(
+                    "SELECT due_utc,kind,payload_json,processed_utc "
+                    "FROM main.clock_events WHERE event_id=?",
+                    (event.event_id,),
+                ).fetchone()
+                if (main_event is None or main_event["processed_utc"] != stamp
+                        or main_event["due_utc"] != _stamp(event.due_at)
+                        or main_event["kind"] != event.kind
+                        or main_event["payload_json"] != _payload(event.payload)):
+                    raise ValueError("Roster UTC completion changed before commit")
             return processed
