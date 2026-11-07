@@ -167,5 +167,44 @@ class AtmosphereLedgerTests(unittest.TestCase):
             self.assertIsNone(db.execute("SELECT name FROM sqlite_master WHERE name='atm_state'").fetchone())
 
 
+    def test_rehydration_rejects_impossible_pressure_but_accepts_exact_upper_bound(self):
+        max_pressure = 10_000_000
+        exact = AtmosphereModel(compartments={
+            "room": {"volume_l": 17, "pressure_pa": max_pressure,
+                     "oxygen_ppm": 1_000_000, "temperature_mk": 2_000_000}},
+            hatches={}, occupants={})
+        original = json.loads(json.dumps(exact.snapshot()))
+        self.assertEqual(original["compartments"], _rehydrate(original).snapshot()["compartments"])
+        room = original["compartments"]["room"]
+        room["gas_pa_l"] += 1
+        room["oxygen_pa_l"] = 0
+        room["oxygen_ppm"] = 0
+        # The pressure floor hides a supermaximum one-unit gas inventory.
+        with self.assertRaises(ValueError):
+            _rehydrate(original)
+        room["gas_pa_l"] = room["volume_l"] * (max_pressure + 1)
+        room["pressure_pa"] = max_pressure + 1
+        with self.assertRaises(ValueError):
+            _rehydrate(original)
+
+    def test_forged_persisted_superpressure_rejects_read_and_action_without_receipt(self):
+        with closing(sqlite3.connect(self.path)) as db, db:
+            snapshot = json.loads(db.execute("SELECT state_json FROM atm_state WHERE id=1").fetchone()[0])
+            c = snapshot["compartments"]["bridge"]
+            c["gas_pa_l"] = c["volume_l"] * 10_000_001
+            c["oxygen_pa_l"] = 0
+            c["pressure_pa"] = 10_000_001
+            c["oxygen_ppm"] = 0
+            raw = json.dumps(snapshot, sort_keys=True)
+            db.execute("UPDATE atm_state SET state_json=? WHERE id=1", (raw,))
+        with self.assertRaises(ValueError):
+            self.ledger.status(world_id="worldOne")
+        with self.assertRaises(ValueError):
+            self.perform("overmax", "tick", {}, 0)
+        with closing(sqlite3.connect(self.path)) as db:
+            self.assertEqual((0, raw), db.execute("SELECT version,state_json FROM atm_state WHERE id=1").fetchone())
+            self.assertEqual(0, db.execute("SELECT count(*) FROM atm_receipts").fetchone()[0])
+
+
 if __name__ == "__main__":
     unittest.main()

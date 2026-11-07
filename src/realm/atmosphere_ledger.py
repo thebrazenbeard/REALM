@@ -13,7 +13,7 @@ import sqlite3
 from contextlib import closing
 from pathlib import Path
 
-from .atmosphere import AtmosphereModel, _MAX_GAS, _MAX_RATE, _id, _integer
+from .atmosphere import AtmosphereModel, _MAX_PRESSURE, _MAX_RATE, _id, _integer
 
 _ACTIONS = {"hatch", "breach", "tick"}
 _MAX_STATE_BYTES = 4 * 1024 * 1024
@@ -63,10 +63,14 @@ def _rehydrate(snapshot):
         if type(c) is not dict or set(c) != {"volume_l", "gas_pa_l", "oxygen_pa_l", "temperature_mk", "pressure_pa", "oxygen_ppm"}:
             raise ValueError("Invalid compartment snapshot")
         v = _integer(c["volume_l"], "volume_l", 1, 10_000_000)
-        gas = _integer(c["gas_pa_l"], "gas_pa_l", 0, 512 * _MAX_GAS)
+        # Checking only floor(gas / volume) lets a supermaximum fractional
+        # inventory pass at the declared max pressure. Bound the exact gas.
+        gas = _integer(c["gas_pa_l"], "gas_pa_l", 0, v * _MAX_PRESSURE)
         oxygen = _integer(c["oxygen_pa_l"], "oxygen_pa_l", 0, gas)
         _integer(c["temperature_mk"], "temperature_mk", 1, 2_000_000)
-        if c["pressure_pa"] != gas // v or c["oxygen_ppm"] != (oxygen * 1_000_000 // gas if gas else 0):
+        pressure = _integer(c["pressure_pa"], "pressure_pa", 0, _MAX_PRESSURE)
+        oxygen_ppm = _integer(c["oxygen_ppm"], "oxygen_ppm", 0, 1_000_000)
+        if pressure != gas // v or oxygen_ppm != (oxygen * 1_000_000 // gas if gas else 0):
             raise ValueError("Inconsistent atmospheric inventory")
         specs[key] = {"volume_l": v, "pressure_pa": 0, "oxygen_ppm": 0,
                       "temperature_mk": c["temperature_mk"]}

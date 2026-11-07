@@ -33,7 +33,9 @@ even if the enclosing host catches a late SQL error and commits.
   cross-world attempts reject.
 - State stores exact integer gas/oxygen pressure-volume inventories. Reading
   does not reconstruct pressure through lossy rounding. Restart retains
-  pressure, hatches, breaches, occupants, and receipts.
+  pressure, hatches, breaches, occupants, and receipts. Restoration rejects
+  over-limit *exact* gas inventories even if integer-truncated displayed
+  pressure happens to remain at the maximum allowed value.
 - Sample equalization, breach, and exposure semantics remain synthetic and
   setting-neutral. A sealed suit is a nominal protective flag, not modeled
   oxygen supply, heat transfer, mass transfer or canonical Wreckforge physics.
