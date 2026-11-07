@@ -129,6 +129,20 @@ class MedicalSourceBridgeTests(unittest.TestCase):
                 self.inspect(db)
             db.rollback()
 
+    def test_orphan_receipt_is_rejected_before_medical_source_review(self):
+        with closing(sqlite3.connect(self.medical)) as db, db:
+            db.execute("PRAGMA foreign_keys=OFF")
+            db.execute("INSERT INTO medical_receipts(action_id,fingerprint,injury_id,state,version) "
+                       "VALUES('orphan','synthetic','noSuchInjury','done',1)")
+            self.assertEqual(len(db.execute("PRAGMA main.foreign_key_check").fetchall()), 1)
+        with closing(sqlite3.connect(self.world)) as db:
+            db.row_factory = sqlite3.Row
+            db.execute("PRAGMA foreign_keys=ON")
+            db.execute("BEGIN IMMEDIATE")
+            with self.assertRaisesRegex(ValueError, "referential integrity"):
+                self.inspect(db)
+            db.rollback()
+
     def test_wrong_medical_world_is_rejected_without_world_or_kit_effect(self):
         alien = Path(self.temp.name) / "alien.db"
         MedicalLedger(alien, world_id="another", policy=self.policy)
