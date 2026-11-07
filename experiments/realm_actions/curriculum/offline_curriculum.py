@@ -79,7 +79,8 @@ def _setup_world(engine: Engine, split: str) -> None:
 def _room(engine: Engine) -> str:
     with closing(sqlite3.connect(engine.db_path)) as db:
         row = db.execute("SELECT room_id FROM players WHERE id=?", (ACTOR,)).fetchone()
-        assert row is not None
+        if row is None:
+            raise RuntimeError("Fixture actor vanished from its world")
         return row[0]
 
 
@@ -89,6 +90,45 @@ def _counts(engine: Engine, action_id: str) -> tuple[int, int]:
                               (ACTOR, action_id)).fetchone()[0]
         events = db.execute("SELECT COUNT(*) FROM events").fetchone()[0]
         return receipts, events
+
+
+def _world_state(engine: Engine) -> dict:
+    """Read canonical fixture state, including all receipts (not one ID)."""
+    with closing(sqlite3.connect(engine.db_path)) as db:
+        return {
+            "players": db.execute("SELECT id,room_id FROM players ORDER BY id").fetchall(),
+            "items": db.execute("SELECT id,name,room_id,held_by FROM items ORDER BY id").fetchall(),
+            "events": db.execute("SELECT COUNT(*) FROM events").fetchone()[0],
+            "receipts": db.execute("SELECT COUNT(*) FROM action_receipts").fetchone()[0],
+        }
+
+
+def _objective_succeeded(command: str, observation: dict, reply: str,
+                         before: dict, after: dict) -> bool:
+    """Fixture-specific state checks; receipt creation alone is NOT success."""
+    verb, _, arg = command.partition(" ")
+    event_delta = after["events"] - before["events"]
+    if verb == "look":
+        return reply == observation["room"] and event_delta == 0
+    if verb == "inventory":
+        return reply == observation["inventory"] and event_delta == 0
+    old_room = next((room for who, room in before["players"] if who == ACTOR), None)
+    new_room = next((room for who, room in after["players"] if who == ACTOR), None)
+    if verb == "go":
+        return old_room != new_room and event_delta == 2 and not reply.startswith("No exit")
+    if verb in {"take", "drop"}:
+        old_item = next((item for item in before["items"] if item[1] == arg), None)
+        new_item = next((item for item in after["items"] if item[1] == arg), None)
+        if old_item is None or new_item is None or event_delta != 1:
+            return False
+        if verb == "take":
+            return (old_item[2] == old_room and old_item[3] is None
+                    and new_item[2] is None and new_item[3] == ACTOR
+                    and reply == f"You take {arg}.")
+        return (old_item[2] is None and old_item[3] == ACTOR
+                and new_item[2] == new_room and new_item[3] is None
+                and reply == f"You drop {arg}.")
+    return False
 
 
 def _case_record(case: Case, temporary: Path, git_head: str, engine_hash: str) -> dict:
@@ -104,18 +144,27 @@ def _case_record(case: Case, temporary: Path, git_head: str, engine_hash: str) -
     controller = ResidentController(engine, ACTOR, allowed_verbs=VERBS)
     action_id = "host-action-0001"
     receipts_before, events_before = _counts(engine, action_id)
-    assert receipts_before == 0
+    world_before = _world_state(engine)
+    if receipts_before != 0:
+        raise RuntimeError("Fixture action ID already has a receipt")
     command = case.command.format(**VARIANTS[case.split]) if case.command is not None else None
     target = {"decision": "abstain" if command is None else "act", "command": command}
     if command is not None:
         proposal = {"command": command}
         controller.validate(proposal)
         reply = controller.commit(proposal, action_id=action_id)
-        assert controller.commit(proposal, action_id=action_id) == reply, "replay diverged"
+        world_after = _world_state(engine)
+        if not _objective_succeeded(command, observation, reply, world_before, world_after):
+            raise RuntimeError("Fixture objective was not fulfilled by the committed action")
+        if controller.commit(proposal, action_id=action_id) != reply:
+            raise RuntimeError("Fixture replay diverged")
+        if _world_state(engine) != world_after:
+            raise RuntimeError("Fixture replay changed world state or receipts")
     else:
         reply = None
     receipts_after, events_after = _counts(engine, action_id)
-    assert receipts_after == int(command is not None), "receipt count changed unexpectedly"
+    if receipts_after != int(command is not None):
+        raise RuntimeError("Fixture receipt count changed unexpectedly")
     return {
         # Opaque ID: `test-wrench` and similar descriptive IDs leak the label.
         "schema": SCHEMA,
@@ -123,6 +172,7 @@ def _case_record(case: Case, temporary: Path, git_head: str, engine_hash: str) -
         "split": case.split,
         "world_variant": case.split, "input": observation, "target": target,
         "verification": {"room_after": _room(engine), "response": reply,
+                         "objective_succeeded": True if command is not None else None,
                          "target_receipts": receipts_after,
                          "event_delta": events_after - events_before},
         "provenance": {"engine_git_head_local": git_head,
@@ -140,8 +190,10 @@ def build_records(engine_root: Path) -> list[dict]:
     engine_hash = hashlib.sha256(Path(inspect.getfile(Engine)).read_bytes()).hexdigest()
     with tempfile.TemporaryDirectory(prefix="realm-offline-curriculum-") as temp:
         records = [_case_record(case, Path(temp), git_head, engine_hash) for case in CASES]
-    assert len({record["id"] for record in records}) == len(records)
-    assert {record["split"] for record in records} == set(VARIANTS)
+    if len({record["id"] for record in records}) != len(records):
+        raise RuntimeError("Duplicate curriculum case IDs")
+    if {record["split"] for record in records} != set(VARIANTS):
+        raise RuntimeError("Incomplete curriculum split coverage")
     return records
 
 
@@ -181,16 +233,37 @@ def evaluate_predictions(records: list[dict], predictions: list[dict]) -> dict[s
     def grounded(command: str, observation: dict) -> bool:
         verb, _, arg = command.partition(" ")
         verb = verb.casefold()
+        # Host policy is independent of the global curriculum verb vocabulary.
+        allowed = observation.get("allowed_verbs")
+        if (type(allowed) is not list or any(type(item) is not str for item in allowed)
+                or verb not in {item.casefold() for item in allowed}):
+            return False
         if verb in {"look", "inventory"}:
             return not arg
+        room = observation.get("room")
+        if type(room) is not str:
+            return False
+        # The engine appends its authoritative Exits line after room text.
+        # Earlier Exits/Items markers in untrusted room descriptions are not authority.
+        room_lines = room.splitlines()
+        exit_positions = [index for index, line in enumerate(room_lines)
+                          if line.startswith("Exits: ")]
+        if not exit_positions:
+            return False
+        exit_index = exit_positions[-1]
         if verb == "go":
-            exits = next((line.removeprefix("Exits: ") for line in observation["room"].splitlines()
-                          if line.startswith("Exits: ")), "")
+            exits = room_lines[exit_index].removeprefix("Exits: ")
             return arg.casefold() in {x.strip().casefold() for x in exits.split(",")} and bool(arg)
         if verb in {"take", "drop"}:
-            visible = (next((line.removeprefix("Items: ") for line in observation["room"].splitlines()
-                             if line.startswith("Items: ")), "") if verb == "take"
-                       else observation["inventory"].removeprefix("You carry: "))
+            if verb == "take":
+                item_lines = [line.removeprefix("Items: ") for line in room_lines[exit_index + 1:]
+                              if line.startswith("Items: ")]
+                visible = item_lines[-1] if item_lines else ""
+            else:
+                inventory = observation.get("inventory")
+                if type(inventory) is not str or not inventory.startswith("You carry: "):
+                    return False
+                visible = inventory.removeprefix("You carry: ")
             return arg.casefold() in {x.strip().casefold() for x in visible.split(",")} and bool(arg)
         return False
 
