@@ -104,6 +104,31 @@ class MedicalSourceBridgeTests(unittest.TestCase):
                              review.mode_binding.policy_hash)
             db.rollback()
 
+    def test_same_named_foreign_injury_table_is_not_a_medical_ledger(self):
+        with closing(sqlite3.connect(self.medical)) as db, db:
+            db.execute("DROP TABLE medical_injuries")
+            db.execute("CREATE TABLE medical_injuries (forged_only INTEGER NOT NULL)")
+        with closing(sqlite3.connect(self.world)) as db:
+            db.row_factory = sqlite3.Row
+            db.execute("PRAGMA foreign_keys=ON")
+            db.execute("BEGIN IMMEDIATE")
+            with self.assertRaisesRegex(ValueError, "medical sidecar schema"):
+                self.inspect(db)
+            db.rollback()
+
+    def test_same_columns_without_medical_supply_check_are_rejected(self):
+        with closing(sqlite3.connect(self.medical)) as db, db:
+            db.execute("DROP TABLE medical_supply")
+            db.execute("CREATE TABLE medical_supply ("
+                       "resource_id TEXT PRIMARY KEY, quantity INTEGER NOT NULL)")
+        with closing(sqlite3.connect(self.world)) as db:
+            db.row_factory = sqlite3.Row
+            db.execute("PRAGMA foreign_keys=ON")
+            db.execute("BEGIN IMMEDIATE")
+            with self.assertRaisesRegex(ValueError, "medical sidecar schema"):
+                self.inspect(db)
+            db.rollback()
+
     def test_wrong_medical_world_is_rejected_without_world_or_kit_effect(self):
         alien = Path(self.temp.name) / "alien.db"
         MedicalLedger(alien, world_id="another", policy=self.policy)

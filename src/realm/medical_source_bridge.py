@@ -21,6 +21,29 @@ from .server_mode import (
 )
 
 
+# Mirrors MedicalLedger's own four CREATE TABLE statements. Deliberately
+# fail closed if its schema evolves without a reviewed bridge update.
+_MEDICAL_DDL = {
+    "medical_meta": "CREATE TABLE medical_meta ("
+                    "key TEXT PRIMARY KEY, value TEXT NOT NULL)",
+    "medical_supply": "CREATE TABLE medical_supply ("
+                      "resource_id TEXT PRIMARY KEY, quantity INTEGER NOT NULL "
+                      "CHECK(quantity >= 0))",
+    "medical_injuries": "CREATE TABLE medical_injuries ("
+                        "injury_id TEXT PRIMARY KEY, world_id TEXT NOT NULL, "
+                        "character_id TEXT NOT NULL, mode TEXT NOT NULL, "
+                        "policy_id TEXT NOT NULL, policy_hash TEXT NOT NULL, "
+                        "cause TEXT NOT NULL, severity TEXT NOT NULL, "
+                        "state TEXT NOT NULL, incident_utc TEXT NOT NULL, "
+                        "deadline_utc TEXT NOT NULL, last_utc TEXT NOT NULL, "
+                        "version INTEGER NOT NULL CHECK(version >= 0))",
+    "medical_receipts": "CREATE TABLE medical_receipts ("
+                        "action_id TEXT PRIMARY KEY, fingerprint TEXT NOT NULL, "
+                        "injury_id TEXT NOT NULL REFERENCES medical_injuries(injury_id), "
+                        "state TEXT NOT NULL, version INTEGER NOT NULL)",
+}
+
+
 @dataclass(frozen=True)
 class MedicalSourceReview:
     status: str
@@ -61,13 +84,15 @@ def _medical_sidecar_bound(path: str | Path, *, world_id: str,
                                      uri=True, timeout=5)) as db:
             db.execute("PRAGMA query_only=ON")
             db.execute("BEGIN")
-            objects = {tuple(row) for row in db.execute(
-                "SELECT type,name FROM main.sqlite_master "
-                "WHERE name NOT LIKE 'sqlite_%'")}
-            expected = {("table", name) for name in (
-                "medical_meta", "medical_supply",
-                "medical_injuries", "medical_receipts")}
-            if objects != expected:
+            objects = db.execute(
+                "SELECT type,name,sql FROM main.sqlite_master "
+                "WHERE name NOT LIKE 'sqlite_%'").fetchall()
+            if (len(objects) != len(_MEDICAL_DDL)
+                or any(kind != "table" or name not in _MEDICAL_DDL
+                       or type(ddl) is not str
+                       or " ".join(ddl.split()).replace("( ", "(") !=
+                          " ".join(_MEDICAL_DDL[name].split()).replace("( ", "(")
+                       for kind, name, ddl in objects)):
                 raise ValueError("medical sidecar schema mismatch")
             rows = db.execute("SELECT key,value FROM main.medical_meta").fetchall()
             expected = {"world_id": world_id, "mode": policy.mode,
