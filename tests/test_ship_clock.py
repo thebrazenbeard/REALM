@@ -209,5 +209,154 @@ class ShipClockTests(unittest.TestCase):
         self.assertEqual((0, 0), self._counts())
 
 
+    def test_shared_departure_can_rollback_with_outer_transaction(self):
+        self.geo.register_ship("vesta", "Vesta", "Patrick", "earth")
+        with closing(sqlite3.connect(self.path)) as db:
+            db.row_factory = sqlite3.Row
+            db.execute("PRAGMA foreign_keys=ON")
+            db.execute("BEGIN IMMEDIATE")
+            response = self.geo.depart_in_transaction(
+                db, "vesta", "moon", actor="Patrick",
+                now=int(START.timestamp()), action_id="depart-vesta",
+            )
+            self.assertEqual("in_transit", response["state"])
+            db.rollback()
+        self.assertEqual("docked", self.geo.ship_status("vesta")["state"])
+
+    def test_atomic_departure_schedules_and_arrives_under_utc_clock(self):
+        from realm.ship_clock_dispatch import depart_and_schedule_in_transaction
+        self.geo.register_ship("vesta", "Vesta", "Patrick", "earth")
+        with closing(sqlite3.connect(self.path)) as db:
+            db.row_factory = sqlite3.Row
+            db.execute("PRAGMA foreign_keys=ON")
+            db.execute("BEGIN IMMEDIATE")
+            result = depart_and_schedule_in_transaction(
+                self.clock, self.geo, db, "vesta", "moon", actor="Patrick",
+                now=int(START.timestamp()), action_id="vesta_depart_1",
+            )
+            self.assertEqual("in_transit", result["departure"]["state"])
+            self.assertTrue(db.in_transaction)
+            db.commit()
+        queued = self.clock.lookup(result["event_id"])
+        self.assertEqual(ARRIVAL, queued.due_at)
+        self.assertEqual({"ship_id": "vesta"}, queued.payload)
+        self.assertEqual("in_transit", self.geo.ship_status("vesta")["state"])
+        self.clock.tick(ARRIVAL, self._arrive)
+        self.assertEqual("docked", self.geo.ship_status("vesta")["state"])
+        self.assertEqual("moon", self.geo.ship_status("vesta")["planet"])
+        self.assertIsNotNone(self.clock.lookup(result["event_id"]).processed_at)
+
+    def test_failed_clock_insert_rolls_back_departure_even_after_caught_error(self):
+        from realm.ship_clock_dispatch import depart_and_schedule_in_transaction
+        self.geo.register_ship("vesta", "Vesta", "Patrick", "earth")
+        with closing(sqlite3.connect(self.path)) as db:
+            db.row_factory = sqlite3.Row
+            db.execute("PRAGMA foreign_keys=ON")
+            db.executescript(
+                "CREATE TEMP TRIGGER reject_depart_clock BEFORE INSERT ON main.clock_events "
+                "WHEN NEW.kind='ship_arrival' BEGIN SELECT RAISE(FAIL, 'forced clock reject'); END"
+            )
+            db.execute("BEGIN IMMEDIATE")
+            with self.assertRaisesRegex(sqlite3.IntegrityError, "forced clock reject"):
+                depart_and_schedule_in_transaction(
+                    self.clock, self.geo, db, "vesta", "moon", actor="Patrick",
+                    now=int(START.timestamp()), action_id="vesta_failed",
+                )
+            self.assertTrue(db.in_transaction)
+            db.commit()
+        self.assertEqual("docked", self.geo.ship_status("vesta")["state"])
+        with closing(sqlite3.connect(self.path)) as db:
+            self.assertEqual(0, db.execute(
+                "SELECT COUNT(*) FROM geo_ship_events WHERE ship_id='vesta'").fetchone()[0])
+            self.assertEqual(0, db.execute(
+                "SELECT COUNT(*) FROM geo_ship_receipts WHERE ship_id='vesta'").fetchone()[0])
+            self.assertEqual(0, db.execute(
+                "SELECT COUNT(*) FROM clock_events WHERE payload_json LIKE '%vesta%'").fetchone()[0])
+
+    def test_departure_replay_preserves_one_event_and_conflict_fails(self):
+        from realm.ship_clock_dispatch import depart_and_schedule_in_transaction
+        self.geo.register_ship("vesta", "Vesta", "Patrick", "earth")
+        with closing(sqlite3.connect(self.path)) as db:
+            db.row_factory = sqlite3.Row
+            db.execute("PRAGMA foreign_keys=ON")
+            db.execute("BEGIN IMMEDIATE")
+            first = depart_and_schedule_in_transaction(
+                self.clock, self.geo, db, "vesta", "moon", actor="Patrick",
+                now=int(START.timestamp()), action_id="stable-id",
+            )
+            replay = depart_and_schedule_in_transaction(
+                self.clock, self.geo, db, "vesta", "moon", actor="Patrick",
+                now=int(START.timestamp()) + 20, action_id="stable-id",
+            )
+            self.assertEqual(first, replay)
+            with self.assertRaisesRegex(ValueError, "different command"):
+                depart_and_schedule_in_transaction(
+                    self.clock, self.geo, db, "vesta", "earth", actor="Patrick",
+                    now=int(START.timestamp()), action_id="stable-id",
+                )
+            db.commit()
+        with closing(sqlite3.connect(self.path)) as db:
+            self.assertEqual(1, db.execute(
+                "SELECT COUNT(*) FROM clock_events WHERE kind='ship_arrival' "
+                "AND payload_json LIKE '%vesta%'").fetchone()[0])
+            self.assertEqual(1, db.execute(
+                "SELECT COUNT(*) FROM geo_ship_events WHERE ship_id='vesta'").fetchone()[0])
+
+    def test_departure_denies_other_actor_without_event_or_ship_effect(self):
+        from realm.ship_clock_dispatch import depart_and_schedule_in_transaction
+        self.geo.register_ship("vesta", "Vesta", "Patrick", "earth")
+        with closing(sqlite3.connect(self.path)) as db:
+            db.row_factory = sqlite3.Row
+            db.execute("PRAGMA foreign_keys=ON")
+            db.execute("BEGIN IMMEDIATE")
+            with self.assertRaises(PermissionError):
+                depart_and_schedule_in_transaction(
+                    self.clock, self.geo, db, "vesta", "moon", actor="Intruder",
+                    now=int(START.timestamp()), action_id="intruder",
+                )
+            db.commit()
+        self.assertEqual("docked", self.geo.ship_status("vesta")["state"])
+
+    def test_departure_overflow_does_not_strand_ship(self):
+        from realm.ship_clock_dispatch import depart_and_schedule_in_transaction
+        self.geo.register_ship("vesta", "Vesta", "Patrick", "earth")
+        with closing(sqlite3.connect(self.path)) as db:
+            db.row_factory = sqlite3.Row
+            db.execute("PRAGMA foreign_keys=ON")
+            db.execute("BEGIN IMMEDIATE")
+            with self.assertRaisesRegex(ValueError, "SQLite signed 64-bit"):
+                depart_and_schedule_in_transaction(
+                    self.clock, self.geo, db, "vesta", "moon", actor="Patrick",
+                    now=(1 << 63) - 1, action_id="too_late",
+                )
+            db.commit()
+        self.assertEqual("docked", self.geo.ship_status("vesta")["state"])
+        with closing(sqlite3.connect(self.path)) as db:
+            self.assertEqual(0, db.execute(
+                "SELECT COUNT(*) FROM geo_ship_events WHERE ship_id='vesta'").fetchone()[0])
+
+    def test_clock_host_callback_can_depart_and_queue_followup_atomically(self):
+        from realm.ship_clock_dispatch import depart_and_schedule_in_transaction
+        self.geo.register_ship("vesta", "Vesta", "Patrick", "earth")
+        self.clock.schedule(
+            "host_depart_vesta", due_at=START, kind="ship_departure",
+            payload={"ship_id": "vesta", "destination": "moon"},
+        )
+        scheduled = []
+        def host_depart(db, event):
+            self.assertEqual("ship_departure", event.kind)
+            scheduled.append(depart_and_schedule_in_transaction(
+                self.clock, self.geo, db, event.payload["ship_id"],
+                event.payload["destination"], actor="Patrick",
+                now=int(event.due_at.timestamp()), action_id=event.event_id,
+            ))
+        applied = self.clock.tick(START, host_depart)
+        self.assertEqual(["host_depart_vesta"], [e.event_id for e in applied])
+        self.assertEqual("in_transit", self.geo.ship_status("vesta")["state"])
+        self.assertEqual(ARRIVAL, self.clock.lookup(scheduled[0]["event_id"]).due_at)
+        self.clock.tick(ARRIVAL, self._arrive)
+        self.assertEqual("moon", self.geo.ship_status("vesta")["planet"])
+        self.assertEqual("docked", self.geo.ship_status("vesta")["state"])
+
 if __name__ == "__main__":
     unittest.main()
