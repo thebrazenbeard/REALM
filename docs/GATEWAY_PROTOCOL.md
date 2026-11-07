@@ -84,9 +84,9 @@ For browser requests, Origin must exactly match one explicitly configured
 | Request | Body/query | Response |
 | --- | --- | --- |
 | `GET /api/v1/health` | none | `{ "ok": true, "world_id": "demo" }` |
-| `POST /api/v1/join` | `{"player":"Patrick"}` | `{"ok":true,"text":"Welcome ...","cursor":1}` |
-| `POST /api/v1/command` | `{"player":"Patrick","command":"look","action_id":"optional-unique-id"}` | `{"ok":true,"text":"...","cursor":1}` |
-| `GET /api/v1/room?player=Patrick` | query | `{"ok":true,"text":"...","cursor":1}` |
+| `POST /api/v1/join` | `{"player":"Patrick"}` | `{"ok":true,"text":"Welcome ...","cursor":0}` |
+| `POST /api/v1/command` | `{"player":"Patrick","command":"look","action_id":"optional-unique-id"}` | `{"ok":true,"text":"..."}` |
+| `GET /api/v1/room?player=Patrick` | query | `{"ok":true,"text":"..."}` |
 | `GET /api/v1/feed?player=Patrick&after=1` | query | `{"ok":true,"events":[...],"cursor":2}` |
 | `GET /api/v1/map?player=Patrick` | query; optional authored geography | `{"ok":true,"space":{...},"origin":{...},"width":3,"height":2,"tiles":[...],"markers":[...],"player":{...},"legend":[...]}` |
 
@@ -107,13 +107,34 @@ an authoring API, not an automatic galaxy generator or public worldpack
 loader. Ship departure/arrival state is persisted and advanced by explicit
 host ticks; no always-running simulation is implied.
 
-Each event is `{id,kind,actor,text,room,at}`. Movement creates a `leave` event
+Each event is `{id,kind,actor,text,room,at}`. `id` and `cursor` are **per-player
+delivery positions**, not SQLite event IDs or shared world clocks. Movement creates a `leave` event
 in the source room and a `move` (arrival) event in the destination in one
-transaction. The feed is **polling**, not
-server push. It is filtered to the player's current room, returns up to 100
-events per request, and advances its cursor only for returned events.
-The join response supplies a starting cursor to avoid displaying a room's
-entire previous history as new activity.
+transaction. The feed is **polling**, not server push. It returns only events
+with an event-time delivery grant for that authenticated player, up to 100
+per request. Delivery is determined by **persisted room co-location at the
+original event transaction**; an actor also receives their own movement
+events. Later arrival or room re-entry never grants older events. `history`
+and `listen` use the same grant table and show only previously granted events
+for the actor's current room. Legacy events without durable grants fail closed.
+Unknown future event kinds and incompatible payload shapes receive no implicit
+delivery. An authorized operator can redact a previously granted delivery via
+the host-owned `revoked_at` field; no public revocation endpoint exists yet.
+
+**Important scope:** A player left in a room in persisted world state counts
+as present for delivery even if no browser/terminal session is active. This is
+not proof of live observation or consent. Authenticated online presence,
+session lifecycle, private messages, public-chronicle opt-in and richer
+event-time sensory/consent policy remain future work. These event grants are
+not automatically grants for NPC training or derived memory.
+
+`join` returns `cursor:0` on both first join and reconnect: joining does not
+acknowledge receipt of unseen events. Clients must page through their own
+authorized backlog or explicitly retain a previously acknowledged cursor.
+`command` and `room` deliberately return **no cursor**: they aren't delivery
+acknowledgments. Only a feed response's actually returned events may advance a
+client's consumption cursor; an empty feed returns its input cursor, including
+when a new event commits concurrently with the read.
 
 Credentials are bound to one character name, but are long-lived bearer
 capabilities rather than expiring sessions with account recovery. Anyone who
