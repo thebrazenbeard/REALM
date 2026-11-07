@@ -165,6 +165,97 @@ class HostGameTheoryBridgeTests(unittest.TestCase):
         self.assertEqual(choice.site, SITES[1])
         self.assertEqual(choice.available_units, 3)
 
+    def test_reviewed_choice_requires_same_transaction_and_fresh_state(self):
+        from realm import npc_game_theory
+        choice = self.choose(seed=1)
+        with closing(sqlite3.connect(self.db)) as db:
+            db.row_factory = sqlite3.Row
+            with self.assertRaises(ValueError):
+                npc_game_theory.verify_economic_choice_in_transaction(
+                    db, choice=choice, sites=SITES, seed=1,
+                )
+            db.execute("BEGIN IMMEDIATE")
+            verified = npc_game_theory.verify_economic_choice_in_transaction(
+                db, choice=choice, sites=SITES, seed=1,
+            )
+            self.assertEqual(verified.status, "VERIFIED_FOR_HOST_ACTION")
+            self.assertEqual(verified.site, choice.site)
+            self.assertEqual(verified.world_id, choice.world_id)
+            db.rollback()
+
+    def test_reviewed_choice_rejects_forgery_and_changed_world_state(self):
+        from dataclasses import replace
+        from realm import npc_game_theory
+        choice = self.choose(seed=1)
+        with closing(sqlite3.connect(self.db)) as db:
+            db.row_factory = sqlite3.Row
+            db.execute("BEGIN IMMEDIATE")
+            with self.assertRaises(ValueError):
+                npc_game_theory.verify_economic_choice_in_transaction(
+                    db, choice=replace(choice, site=SITES[1] if choice.site == SITES[0] else SITES[0]),
+                    sites=SITES, seed=1,
+                )
+            db.rollback()
+        self.crafting.perform("Ben", "gather stone", action_id="ben-changed-stock")
+        with closing(sqlite3.connect(self.db)) as db:
+            db.row_factory = sqlite3.Row
+            db.execute("BEGIN IMMEDIATE")
+            with self.assertRaises(ValueError):
+                npc_game_theory.verify_economic_choice_in_transaction(
+                    db, choice=choice, sites=SITES, seed=1,
+                )
+            db.rollback()
+
+    def test_temp_shadow_table_cannot_spoof_world_identity(self):
+        from realm import npc_game_theory
+        with closing(sqlite3.connect(self.db)) as db:
+            db.row_factory = sqlite3.Row
+            db.execute("CREATE TEMP TABLE world_meta AS SELECT * FROM main.world_meta")
+            db.execute("UPDATE temp.world_meta SET value='shadow_world' WHERE key='world_id'")
+            db.commit()
+            db.execute("BEGIN IMMEDIATE")
+            with self.assertRaises(ValueError):
+                forged = npc_game_theory.choose_economic_site(
+                    self.db, expected_world_id="shadow_world",
+                    actor="Ada", opponent="Ben", sites=SITES,
+                    observed_through_event=self.watermark(), seed=1,
+                    _connection=db,
+                )
+                npc_game_theory.verify_economic_choice_in_transaction(
+                    db, choice=forged, sites=SITES, seed=1,
+                )
+            db.rollback()
+
+    def test_revalidation_reads_uncommitted_stock_in_same_transaction(self):
+        from realm import npc_game_theory
+        choice = self.choose(seed=1)
+        with closing(sqlite3.connect(self.db)) as db:
+            db.row_factory = sqlite3.Row
+            db.execute("BEGIN IMMEDIATE")
+            db.execute("UPDATE main.gathering_nodes SET remaining=0 WHERE room_id='atrium'")
+            with self.assertRaises(ValueError):
+                npc_game_theory.verify_economic_choice_in_transaction(
+                    db, choice=choice, sites=SITES, seed=1,
+                )
+            db.rollback()
+        # The rejected speculative action never changed real stock.
+        self.assertEqual(self.choose(seed=1), choice)
+
+    def test_verified_status_is_not_reusable_as_fresh_review_authority(self):
+        from realm import npc_game_theory
+        choice = self.choose(seed=1)
+        with closing(sqlite3.connect(self.db)) as db:
+            db.row_factory = sqlite3.Row
+            db.execute("BEGIN IMMEDIATE")
+            verified = npc_game_theory.verify_economic_choice_in_transaction(
+                db, choice=choice, sites=SITES, seed=1,
+            )
+            with self.assertRaises(ValueError):
+                npc_game_theory.verify_economic_choice_in_transaction(
+                    db, choice=verified, sites=SITES, seed=1,
+                )
+            db.rollback()
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -6,8 +6,8 @@ event watermark before offering the next simultaneous strategic round.
 """
 from __future__ import annotations
 
-from contextlib import closing
-from dataclasses import dataclass
+from contextlib import closing, nullcontext
+from dataclasses import dataclass, replace
 from fractions import Fraction
 import hashlib
 import json
@@ -40,6 +40,7 @@ class ResourceChoice:
 def choose_economic_site(
     db_path: str | Path, *, expected_world_id: str, actor: str, opponent: str,
     sites: tuple[ResourceSite, ...], observed_through_event: int, seed: int,
+    _connection: sqlite3.Connection | None = None,
 ) -> ResourceChoice:
     """Choose an anti-coordination resource site from a real world snapshot.
 
@@ -68,21 +69,34 @@ def choose_economic_site(
     db_path = Path(db_path).resolve()
     if not db_path.is_file():
         raise ValueError("Bound world database is missing")
-    with closing(sqlite3.connect(db_path.as_uri() + "?mode=ro", uri=True)) as db:
-        db.row_factory = sqlite3.Row
-        db.execute("PRAGMA query_only=ON")
-        db.execute("BEGIN")
-        binding = db.execute("SELECT value FROM world_meta WHERE key='world_id'").fetchone()
+    if _connection is None:
+        context = closing(sqlite3.connect(db_path.as_uri() + "?mode=ro", uri=True))
+    else:
+        if type(_connection) is not sqlite3.Connection or not _connection.in_transaction:
+            raise ValueError("Host must provide an open, owned SQLite transaction")
+        if _connection.row_factory is not sqlite3.Row:
+            raise ValueError("Host transaction must use sqlite3.Row")
+        files = _connection.execute("PRAGMA database_list").fetchall()
+        main = next((row[2] for row in files if row[1] == "main"), None)
+        if not main or Path(main).resolve() != db_path:
+            raise ValueError("Host transaction is not bound to the offered world DB")
+        context = nullcontext(_connection)
+    with context as db:
+        if _connection is None:
+            db.row_factory = sqlite3.Row
+            db.execute("PRAGMA query_only=ON")
+            db.execute("BEGIN")
+        binding = db.execute("SELECT value FROM main.world_meta WHERE key='world_id'").fetchone()
         if binding is None or binding["value"] != expected_world_id:
             raise ValueError("Unbound or different world database")
         identities = []
         for name in (actor, opponent):
-            row = db.execute("SELECT id FROM players WHERE id=? COLLATE NOCASE", (name,)).fetchone()
+            row = db.execute("SELECT id FROM main.players WHERE id=? COLLATE NOCASE", (name,)).fetchone()
             if row is None:
                 raise ValueError("Host must pre-provision both actors")
             identities.append(row["id"])
         actor_id, rival_id = identities
-        latest = db.execute("SELECT COALESCE(MAX(id),0) FROM events").fetchone()[0]
+        latest = db.execute("SELECT COALESCE(MAX(id),0) FROM main.events").fetchone()[0]
         if observed_through_event > latest:
             raise ValueError("Event watermark is ahead of the durable event ledger")
         capacity = []
@@ -90,7 +104,7 @@ def choose_economic_site(
         resources = []
         for site in sites:
             row = db.execute(
-                "SELECT remaining,batch_yield FROM gathering_nodes WHERE room_id=? AND material=?",
+                "SELECT remaining,batch_yield FROM main.gathering_nodes WHERE room_id=? AND material=?",
                 (site.room_id, site.material),
             ).fetchone()
             if row is None:
@@ -107,7 +121,7 @@ def choose_economic_site(
         counts = [0] * len(sites)
         offered = {(site.room_id, site.material): idx for idx, site in enumerate(sites)}
         events = db.execute(
-            "SELECT room_id,payload_json FROM events "
+            "SELECT room_id,payload_json FROM main.events "
             "WHERE actor=? AND kind='gather' AND id<=? ORDER BY id DESC LIMIT 256",
             (rival_id, observed_through_event),
         ).fetchall()
@@ -152,3 +166,40 @@ def choose_economic_site(
             observations=observations, observed_through_event=observed_through_event,
             evidence_sha256=hashlib.sha256(evidence).hexdigest(),
         )
+
+
+def verify_economic_choice_in_transaction(
+    db: sqlite3.Connection, *, choice: ResourceChoice,
+    sites: tuple[ResourceSite, ...], seed: int,
+) -> ResourceChoice:
+    """Recheck a read-only proposal against current state in the host's transaction.
+
+    The host MUST own a real ``BEGIN IMMEDIATE`` transaction and must independently
+    authenticate/authorize actor, site and ensuing action. SQLite does not expose
+    a reliable primitive here to prove the caller acquired an IMMEDIATE lock.
+    This operation makes no write, creates no single-use receipt and is not an
+    authorization or a durable gameplay effect. The host must commit the eventual
+    action in *this same transaction* for the recheck to prevent a TOCTOU race.
+    """
+    if type(choice) is not ResourceChoice or choice.status != "HOST_REVIEW_REQUIRED":
+        raise ValueError("Only an original host-review-required choice may be adjudicated")
+    if type(db) is not sqlite3.Connection or not db.in_transaction:
+        raise ValueError("Adjudication requires a caller-owned SQLite transaction")
+    if db.row_factory is not sqlite3.Row:
+        raise ValueError("Adjudication requires sqlite3.Row")
+    files = db.execute("PRAGMA database_list").fetchall()
+    main = next((row[2] for row in files if row[1] == "main"), None)
+    if not main:
+        raise ValueError("Adjudication requires a durable world database")
+    latest = db.execute("SELECT COALESCE(MAX(id),0) FROM main.events").fetchone()[0]
+    if latest != choice.observed_through_event:
+        raise ValueError("The proposed event watermark is stale")
+    regenerated = choose_economic_site(
+        main, expected_world_id=choice.world_id,
+        actor=choice.actor, opponent=choice.opponent,
+        sites=sites, observed_through_event=choice.observed_through_event,
+        seed=seed, _connection=db,
+    )
+    if regenerated != choice:
+        raise ValueError("Proposal evidence or contents no longer match world state")
+    return replace(regenerated, status="VERIFIED_FOR_HOST_ACTION")
