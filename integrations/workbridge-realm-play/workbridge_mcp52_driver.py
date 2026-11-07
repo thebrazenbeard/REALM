@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+from contextlib import closing
 import hashlib
 import json
 import os
@@ -96,7 +97,7 @@ def preflight(config: dict, token: str) -> None:
         raise DriverError("WORLD_DATABASE_NOT_FOUND")
     digest = hashlib.sha256(token.encode("ascii")).hexdigest()
     try:
-        with sqlite3.connect(path.resolve(strict=True).as_uri() + "?mode=ro", uri=True, timeout=3) as db:
+        with closing(sqlite3.connect(path.resolve(strict=True).as_uri() + "?mode=ro", uri=True, timeout=3)) as db:
             row = db.execute("SELECT value FROM world_meta WHERE key='world_id'").fetchone()
             actor = db.execute("SELECT player_name FROM player_credentials WHERE token_digest=?",
                                (digest,)).fetchone()
