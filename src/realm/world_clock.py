@@ -189,7 +189,7 @@ class WorldClock:
         stamp = _stamp(now)
         with self._connect() as db:
             db.execute("BEGIN IMMEDIATE")
-            state = db.execute("SELECT last_utc FROM clock_state WHERE id=1").fetchone()
+            state = db.execute("SELECT last_utc FROM main.clock_state WHERE id=1").fetchone()
             if state is not None:
                 prior = datetime.fromisoformat(state["last_utc"])
                 elapsed = (now - prior).total_seconds()
@@ -197,8 +197,20 @@ class WorldClock:
                     raise ClockSkewError("UTC wall clock moved backward")
                 if elapsed > _MAX_FORWARD_SECONDS and not acknowledge_forward_jump:
                     raise ClockSkewError("UTC advanced more than 24 hours; host acknowledgment required")
+            # Snapshot every pre-existing scheduler row in Python memory.
+            # A callback's TEMP trigger could otherwise pre-complete, delete,
+            # or rewrite an event outside this tick's selected batch.
+            before_events = {
+                row["event_id"]: (
+                    row["due_utc"], row["kind"], row["payload_json"], row["processed_utc"]
+                )
+                for row in db.execute(
+                    "SELECT event_id,due_utc,kind,payload_json,processed_utc "
+                    "FROM main.clock_events"
+                )
+            }
             rows = db.execute(
-                "SELECT * FROM clock_events WHERE processed_utc IS NULL AND due_utc <= ? "
+                "SELECT * FROM main.clock_events WHERE processed_utc IS NULL AND due_utc <= ? "
                 "ORDER BY due_utc, event_id LIMIT ?", (stamp, limit),
             ).fetchall()
             processed = []
@@ -206,7 +218,7 @@ class WorldClock:
                 event = _event(row)
                 handler(db, event)
                 updated = db.execute(
-                    "UPDATE clock_events SET processed_utc=? "
+                    "UPDATE main.clock_events SET processed_utc=? "
                     "WHERE event_id=? AND processed_utc IS NULL",
                     (stamp, event.event_id),
                 )
@@ -214,8 +226,43 @@ class WorldClock:
                     raise RuntimeError("A clock receipt changed during host transaction")
                 processed.append(event)
             db.execute(
-                "INSERT INTO clock_state(id,last_utc) VALUES(1,?) "
+                "INSERT INTO main.clock_state(id,last_utc) VALUES(1,?) "
                 "ON CONFLICT(id) DO UPDATE SET last_utc=excluded.last_utc",
                 (stamp,),
             )
+            # Handler-created TEMP triggers can alter the durable receipts or
+            # clock watermark after UPDATE rowcount checks succeeded. Verify
+            # the final main-schema state, including earlier batch members,
+            # while still inside the same rollback-capable transaction.
+            state_after = db.execute(
+                "SELECT last_utc FROM main.clock_state WHERE id=1"
+            ).fetchone()
+            if state_after is None or state_after["last_utc"] != stamp:
+                raise RuntimeError("Clock state postcondition failed during host transaction")
+            expected_receipts = {event.event_id: stamp for event in processed}
+            unseen = set(before_events)
+            for row in db.execute(
+                "SELECT event_id,due_utc,kind,payload_json,processed_utc "
+                "FROM main.clock_events"
+            ):
+                event_id = row["event_id"]
+                if event_id in before_events:
+                    unseen.remove(event_id)
+                    before = before_events[event_id]
+                    expected = (
+                        before[0], before[1], before[2],
+                        expected_receipts.get(event_id, before[3]),
+                    )
+                    actual = (
+                        row["due_utc"], row["kind"], row["payload_json"],
+                        row["processed_utc"],
+                    )
+                    if actual != expected:
+                        raise RuntimeError("Clock event receipt/metadata postcondition failed during host transaction")
+                elif row["processed_utc"] is not None:
+                    # A trusted host can enqueue a new pending future event
+                    # in its transaction, but cannot forge its completion.
+                    raise RuntimeError("Clock new event postcondition failed during host transaction")
+            if unseen:
+                raise RuntimeError("Clock event deletion postcondition failed during host transaction")
             return processed
