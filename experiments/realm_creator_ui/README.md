@@ -41,6 +41,37 @@ compile/deploy button. Keep source rights evidence
 and any game-world release approval in a separate private, host-authenticated
 workflow.
 
+### Host-custodied exact-candidate staging (source-only)
+
+The `release_gate.stage_exact_worldpack` Python function is an **offline
+staging-only** seam, not a browser route or world importer. It accepts exact
+authored `realm.worldpack.v1` bytes, a bounded JSON source manifest, a
+canonical UTF-8 release-authorization payload and a **separately held** HMAC
+over `b"REALM/CREATOR-RELEASE-STAGING/v1\x00" + authorization_bytes`.
+The host supplies a purpose-specific secret (at least 32 bytes) and fixed
+`expected_owner_id`, `expected_key_id` and `expected_ledger_id`; neither player
+credentials nor the Creator loopback token are valid substitutes.
+
+The exact authorization keys are `schema` (`realm.creator.release-authorization.v1`),
+`scope` (`STAGE_ONLY`), `release_id`, `owner_id`, `key_id`, `ledger_id`,
+`world_id`, `revision`, `raw_sha256`, `semantic_sha256`, and
+`source_manifest_sha256`. The source manifest is
+`{"schema":"realm.creator.source-manifest.v1","sources":[{"source_id":"worldpack","sha256":"<raw pack hash>"},...]}`
+with unique bounded source IDs and lowercase SHA-256 digests. The format binds
+source identifiers and bytes, **not** the truth, rights or canon of source lore.
+
+The dedicated SQLite staging ledger serializes one `(world_id, revision)` and
+`release_id` in a single write transaction. Exact retries are readback-only;
+changed IDs or content are rejected. The receipt always says
+`STAGED_NOT_IMPORTED`, `owner_authority=HELD_UNVERIFIED`,
+`release_permitted=false`, and `world_imported=false`. Key possession proves
+only the host key is present, **not that Patrick authorized anything**. A
+separate authenticated owner decision, source-rights review, independent
+custody/witness and real-world isolation/backup qualification are required
+before building an actual importer/release path. This rollbackable SQLite
+ledger cannot provide global replay immunity against copying/restoring the
+ledger file; do not treat it as an immutable release witness.
+
 The browser and server process source bytes in memory only; there is no upload directory, database write, external API call or telemetry. **Your manual worldpack download is an intentional local file write.** No private fiction is included in this repository.
 
 ## Trust and release limits
@@ -58,6 +89,7 @@ $env:PYTHONPATH = Join-Path (Get-Location).Path 'src'
 py -3 -m unittest experiments.realm_creator_ui.test_server experiments.realm_creator_ui.test_workflow experiments.realm_creator_generation.test_generation experiments.realm_creator_generation.test_integration experiments.realm_creator.test_draft -q
 py -3 -O -m unittest experiments.realm_creator_ui.test_server experiments.realm_creator_ui.test_workflow experiments.realm_creator_generation.test_generation experiments.realm_creator_generation.test_integration experiments.realm_creator.test_draft -q
 py -3 -m unittest discover -s tests -q
+py -3 -m unittest tests.test_creator_release_gate -q
 $env:REALM_PYTHON = (py -3 -c 'import sys; print(sys.executable)').Trim()
 node --test tests/browser/test-client.cjs tests/browser/test-map.cjs experiments/realm_creator_ui/test_ui.cjs
 ```
