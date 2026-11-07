@@ -33,6 +33,7 @@ from .geography import MapUnavailable
 
 MAX_LINE_BYTES = 32_768
 MAX_RESULT_BYTES = 65_536
+MAX_REQUEST_ID_CHARS = 512
 _WORLD_ID = re.compile(r"[A-Za-z][A-Za-z0-9_-]{0,63}\Z")
 _ACTION_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}\Z")
 _SUPPORTED_PROTOCOLS = frozenset({"2024-11-05", "2025-03-26", "2025-06-18"})
@@ -230,6 +231,10 @@ def dispatch(message: object, bridge: RealmMCPBridge) -> dict[str, object] | Non
     request_id = message.get("id")
     if "id" in message and (type(request_id) not in (int, str) and request_id is not None):
         return _jsonrpc_error(None, -32600, "invalid request identifier")
+    if type(request_id) is str and len(request_id) > MAX_REQUEST_ID_CHARS:
+        # A short UTF-8 request can contain enough non-ASCII ID characters
+        # to amplify the ensure_ascii=True response beyond the wire budget.
+        return _jsonrpc_error(None, -32600, "request identifier too long")
     if "id" not in message:
         # MCP notifications are one-way. Unknown notifications cannot cause
         # gameplay effects because no tool invocation is processed here.
@@ -293,7 +298,11 @@ def serve_stdio(bridge: RealmMCPBridge, source: IO[bytes], destination: IO[str])
         if result is not None:
             # Escape unpaired surrogate code points accepted by json.loads;
             # writing those directly to a strict UTF-8 stdout kills the MCP process.
-            destination.write(json.dumps(result, ensure_ascii=True, separators=(",", ":")) + "\n")
+            serialized = json.dumps(result, ensure_ascii=True, separators=(",", ":"))
+            if len(serialized.encode("utf-8")) > MAX_RESULT_BYTES:
+                serialized = json.dumps(_jsonrpc_error(None, -32600, "oversized JSON-RPC response"),
+                                        separators=(",", ":"))
+            destination.write(serialized + "\n")
             destination.flush()
 
 

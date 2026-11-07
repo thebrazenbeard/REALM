@@ -341,6 +341,22 @@ class MCPServerTests(unittest.TestCase):
         self.assertEqual(rows[1]["id"], 10)
         self.assertEqual(rows[1]["result"], {})
 
+    def test_large_unicode_request_id_cannot_amplify_stdio_reply(self):
+        oversized = {"jsonrpc": "2.0", "id": "😀" * 7000, "method": "ping"}
+        raw = (json.dumps(oversized, ensure_ascii=False) + "\n").encode("utf-8")
+        self.assertLess(len(raw), 32768)
+        ping = b'{"jsonrpc":"2.0","id":22,"method":"ping"}\n'
+        output = io.StringIO()
+        serve_stdio(self.bridge, io.BytesIO(raw + ping), output)
+        lines = output.getvalue().splitlines(keepends=True)
+        self.assertEqual(len(lines), 2)
+        self.assertLessEqual(max(len(line.encode("utf-8")) for line in lines), MAX_RESULT_BYTES + 1)
+        rows = [json.loads(line) for line in lines]
+        self.assertEqual(rows[0]["error"]["code"], -32600)
+        self.assertIsNone(rows[0]["id"])
+        self.assertEqual(rows[1]["id"], 22)
+        self.assertEqual(rows[1]["result"], {})
+
     def test_malformed_request_identifiers_and_protocol_version_fail_safely(self):
         self.assertEqual(dispatch({"jsonrpc": "2.0", "id": True,
                                    "method": "tools/list"}, self.bridge)["error"]["code"], -32600)
