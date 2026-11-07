@@ -6,7 +6,10 @@ tool arguments can never select an actor, a database or an identity.  Gameplay
 continues to pass through the same Gateway and CommandRouter as HTTP clients.
 
 An MCP stdio client is a trusted local process with the authority of the bound
-player.  It must not expose these tools to an untrusted remote principal.
+player.  It must not expose these tools to an untrusted remote principal. The
+selected world database and its parent directory must be host-trusted: read-only
+schema/world/token preflight is not atomic with later SQLite path-based commits,
+so a local adversary able to replace database files can defeat path pinning.
 """
 
 from __future__ import annotations
@@ -23,7 +26,7 @@ from tempfile import TemporaryDirectory
 from typing import IO, Any
 
 from .auth import CredentialStore
-from .engine import _PLAYER_RE, _schema_snapshot
+from .engine import _LONG_DIRECTIONS, _PLAYER_RE, _schema_snapshot
 from .gateway import Gateway
 from .geography import MapUnavailable
 
@@ -96,11 +99,15 @@ TOOLS: tuple[dict[str, object], ...] = (
     _tool("realm_status", "Read the bound world and authenticated character identity; no arbitrary actor selection.", {}),
     _tool("realm_join", "Join the host-configured character in its existing REALM world. May create the character if it has never joined.", {}),
     _tool("realm_look", "Read the room around the currently bound character, without moving.", {}),
-    _tool("realm_command", "Execute an explicit game command as the bound player. This mutates persistent world state when the command is an action. Use a fresh action_id per intended action; reuse it for retries.",
+    _tool("realm_inventory", "Inspect carried items as the bound character, without creating an action receipt.", {}),
+    _tool("realm_move", "Move the bound character in an explicit direction. Reuse the action_id on uncertain retries to prevent duplicate movement.",
+          {"direction": {"type": "string", "enum": sorted(_LONG_DIRECTIONS)},
+           "action_id": {"type": "string", "minLength": 1, "maxLength": 128}}, ("direction", "action_id")),
+    _tool("realm_command", "Execute an explicit non-speech game command as the bound player. This mutates persistent world state when the command is an action. Use a fresh action_id per intended action; reuse it for retries. Use realm_say for speech.",
           {"command": {"type": "string", "minLength": 1, "maxLength": 512},
            "action_id": {"type": "string", "minLength": 1, "maxLength": 128}}, ("command", "action_id")),
     _tool("realm_say", "Post a message to the shared game room as the bound player. This is public to occupants and durable in the world history; ordinary assistant conversation must not call it.",
-          {"message": {"type": "string", "minLength": 1, "maxLength": 480},
+          {"message": {"type": "string", "minLength": 1, "maxLength": 280},
            "action_id": {"type": "string", "minLength": 1, "maxLength": 128}}, ("message", "action_id")),
     _tool("realm_feed", "Read recent events visible in the bound character's current room, after an event cursor.",
           {"after": {"type": "integer", "minimum": 0}}, ()),
@@ -124,14 +131,19 @@ def _action_id(value: object) -> str:
 class RealmMCPBridge:
     def __init__(self, path: str, world_id: str, token: str):
         self.db_path = _existing_bound_world(path, world_id, token)
+        self._world_id = world_id
         self._token = token
         self.gateway = Gateway(self.db_path, world_id=world_id)
         if self.gateway.credentials.authenticate(token) is None:
             raise RealmMCPError("host player credential is invalid or revoked")
 
     def _actor(self) -> str:
-        # Reauthenticate each invocation so host revocation takes effect
-        # without a plugin-process restart.
+        # Revalidate the selected world and credential at every invocation,
+        # including after a host modifies or replaces the configured database.
+        # This is a best-effort preflight, not an atomic filesystem path lock.
+        _existing_bound_world(str(self.db_path), self._world_id, self._token)
+        # Reauthenticate each invocation so revocation takes effect without
+        # a plugin-process restart.
         actor = self.gateway.credentials.authenticate(self._token)
         if actor is None:
             raise RealmMCPError("host player credential is invalid or revoked")
@@ -150,6 +162,16 @@ class RealmMCPBridge:
         if name == "realm_look":
             _arguments(arguments, frozenset())
             return self.gateway.room(actor)
+        if name == "realm_inventory":
+            _arguments(arguments, frozenset())
+            return self.gateway.command(actor, "inventory", None)
+        if name == "realm_move":
+            args = _arguments(arguments, frozenset({"direction", "action_id"}),
+                              frozenset({"direction", "action_id"}))
+            direction = args["direction"]
+            if type(direction) is not str or direction not in _LONG_DIRECTIONS:
+                raise RealmMCPError("invalid movement direction")
+            return self.gateway.command(actor, "go " + direction, _action_id(args["action_id"]))
         if name == "realm_map":
             _arguments(arguments, frozenset())
             return self.gateway.map(actor)
@@ -165,12 +187,14 @@ class RealmMCPBridge:
             command = args["command"]
             if type(command) is not str or not command.strip() or len(command) > 512:
                 raise RealmMCPError("invalid game command")
+            if command.strip().split(maxsplit=1)[0].casefold() == "say":
+                raise RealmMCPError("use explicit realm_say for durable in-world speech")
             return self.gateway.command(actor, command, _action_id(args["action_id"]))
         args = _arguments(arguments, frozenset({"message", "action_id"}),
                           frozenset({"message", "action_id"}))
         message = args["message"]
-        if (type(message) is not str or not message.strip() or len(message) > 480
-                or any(ch in "\r\n\0" for ch in message)):
+        if (type(message) is not str or not 1 <= len(message) <= 280
+                or message != message.strip() or not all(ch.isprintable() for ch in message)):
             raise RealmMCPError("invalid room chat message")
         return self.gateway.command(actor, "say " + message, _action_id(args["action_id"]))
 

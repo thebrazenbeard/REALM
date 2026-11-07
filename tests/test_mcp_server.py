@@ -33,7 +33,7 @@ class MCPServerTests(unittest.TestCase):
         tools = {tool["name"]: tool for tool in TOOLS}
         self.assertEqual(set(tools), {
             "realm_status", "realm_join", "realm_look", "realm_command",
-            "realm_say", "realm_feed", "realm_map",
+            "realm_say", "realm_feed", "realm_map", "realm_move", "realm_inventory",
         })
         for tool in tools.values():
             self.assertNotIn("player", tool["inputSchema"]["properties"])
@@ -50,6 +50,32 @@ class MCPServerTests(unittest.TestCase):
         self.assertIn("Corridor", move["text"])
         reconnected = RealmMCPBridge(str(self.database), "sandbox", self.token)
         self.assertIn("Corridor", reconnected.call("realm_look", {})["text"])
+
+    def test_typed_inventory_and_move_replay_do_not_duplicate_world_actions(self):
+        self.bridge.call("realm_join", {})
+        self.assertIn("nothing", self.bridge.call("realm_inventory", {})["text"].lower())
+        self.bridge.call("realm_command", {"command": "take token", "action_id": "take-token"})
+        self.assertIn("token", self.bridge.call("realm_inventory", {})["text"].lower())
+        args = {"direction": "north", "action_id": "typed-north"}
+        first = self.bridge.call("realm_move", args)
+        self.assertIn("Corridor", first["text"])
+        self.assertEqual(first, self.bridge.call("realm_move", args))
+        with sqlite3.connect(self.database) as db:
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM action_receipts").fetchone()[0], 2)
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM events WHERE kind='move'").fetchone()[0], 1)
+        with self.assertRaisesRegex(ValueError, "Action ID"):
+            self.bridge.call("realm_move", {"direction": "south", "action_id": "typed-north"})
+
+    def test_typed_move_fails_closed_on_non_directions_and_unknown_fields(self):
+        self.bridge.call("realm_join", {})
+        for arguments in ({"direction": "north"},
+                          {"direction": "teleport", "action_id": "a"},
+                          {"direction": "north; say hi", "action_id": "a"},
+                          {"direction": "north", "action_id": "a", "player": "Patrick"}):
+            with self.subTest(arguments=arguments), self.assertRaises(RealmMCPError):
+                self.bridge.call("realm_move", arguments)
+        with self.assertRaises(RealmMCPError):
+            self.bridge.call("realm_inventory", {"player": "Patrick"})
 
     def test_action_id_retry_and_conflicting_reuse(self):
         self.bridge.call("realm_join", {})
@@ -84,6 +110,9 @@ class MCPServerTests(unittest.TestCase):
         ):
             with self.subTest(arguments=arguments), self.assertRaises(RealmMCPError):
                 self.bridge.call("realm_command", arguments)
+        for speech in ("say hello", " SAY hello", "say\thello"):
+            with self.subTest(speech=speech), self.assertRaisesRegex(RealmMCPError, "realm_say"):
+                self.bridge.call("realm_command", {"command": speech, "action_id": "speech-bypass"})
         for after in (True, -1, "0", 2**64):
             with self.subTest(after=after), self.assertRaises(RealmMCPError):
                 self.bridge.call("realm_feed", {"after": after})
@@ -148,6 +177,24 @@ class MCPServerTests(unittest.TestCase):
             self.bridge.call("realm_status", {})
         self.assertNotIn(self.token, str(caught.exception))
 
+    def test_rebinding_world_invalidates_live_bridge_before_effect(self):
+        self.bridge.call("realm_join", {})
+        with sqlite3.connect(self.database) as db:
+            db.execute("UPDATE world_meta SET value='otherworld' WHERE key='world_id'")
+        with self.assertRaisesRegex(RealmMCPError, "does not match"):
+            self.bridge.call("realm_move", {"direction": "north", "action_id": "invalid-world-move"})
+        with sqlite3.connect(self.database) as db:
+            self.assertEqual(db.execute("SELECT room_id FROM players WHERE id='Vera'").fetchone()[0], "atrium")
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM action_receipts").fetchone()[0], 0)
+
+    def test_overlong_or_nonprintable_speech_rejected_without_receipt(self):
+        self.bridge.call("realm_join", {})
+        for message in ("x" * 281, "hello\tworld", "hello\nworld", " hello", "hello "):
+            with self.subTest(message=repr(message)), self.assertRaises(RealmMCPError):
+                self.bridge.call("realm_say", {"message": message, "action_id": "bad-speech"})
+        with sqlite3.connect(self.database) as db:
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM action_receipts").fetchone()[0], 0)
+
     def test_mcp_initialize_list_and_tool_call_on_stdin(self):
         requests = [
             {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-06-18"}},
@@ -170,7 +217,7 @@ class MCPServerTests(unittest.TestCase):
         responses = [json.loads(line) for line in result.stdout.splitlines()]
         self.assertEqual([r["id"] for r in responses], [1, 2, 3, 4, 5])
         self.assertEqual(responses[0]["result"]["protocolVersion"], "2025-06-18")
-        self.assertEqual(len(responses[1]["result"]["tools"]), 7)
+        self.assertEqual(len(responses[1]["result"]["tools"]), 9)
         self.assertIn("Welcome, Vera", responses[2]["result"]["content"][0]["text"])
         self.assertIn("Corridor", responses[4]["result"]["content"][0]["text"])
         self.assertNotIn("error", responses[3])
