@@ -3,6 +3,7 @@ import copy
 import io
 import json
 import unittest
+from email.message import Message
 from unittest.mock import patch
 
 from research.pr_stack_live import (API, canonical_origin, assess_live,
@@ -107,6 +108,50 @@ class PRStackLiveTest(unittest.TestCase):
         self.assertEqual(set(observed), {61, 92})
         self.assertIn("UNTRACKED_OPEN_PR:92",
                       assess_live(self.snapshot, observed)["findings"])
+
+    def test_separate_link_headers_must_follow_hidden_next_page(self):
+        # A complete-looking 27-PR manifest must not hide PR #92 on page 2.
+        rows = []
+        manifest = copy.deepcopy(self.snapshot)
+        for number in range(61, 88):
+            pr = copy.deepcopy(self.live[61])
+            pr["number"] = number
+            rows.append(pr)
+            if number != 61:
+                pr["head"]["ref"] = f"feature/parent-{number}"
+                rec = copy.deepcopy(manifest["prs"][0])
+                rec["n"] = number
+                rec["head_ref"] = pr["head"]["ref"]
+                manifest["prs"].append(rec)
+        first = _Response(rows)
+        headers = Message()
+        headers.add_header("Link", f'<{API}?state=open&per_page=100&page=1>; rel="prev"')
+        headers.add_header("Link", f'<{API}?state=open&per_page=100&page=2>; rel="next"')
+        first.headers = headers
+        later = copy.deepcopy(self.live[61])
+        later["number"] = 92
+        with patch("research.pr_stack_live.urlopen",
+                   side_effect=[first, _Response([later])]) as lookup:
+            observed = fetch_live_open_prs()
+        self.assertEqual(lookup.call_count, 2)
+        self.assertEqual(len(observed), 28)
+        self.assertEqual(assess_live(manifest, observed)["pr_gate"], "HOLD")
+        self.assertIn("UNTRACKED_OPEN_PR:92",
+                      assess_live(manifest, observed)["findings"])
+
+    def test_separate_conflicting_next_headers_rejected(self):
+        for second_page in (2, 3):
+            with self.subTest(second_page=second_page):
+                first = _Response([self.live[61]])
+                headers = Message()
+                headers.add_header("Link", f'<{API}?state=open&per_page=100&page=2>; rel="next"')
+                headers.add_header("Link", f'<{API}?state=open&per_page=100&page={second_page}>; rel="next"')
+                first.headers = headers
+                with patch("research.pr_stack_live.urlopen",
+                           side_effect=[first, _Response([])]) as lookup:
+                    with self.assertRaises(ValueError):
+                        fetch_live_open_prs()
+                self.assertEqual(lookup.call_count, 1)
 
     def test_malformed_or_cyclic_pagination_fail_closed(self):
         bad = (

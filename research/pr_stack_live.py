@@ -127,7 +127,17 @@ def fetch_live_open_prs(api: str = API):
         with urlopen(req, timeout=15) as response:
             if response.status != 200:
                 raise RuntimeError(f"GitHub API HTTP {response.status}")
-            further = has_next_page(response.headers.get("Link", ""), page)
+            # HTTP permits multiple Link header fields. HTTPMessage.get() only
+            # returns the first; an omitted later 'next' must not yield PASS.
+            headers = response.headers
+            if hasattr(headers, "get_all"):
+                links = headers.get_all("Link") or []
+            else:
+                value = headers.get("Link", "")
+                links = [value] if value else []
+            if not isinstance(links, (list, tuple)):
+                raise ValueError("malformed GitHub pagination headers")
+            further = has_next_page(", ".join(links), page)
             payload = json.load(response)
         if not isinstance(payload, list):
             raise ValueError("GitHub API did not return PR list")

@@ -13,8 +13,10 @@ The wrapper checks:
 - Canonical public GitHub REST open-PR metadata: number, open, draft, exact
   base and head repo/ref/SHA; malformed/unavailable API state yields UNVERIFIED.
 - Canonical GitHub `Link: rel="next"` pagination is followed even if the
-  preceding page contains fewer than 100 records. Foreign, cyclic, skipped,
-  malformed and duplicated Link relations fail closed. A missing Link header
+  preceding page contains fewer than 100 records. All separate HTTP Link
+  header fields are combined before validation; first-header-only parsing can
+  conceal later pages. Foreign, cyclic, skipped, malformed and duplicated
+  Link relations fail closed. A missing Link header
   on a dishonest truncated upstream response cannot be independently detected
   by this source-only check; its output remains evidence, not authority.
 - Every manifest PR must match. Newly opened PRs numbered within the snapshot's
