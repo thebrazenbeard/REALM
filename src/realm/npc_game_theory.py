@@ -174,12 +174,12 @@ def verify_economic_choice_in_transaction(
 ) -> ResourceChoice:
     """Recheck a read-only proposal against current state in the host's transaction.
 
-    The host MUST own a real ``BEGIN IMMEDIATE`` transaction and must independently
-    authenticate/authorize actor, site and ensuing action. SQLite does not expose
-    a reliable primitive here to prove the caller acquired an IMMEDIATE lock.
-    This operation makes no write, creates no single-use receipt and is not an
-    authorization or a durable gameplay effect. The host must commit the eventual
-    action in *this same transaction* for the recheck to prevent a TOCTOU race.
+    The host must independently authenticate/authorize actor, site and action.
+    A zero-row UPDATE on main.world_meta acquires SQLite's writer reservation
+    inside the caller-owned transaction (also upgrading a deferred BEGIN). It
+    fails closed if query_only, read-only, or another writer holds the reservation.
+    No world row is touched; no receipt or gameplay action is created. The host
+    must commit the eventual action in *this same transaction* to close TOCTOU.
     """
     if type(choice) is not ResourceChoice or choice.status != "HOST_REVIEW_REQUIRED":
         raise ValueError("Only an original host-review-required choice may be adjudicated")
@@ -191,6 +191,16 @@ def verify_economic_choice_in_transaction(
     main = next((row[2] for row in files if row[1] == "main"), None)
     if not main:
         raise ValueError("Adjudication requires a durable world database")
+    if db.execute("PRAGMA query_only").fetchone()[0]:
+        raise ValueError("Query-only transactions cannot adjudicate actions")
+    try:
+        # SQLite enters the write transaction before the zero-row scan. Unlike
+        # db.in_transaction, this actually reserves the single-writer lease.
+        probe = db.execute("UPDATE main.world_meta SET value=value WHERE 0")
+    except sqlite3.DatabaseError as exc:
+        raise ValueError("Cannot reserve the authoritative world writer lock") from exc
+    if probe.rowcount != 0:
+        raise ValueError("Unexpected world write during reservation")
     latest = db.execute("SELECT COALESCE(MAX(id),0) FROM main.events").fetchone()[0]
     if latest != choice.observed_through_event:
         raise ValueError("The proposed event watermark is stale")

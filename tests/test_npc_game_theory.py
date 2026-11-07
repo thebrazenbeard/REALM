@@ -256,6 +256,66 @@ class HostGameTheoryBridgeTests(unittest.TestCase):
                 )
             db.rollback()
 
+    def test_query_only_deferred_connection_cannot_validate_for_action(self):
+        from realm import npc_game_theory
+        choice = self.choose(seed=1)
+        with closing(sqlite3.connect(self.db)) as db:
+            db.row_factory = sqlite3.Row
+            db.execute("PRAGMA query_only=ON")
+            db.execute("BEGIN")
+            with self.assertRaises(ValueError):
+                npc_game_theory.verify_economic_choice_in_transaction(
+                    db, choice=choice, sites=SITES, seed=1,
+                )
+            db.rollback()
+
+    def test_deferred_transaction_must_hold_write_reservation_after_validation(self):
+        from realm import npc_game_theory
+        choice = self.choose(seed=1)
+        with closing(sqlite3.connect(self.db, timeout=0)) as db:
+            db.row_factory = sqlite3.Row
+            db.execute("BEGIN")
+            self.assertEqual(
+                npc_game_theory.verify_economic_choice_in_transaction(
+                    db, choice=choice, sites=SITES, seed=1,
+                ).status, "VERIFIED_FOR_HOST_ACTION"
+            )
+            with closing(sqlite3.connect(self.db, timeout=0)) as competitor:
+                with self.assertRaises(sqlite3.OperationalError):
+                    competitor.execute("BEGIN IMMEDIATE")
+            db.rollback()
+
+    def test_competing_writer_reservation_fails_closed(self):
+        from realm import npc_game_theory
+        choice = self.choose(seed=1)
+        with closing(sqlite3.connect(self.db, timeout=0)) as competitor:
+            competitor.execute("BEGIN IMMEDIATE")
+            with closing(sqlite3.connect(self.db, timeout=0)) as db:
+                db.row_factory = sqlite3.Row
+                db.execute("BEGIN")
+                with self.assertRaises(ValueError):
+                    npc_game_theory.verify_economic_choice_in_transaction(
+                        db, choice=choice, sites=SITES, seed=1,
+                    )
+                db.rollback()
+            competitor.rollback()
+
+    def test_write_reservation_probe_never_touches_world_rows_or_triggers(self):
+        from realm import npc_game_theory
+        choice = self.choose(seed=1)
+        with closing(sqlite3.connect(self.db)) as db:
+            db.row_factory = sqlite3.Row
+            db.execute("CREATE TEMP TRIGGER reject_meta_update AFTER UPDATE ON main.world_meta "
+                       "BEGIN SELECT RAISE(FAIL, 'meta row unexpectedly touched'); END")
+            db.execute("BEGIN")
+            before_changes = db.total_changes
+            verified = npc_game_theory.verify_economic_choice_in_transaction(
+                db, choice=choice, sites=SITES, seed=1,
+            )
+            self.assertEqual(verified.status, "VERIFIED_FOR_HOST_ACTION")
+            self.assertEqual(db.total_changes, before_changes)
+            db.rollback()
+
 
 if __name__ == "__main__":
     unittest.main()
