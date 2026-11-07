@@ -16,7 +16,8 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
 from .auth import CredentialStore
-from .engine import Engine, _SEED_EXITS, _SEED_ITEMS, _SEED_ROOMS, _pristine_schema, _schema_snapshot
+from .engine import (Engine, _EVENT_DELIVERY_SCHEMA_SQL, _SEED_EXITS,
+                     _SEED_ITEMS, _SEED_ROOMS, _pristine_schema, _schema_snapshot)
 from .geography import Geography, MapUnavailable
 from .router import CommandRouter
 
@@ -91,7 +92,7 @@ class Gateway:
         # The complete stored schema must match the one generated from the
         # same core DDL, not merely known names. This rejects added columns,
         # constraints, rewritten built-in indexes, triggers and views.
-        if _schema_snapshot(db) != _pristine_schema():
+        if _schema_snapshot(db) != _pristine_schema(_EVENT_DELIVERY_SCHEMA_SQL):
             return True
         # sqlite_sequence may keep evidence even after events were deleted.
         if db.execute("SELECT EXISTS(SELECT 1 FROM sqlite_sequence)").fetchone()[0]:
@@ -104,10 +105,14 @@ class Gateway:
         conn.execute("PRAGMA query_only=ON")
         return conn
 
-    def cursor(self) -> int:
+    def cursor(self, player: str) -> int:
+        """Return only this player's delivery position, not global event IDs."""
         db = self._read()
         try:
-            return int(db.execute("SELECT COALESCE(MAX(id),0) FROM events").fetchone()[0])
+            return int(db.execute(
+                "SELECT COALESCE(MAX(seq),0) FROM event_deliveries WHERE recipient=?",
+                (player,),
+            ).fetchone()[0])
         finally:
             db.close()
 
@@ -116,7 +121,12 @@ class Gateway:
             raise ValueError("Player must be a string")
         # The underlying join() validates syntax and preserves the current world.
         text = self.engine.join(player)
-        return {"ok": True, "text": text, "cursor": self.cursor()}
+        # Joining/reconnecting does not acknowledge receipt of prior events.
+        # Reading MAX(seq) after join races new writes and would silently skip
+        # any event written between join and this reply. Start at zero for a
+        # complete authorized personal backlog; a future authenticated client
+        # can opt into a bounded acknowledged replay cursor explicitly.
+        return {"ok": True, "text": text, "cursor": 0}
 
     def command(self, player: str, command: str, action_id: str | None) -> dict:
         if not isinstance(player, str) or not isinstance(command, str):
@@ -124,12 +134,15 @@ class Gateway:
         if len(command) > 512:
             raise ValueError("Command is too long")
         text = self.router.act(player, command, action_id=action_id)
-        return {"ok": True, "text": text, "cursor": self.cursor()}
+        # A command result is not an acknowledgment of the player's event
+        # feed. Exposing a post-action cursor here could skip concurrent
+        # deliveries if a client treated it as its replay starting point.
+        return {"ok": True, "text": text}
 
     def room(self, player: str) -> dict:
         if not isinstance(player, str):
             raise ValueError("Player must be a string")
-        return {"ok": True, "text": self.engine.act(player, "look"), "cursor": self.cursor()}
+        return {"ok": True, "text": self.engine.act(player, "look")}
 
     def map(self, player: str) -> dict:
         """Map for the joined character's persisted room, if one is authored.
@@ -155,16 +168,19 @@ class Gateway:
             raise ValueError("Invalid player or cursor")
         db = self._read()
         try:
-            subject = db.execute("SELECT id,room_id FROM players WHERE id=?", (player,)).fetchone()
+            subject = db.execute("SELECT id FROM players WHERE id=?", (player,)).fetchone()
             if subject is None:
                 raise ValueError("Join this REALM before reading the feed")
-            # Only events occurring in the player's CURRENT room are returned.
-            # Host-trusted player name: the HTTP handler authenticates the
-            # principal before reaching this method.
+            # Event-time grants are recorded atomically with each event.
+            # A later arrival, room re-entry, or legacy ungranted event cannot
+            # become visible merely because this player occupies the room now.
+            # seq is per-recipient; world-global event IDs are never exposed.
             records = db.execute(
-                "SELECT id,occurred_at,actor,room_id,kind,payload_json FROM events "
-                "WHERE room_id=? AND id>? ORDER BY id LIMIT ?",
-                (subject["room_id"], after, MAX_FEED_EVENTS),
+                "SELECT d.seq, e.occurred_at,e.actor,e.room_id,e.kind,e.payload_json "
+                "FROM event_deliveries d JOIN events e ON e.id=d.event_id "
+                "WHERE d.recipient=? AND d.revoked_at IS NULL AND d.seq>? "
+                "ORDER BY d.seq LIMIT ?",
+                (subject["id"], after, MAX_FEED_EVENTS),
             ).fetchall()
             events = []
             for row in records:
@@ -190,10 +206,14 @@ class Gateway:
                 else:
                     content = f"{row['actor']} acted."
                 events.append(
-                    {"id": row["id"], "kind": kind, "actor": row["actor"],
+                    {"id": row["seq"], "kind": kind, "actor": row["actor"],
                      "text": content, "room": row["room_id"], "at": row["occurred_at"]}
                 )
-            return {"ok": True, "events": events, "cursor": events[-1]["id"] if events else after}
+            # Never advance past an event not returned by this actual query.
+            # Reading MAX(seq) in a second statement races an event committed
+            # after the first read and can permanently skip that event.
+            return {"ok": True, "events": events,
+                    "cursor": events[-1]["id"] if events else after}
         finally:
             db.close()
 
