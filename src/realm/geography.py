@@ -423,35 +423,82 @@ class Geography:
         actor name. This guard is ownership matching, not authentication.
         """
         at = int(time.time()) if now is None else now
-        if type(at) is not int or at < 0:
-            raise ValueError("Time must be a nonnegative integer")
+        self._valid_epoch(at)
         with self._connect() as db:
             db.execute("BEGIN IMMEDIATE")
-            ship = db.execute("SELECT * FROM geo_ships WHERE id=?", (ship_id,)).fetchone()
-            if ship is None:
-                raise ValueError("Unknown ship")
-            if ship["owner"] != actor:
-                raise PermissionError("Actor is not the registered ship owner")
-            command = "depart:" + destination
-            receipt = self._receipt(db, ship_id, actor, action_id, command)
-            if receipt is not None:
-                return receipt
-            if ship["destination"] is not None:
-                raise ValueError("Ship is already in transit")
-            link = db.execute(
-                "SELECT seconds FROM geo_links WHERE origin=? AND destination=? AND mode='ship'",
-                (ship["planet_id"], destination),
-            ).fetchone()
-            if link is None:
-                raise ValueError("No direct ship route is declared")
-            arrival = at + link["seconds"]
-            db.execute("UPDATE geo_ships SET destination=?,arrival_at=? WHERE id=? AND destination IS NULL",
-                       (destination, arrival, ship_id))
-            payload = {"from": ship["planet_id"], "to": destination, "arrival_at": arrival}
-            db.execute("INSERT INTO geo_ship_events(occurred_at,ship_id,actor,kind,payload_json) VALUES(?,?,?,?,?)",
-                       (at, ship_id, actor, "depart", json.dumps(payload, sort_keys=True)))
-            response = {"ship": ship_id, "state": "in_transit", **payload}
-            self._store_receipt(db, ship_id, actor, action_id, command, response)
+            return self._depart_on_connection(db, ship_id, destination, actor, at, action_id)
+
+    @staticmethod
+    def _valid_epoch(at: int) -> None:
+        if type(at) is not int or not 0 <= at <= _MAX_SQLITE_EPOCH:
+            raise ValueError("Time must be a nonnegative integer fitting SQLite signed 64-bit")
+
+    def _depart_on_connection(self, db: sqlite3.Connection, ship_id: str,
+                              destination: str, actor: str, at: int,
+                              action_id: str | None) -> dict:
+        ship = db.execute("SELECT * FROM geo_ships WHERE id=?", (ship_id,)).fetchone()
+        if ship is None:
+            raise ValueError("Unknown ship")
+        if ship["owner"] != actor:
+            raise PermissionError("Actor is not the registered ship owner")
+        command = "depart:" + destination
+        receipt = self._receipt(db, ship_id, actor, action_id, command)
+        if receipt is not None:
+            return receipt
+        if ship["destination"] is not None:
+            raise ValueError("Ship is already in transit")
+        link = db.execute(
+            "SELECT seconds FROM geo_links WHERE origin=? AND destination=? AND mode='ship'",
+            (ship["planet_id"], destination),
+        ).fetchone()
+        if link is None:
+            raise ValueError("No direct ship route is declared")
+        arrival = at + link["seconds"]
+        self._valid_epoch(arrival)
+        db.execute("UPDATE geo_ships SET destination=?,arrival_at=? WHERE id=? AND destination IS NULL",
+                   (destination, arrival, ship_id))
+        payload = {"from": ship["planet_id"], "to": destination, "arrival_at": arrival}
+        db.execute("INSERT INTO geo_ship_events(occurred_at,ship_id,actor,kind,payload_json) VALUES(?,?,?,?,?)",
+                   (at, ship_id, actor, "depart", json.dumps(payload, sort_keys=True)))
+        response = {"ship": ship_id, "state": "in_transit", **payload}
+        self._store_receipt(db, ship_id, actor, action_id, command, response)
+        return response
+
+    def depart_in_transaction(self, db: sqlite3.Connection, ship_id: str,
+                              destination: str, *, actor: str, now: int,
+                              action_id: str) -> dict:
+        """Host-only departure in an already-open SAME-world SQLite transaction.
+
+        The caller owns the outer transaction and must authenticate actor.
+        SAVEPOINT guarantees exception atomicity when a caller catches errors.
+        """
+        if not isinstance(db, sqlite3.Connection):
+            raise TypeError("Expected an SQLite connection")
+        if not db.in_transaction:
+            raise RuntimeError("Existing SQLite transaction required")
+        main_file = next(
+            (row[2] for row in db.execute("PRAGMA database_list") if row[1] == "main"),
+            None,
+        )
+        if not main_file or Path(main_file).resolve() != self.db_path.resolve():
+            raise ValueError("Connection points to a different world database")
+        if db.row_factory is not sqlite3.Row:
+            raise ValueError("Connection must use sqlite3.Row row_factory")
+        if db.execute("PRAGMA foreign_keys").fetchone()[0] != 1:
+            raise RuntimeError("Shared departure requires enabled foreign keys")
+        self._valid_epoch(now)
+        if action_id is None:
+            raise ValueError("Shared departure requires stable action_id")
+        db.execute("SAVEPOINT realm_ship_departure")
+        try:
+            response = self._depart_on_connection(
+                db, ship_id, destination, actor, now, action_id)
+        except BaseException:
+            db.execute("ROLLBACK TO SAVEPOINT realm_ship_departure")
+            db.execute("RELEASE SAVEPOINT realm_ship_departure")
+            raise
+        else:
+            db.execute("RELEASE SAVEPOINT realm_ship_departure")
             return response
 
     def arrive(self, ship_id: str, *, now: int | None = None,
