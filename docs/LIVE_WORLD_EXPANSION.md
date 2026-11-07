@@ -16,6 +16,8 @@ changed, deployed, or canonized by this feature.
 - An internal _apply_synthetic_transaction test fixture starts BEGIN IMMEDIATE,
   revalidates the invariants, and atomically inserts new rooms/exits/items,
   a ledger receipt and an incremented revision in a disposable test database.
+  The fixture rejects a hosted-path claim and verifies PRAGMA database_list
+  identifies the same physical SQLite main file before any mutation.
   It is intentionally NOT a public/production authorization mechanism.
 - A future host release owner must independently bind exact proposal SHA,
   world ID, original worldpack hash, revision, source provenance, and Patrick's

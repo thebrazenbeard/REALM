@@ -197,6 +197,15 @@ class LiveWorldExpansionTests(unittest.TestCase):
         )
         with self.assertRaises(ExpansionHeld):
             _apply_synthetic_transaction(fake_host, self.proposal, owner_authorizer=lambda _: True)
+        # Forged declared path is under TEMP but the actual SQLite main differs.
+        spoof = SimpleNamespace(
+            db_path=Path(self.temp.name) / "fake.sqlite3",
+            _connect=self.engine._connect,
+        )
+        before = snapshot(self.db)
+        with self.assertRaises(ExpansionHeld):
+            _apply_synthetic_transaction(spoof, self.proposal, owner_authorizer=lambda _: True)
+        self.assertEqual(snapshot(self.db), before)
 
     def test_rejects_duplicate_and_source_claims_cannot_bypass_default_hold(self):
         extras = [

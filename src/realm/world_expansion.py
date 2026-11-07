@@ -254,6 +254,12 @@ def _apply_synthetic_transaction(
             or not db_path.is_relative_to(test_root)):
         raise ExpansionHeld("synthetic transaction fixture is forbidden on hosted worlds")
     with closing(engine._connect()) as conn:
+        main_paths = [
+            Path(row[2]).resolve() for row in conn.execute("PRAGMA database_list")
+            if row[1] == "main" and row[2]
+        ]
+        if main_paths != [db_path]:
+            raise ExpansionHeld("synthetic fixture target differs from SQLite main file")
         conn.execute("BEGIN IMMEDIATE")
         try:
             review = _review(conn, p, digest)
