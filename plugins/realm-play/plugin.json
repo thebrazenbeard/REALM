@@ -1,19 +1,19 @@
 {
   "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
   "name": "realm-play",
-  "version": "0.2.1",
-  "description": "Use one authenticated, world-bound REALM gameplay backend through a local stdio MCP host.",
+  "version": "0.2.2",
+  "description": "Desktop-only, source-only local REALM MCP integration for one host-bound player.",
   "author": {"name": "thebrazenbeard"},
   "repository": "https://github.com/thebrazenbeard/REALM",
   "extensions": {
     "com.openai": {
       "interface": {
         "displayName": "REALM Play",
-        "shortDescription": "Play local REALM worlds",
-        "longDescription": "Local-only REALM tools for an authenticated player to observe and act through the game's authoritative Gateway and Engine. Requires the matching REALM source, an existing world, a host-provisioned player token and a compatible local MCP host. Does not connect ChatGPT Web to a remote machine.",
+        "shortDescription": "Local REALM desktop preview",
+        "longDescription": "Source-only desktop plugin for an authenticated player's local REALM Gateway and Engine. The current MCP backend advertises nine tools; a two-tool read-only pilot requires a separate host-enforced allowlist before installation. Needs matching REALM source, an existing world, a host-owned player token and a compatible local Python MCP host. Does not connect ChatGPT Web or install a remote service.",
         "developerName": "thebrazenbeard",
         "capabilities": [],
-        "defaultPrompt": "Explore the host-configured REALM world with me. Confirm the player/world binding, observe before acting, and report only authoritative results."
+        "defaultPrompt": "If local REALM MCP tools are actually available and host-qualified, call realm_status and realm_look only to observe the bound player and world. Do not join, mutate, access history or map, or assume the plugin package grants host permission."
       }
     }
   }

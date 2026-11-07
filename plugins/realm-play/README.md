@@ -5,6 +5,53 @@ to this ChatGPT Web session, or qualified against a played world. It does not
 install a service, expose a network port, provision a credential, or create a
 world automatically.
 
+## Private ChatGPT Desktop catalogue (source proposal only)
+
+The repository now supplies `.agents/plugins/marketplace.json`, a **repo-local**
+development catalogue pointing at `plugins/realm-play`. The entry is
+`AVAILABLE`, not an installation or activation receipt. The package remains
+named `realm-play` and uses local `stdio` in `mcp.json`; it contains no
+Platform tunnel ID, API key, remote URL or ChatGPT Web connection.
+
+[Official plugin packaging guidance](https://developers.openai.com/plugins/build/plugins)
+documents repository-local marketplaces and ChatGPT Desktop/Codex local
+installation. A desktop operator can, **after completing the safety gates
+below**, refresh the repository marketplace, restart ChatGPT Desktop and use a
+new *local* session to test discovery. A local stdio plugin cannot run in
+ordinary ChatGPT Web or mobile conversations. The user account's exact local
+plugin eligibility, Windows Python interpreter, and `REALM_ROOT` binding have
+not been independently qualified; do not treat this documentation as an
+installation instruction for the current host.
+
+**Do not install or invoke the current unrestricted backend for a live
+read-only pilot.** Source inspection shows that the engine MCP server
+advertises nine tools, including `realm_join`, `realm_command`, movement and
+speech. The repo-local catalogue and the read-only default prompt are
+**presentation only**: they do not confine a malicious, confused or bypassing
+caller to two tools. First implement and test a host-enforced, fail-closed
+allowlist of exactly `realm_status` and `realm_look` in the engine-owner lane,
+and ensure any selected host cannot invoke the broad Executor indirectly.
+
+Before a bounded local pilot, verify all of these independently:
+
+1. Pin and inspect the exact engine and plugin Git heads, selected world,
+   authorized existing joined player, and host interpreter. Never write the
+   player token into plugin source or an issue/comment.
+2. Confirm the local MCP server advertises **only** the two authorized tools,
+   rejects a direct `tools/call` for every excluded tool, and preserves this
+   rejection if the client bypasses `tools/list`.
+3. Run the existing no-gameplay-mutation qualification, then perform actual
+   ChatGPT Desktop tool discovery and harmless status/look round trips in a
+   new *local* session, confirming identity and world binding.
+4. Keep the deployment $0: no Platform tunnel, new API key, account upgrade,
+   paid inference, public listener or external host service is necessary for
+   the proposed local stdio approach. If the local account lacks permission,
+   report the limit rather than silently switching to a paid path.
+
+**Source-only acceptance:** the catalogue resolves to the packaged plugin
+and parses correctly. Until the engine-enforced tool ACL and host readback
+exist, the operational result is `NOT INSTALLED / NOT PLAYABLE IN CHATGPT`.
+
 This package is the **Plugin Creator frontend** for REALM's one authoritative
 gameplay backend: `src/realm/mcp_server.py` from [engine-side Draft PR #52](https://github.com/thebrazenbeard/REALM/pull/52).
 Its `server/realm_mcp.py` is only a source-path launcher. It must not contain a
