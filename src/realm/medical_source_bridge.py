@@ -99,9 +99,29 @@ def _medical_sidecar_bound(path: str | Path, *, world_id: str,
                         "policy_hash": policy.policy_hash}
             if len(rows) != len(expected) or dict(rows) != expected:
                 raise ValueError("medical sidecar world/policy mismatch")
-            # The DDL signature alone cannot prove existing rows obey FKs:
-            # foreign_keys may have been OFF when older rows were written.
-            # This is a read-only review scan, NOT cross-file authority.
+            # Read-only full-table validation can be O(database size).
+            # Bound this review-only path to 64 MiB and fail closed if larger.
+            page_count = db.execute("PRAGMA main.page_count").fetchone()[0]
+            page_size = db.execute("PRAGMA main.page_size").fetchone()[0]
+            if page_count * page_size > 64 * 1024 * 1024:
+                raise ValueError("medical sidecar exceeds integrity review limit")
+            # Exact DDL does not attest old rows: SQLite may previously have
+            # accepted invalid CHECK values or orphan FKs with enforcement off.
+            if db.execute("PRAGMA main.integrity_check").fetchone() != ("ok",):
+                raise ValueError("medical sidecar integrity violation")
+            # Do not rely solely on PRAGMA integrity_check's CHECK coverage:
+            # a fresh read-only connection can miss prior rows inserted with
+            # ignore_check_constraints=ON in some SQLite runtime versions.
+            if db.execute(
+                "SELECT 1 FROM main.medical_supply "
+                "WHERE quantity < 0 OR typeof(quantity) != 'integer' LIMIT 1"
+            ).fetchone() is not None:
+                raise ValueError("medical sidecar supply integrity violation")
+            if db.execute(
+                "SELECT 1 FROM main.medical_injuries "
+                "WHERE version < 0 OR typeof(version) != 'integer' LIMIT 1"
+            ).fetchone() is not None:
+                raise ValueError("medical sidecar injury integrity violation")
             if db.execute("PRAGMA main.foreign_key_check").fetchone() is not None:
                 raise ValueError("medical sidecar referential integrity violation")
     except sqlite3.Error as exc:

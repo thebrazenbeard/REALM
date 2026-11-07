@@ -143,6 +143,48 @@ class MedicalSourceBridgeTests(unittest.TestCase):
                 self.inspect(db)
             db.rollback()
 
+    def test_preexisting_negative_supply_fails_integrity_review(self):
+        with closing(sqlite3.connect(self.medical)) as db, db:
+            db.execute("PRAGMA ignore_check_constraints=ON")
+            db.execute("INSERT INTO medical_supply(resource_id,quantity) "
+                       "VALUES('synthetic-corrupt',-9)")
+            db.execute("PRAGMA ignore_check_constraints=OFF")
+            self.assertEqual(db.execute("PRAGMA main.foreign_key_check").fetchall(), [])
+        with closing(sqlite3.connect(self.medical.resolve().as_uri() + "?mode=ro",
+                                     uri=True)) as check_db:
+            self.assertEqual(check_db.execute(
+                "SELECT quantity FROM medical_supply WHERE resource_id='synthetic-corrupt'").fetchone()[0], -9)
+            # Checking the persisted row is distinct from proving it is
+            # rejected by PRAGMA integrity_check on every SQLite runtime.
+        with closing(sqlite3.connect(self.world)) as db:
+            db.row_factory = sqlite3.Row
+            db.execute("PRAGMA foreign_keys=ON")
+            db.execute("BEGIN IMMEDIATE")
+            with self.assertRaisesRegex(ValueError, "integrity"):
+                self.inspect(db)
+            db.rollback()
+
+    def test_preexisting_negative_injury_version_fails_review(self):
+        with closing(sqlite3.connect(self.medical)) as db, db:
+            db.execute("PRAGMA ignore_check_constraints=ON")
+            db.execute(
+                "INSERT INTO medical_injuries("
+                "injury_id,world_id,character_id,mode,policy_id,policy_hash,"
+                "cause,severity,state,incident_utc,deadline_utc,last_utc,version)"
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                ("corrupt", "worldone", "patient", "hardcore",
+                 self.policy.policy_id, self.policy.policy_hash,
+                 "pressure", "critical", "CRITICAL", self.at.isoformat(),
+                 self.at.isoformat(), self.at.isoformat(), -4))
+            db.execute("PRAGMA ignore_check_constraints=OFF")
+        with closing(sqlite3.connect(self.world)) as db:
+            db.row_factory = sqlite3.Row
+            db.execute("PRAGMA foreign_keys=ON")
+            db.execute("BEGIN IMMEDIATE")
+            with self.assertRaisesRegex(ValueError, "integrity"):
+                self.inspect(db)
+            db.rollback()
+
     def test_wrong_medical_world_is_rejected_without_world_or_kit_effect(self):
         alien = Path(self.temp.name) / "alien.db"
         MedicalLedger(alien, world_id="another", policy=self.policy)
