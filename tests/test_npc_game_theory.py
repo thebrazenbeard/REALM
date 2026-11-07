@@ -386,6 +386,120 @@ class HostGameTheoryBridgeTests(unittest.TestCase):
             self.assertEqual(db.total_changes, before_changes)
             db.rollback()
 
+    def test_host_roster_allocation_uses_full_capacity_without_oversubscription(self):
+        from realm.npc_roster_allocation import propose_roster_allocation
+        actors = ("Ada", "Ben") + tuple(f"Bot{i}" for i in range(6))
+        for actor in actors[2:]:
+            self.engine.join(actor)
+        cutoff = self.watermark()
+        proposal = propose_roster_allocation(
+            self.db, expected_world_id="strategy_fixture",
+            actors=actors, sites=SITES, observed_through_event=cutoff, seed=23,
+        )
+        self.assertEqual(proposal.status, "HOST_REVIEW_REQUIRED")
+        self.assertEqual(proposal.total_expected_units, 15)
+        self.assertEqual(sum(a.expected_units for a in proposal.assignments), 15)
+        self.assertEqual(sum(a.site == SITES[0] for a in proposal.assignments), 2)
+        self.assertEqual(sum(a.site == SITES[1] for a in proposal.assignments), 3)
+        self.assertEqual(sum(a.site is None for a in proposal.assignments), 3)
+        self.assertEqual(self.watermark(), cutoff)
+        reordered = propose_roster_allocation(
+            self.db, expected_world_id="strategy_fixture",
+            actors=tuple(reversed(actors)), sites=tuple(reversed(SITES)),
+            observed_through_event=cutoff, seed=23,
+        )
+        self.assertEqual(proposal, reordered)
+
+    def test_host_site_utility_dominance_survives_capacity_allocation(self):
+        from realm.npc_roster_allocation import propose_roster_allocation
+        high_value = {SITES[0]: 10, SITES[1]: 1}
+        choice = propose_roster_allocation(
+            self.db, expected_world_id="strategy_fixture", actors=("Ada", "Ben"),
+            sites=SITES, observed_through_event=self.watermark(), seed=23,
+            site_values=high_value,
+        )
+        self.assertEqual([a.site for a in choice.assignments], [SITES[0], SITES[0]])
+        self.assertEqual(choice.total_expected_units, 6)
+        self.assertEqual(choice.total_expected_utility, 60)
+        with self.assertRaises(ValueError):
+            propose_roster_allocation(
+                self.db, expected_world_id="strategy_fixture",
+                actors=("Ada", "Ben"), sites=SITES,
+                observed_through_event=self.watermark(), seed=23,
+                site_values={SITES[0]: True, SITES[1]: 1},
+            )
+
+    def test_multi_actor_full_roster_is_capacity_bound_across_seeds(self):
+        from realm.npc_roster_allocation import propose_roster_allocation
+        actors = ("Ada", "Ben") + tuple(f"Bot{i}" for i in range(6))
+        for actor in actors[2:]:
+            self.engine.join(actor)
+        for n in (3, 5, 8):
+            for seed in range(12):
+                result = propose_roster_allocation(
+                    self.db, expected_world_id="strategy_fixture",
+                    actors=actors[:n], sites=SITES,
+                    observed_through_event=self.watermark(), seed=seed,
+                )
+                self.assertEqual(result.total_expected_units, min(n * 3, 15))
+                self.assertLessEqual(sum(a.site == SITES[0] for a in result.assignments), 2)
+                self.assertLessEqual(sum(a.site == SITES[1] for a in result.assignments), 3)
+                self.assertEqual(sum(a.site is None for a in result.assignments),
+                                 max(0, n - 5))
+
+    def test_host_actions_following_full_roster_proposal_create_real_idempotent_receipts(self):
+        from realm.npc_roster_allocation import propose_roster_allocation
+        actors = ("Ada", "Ben") + tuple(f"Bot{i}" for i in range(6))
+        for actor in actors[2:]:
+            self.engine.join(actor)
+        cutoff = self.watermark()
+        result = propose_roster_allocation(
+            self.db, expected_world_id="strategy_fixture",
+            actors=actors, sites=SITES, observed_through_event=cutoff, seed=23,
+        )
+        self.assertEqual(result.status, "HOST_REVIEW_REQUIRED")
+        for row in result.assignments:
+            if row.site is None:
+                self.assertEqual(row.expected_units, 0)
+                continue
+            if row.site.room_id == "corridor":
+                self.engine.act(row.actor, "north", action_id=f"host-{row.actor}-move")
+            action = f"gather {row.site.material}"
+            action_id = f"host-{row.actor}-gather"
+            response = self.crafting.perform(row.actor, action, action_id=action_id)
+            self.assertIn("x3", response)
+            self.assertEqual(self.crafting.perform(row.actor, action, action_id=action_id),
+                             response)
+            self.assertEqual(self.pouch(row.actor, row.site.material), 3)
+        with closing(sqlite3.connect(self.db)) as db:
+            gathered = db.execute("SELECT COUNT(*) FROM events WHERE kind='gather'").fetchone()[0]
+        self.assertEqual(gathered, 5)
+        self.assertNotEqual(self.watermark(), cutoff)
+        with self.assertRaises(ValueError):
+            propose_roster_allocation(self.db, expected_world_id="strategy_fixture",
+                    actors=actors, sites=SITES,
+                    observed_through_event=self.watermark(), seed=23)
+
+    def test_full_roster_rejects_unjoined_duplicate_world_swap_and_forged_values(self):
+        from realm.npc_roster_allocation import propose_roster_allocation
+        args = dict(expected_world_id="strategy_fixture", actors=("Ada", "Ben"),
+                    sites=SITES, observed_through_event=self.watermark(), seed=23)
+        for bad in (("Ada", "ada"), ("Ada", "Absent")):
+            with self.assertRaises(ValueError):
+                propose_roster_allocation(self.db, **(args | {"actors": bad}))
+        with self.assertRaises(ValueError):
+            propose_roster_allocation(self.db, **(args | {"expected_world_id": "fake"}))
+        for bad in ({SITES[0]: 10}, {SITES[0]: 10, SITES[1]: 0},
+                    {SITES[0]: 10, SITES[1]: 1.5}):
+            with self.assertRaises(ValueError):
+                propose_roster_allocation(self.db, **args, site_values=bad)
+        with self.assertRaises(ValueError):
+            propose_roster_allocation(self.db, **(args | {"observed_through_event": 10**50}))
+        with self.assertRaises(ValueError):
+            propose_roster_allocation(
+                self.db, **(args | {"sites": (ResourceSite(1, "stone"), SITES[1])})
+            )
+
 
 if __name__ == "__main__":
     unittest.main()
