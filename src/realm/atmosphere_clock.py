@@ -52,7 +52,11 @@ class AtmosphereUTCHandler:
         self._scheduled = tuple(e.event_id for e in due_events
                                 if e.kind == "atmosphere_tick")
         self._seen = []
-        self._expected = self._evidence(db) if self._scheduled else None
+        # Clock/state receipt DML and unrelated host callbacks can tamper with
+        # earlier atmosphere actions even when this batch has NO new atmosphere
+        # event (or no due event at all). An explicitly selected atmosphere
+        # handler therefore keeps custody throughout every host UTC batch.
+        self._expected = self._evidence(db)
 
     def __call__(self, db: sqlite3.Connection, event: DueEvent):
         if event.kind != "atmosphere_tick":
@@ -80,11 +84,10 @@ class AtmosphereUTCHandler:
         """WorldClock invokes this after all callbacks and receipts, before COMMIT."""
         if db is not self._db:
             raise RuntimeError("Atmosphere finalizer bound to wrong UTC transaction")
-        if self._scheduled:
-            if tuple(self._seen) != self._scheduled:
-                raise ValueError("Missing authorized atmosphere UTC effect")
-            if self._evidence(db) != self._expected:
-                raise ValueError("Atmosphere postcondition changed before UTC commit")
+        if self._scheduled and tuple(self._seen) != self._scheduled:
+            raise ValueError("Missing authorized atmosphere UTC effect")
+        if self._evidence(db) != self._expected:
+            raise ValueError("Atmosphere postcondition changed before UTC commit")
         self._db = None
         self._expected = None
         self._scheduled = ()
