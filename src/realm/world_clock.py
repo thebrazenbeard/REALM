@@ -324,6 +324,13 @@ class WorldClock:
             node_gathered = defaultdict(int)
             pouch_gathered = defaultdict(int)
             gather_events = {}
+            # Optional host-owned components may bind exact transaction-start
+            # evidence before any selected callback mutates this world.
+            prepare = getattr(handler, "begin_host_tick", None)
+            if prepare is not None:
+                if not callable(prepare):
+                    raise TypeError("Host tick preparation must be callable")
+                prepare(db, tuple(_event(row) for row in rows))
             for row in rows:
                 event = _event(row)
                 if event.kind == "npc_roster_gather":
@@ -479,4 +486,12 @@ class WorldClock:
                        and r["id"] not in gather_events
                        for r in final_event_rows):
                     raise ValueError("Roster gather history contains ungranted effects")
+            # This is the actual final read-only host effect boundary, AFTER
+            # every handler, clock acknowledgment, roster check and DB trigger.
+            # Existing ordinary handlers have no hook and retain their behavior.
+            finalizer = getattr(handler, "verify_final_precommit", None)
+            if finalizer is not None:
+                if not callable(finalizer):
+                    raise TypeError("Host tick finalizer must be callable")
+                finalizer(db, tuple(processed))
             return processed

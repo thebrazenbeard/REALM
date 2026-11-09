@@ -22,6 +22,29 @@ result = ledger.apply(
 )
 ```
 
+## Explicit host UTC integration (source-only)
+
+For a world where both ledgers are explicitly enabled, a host can schedule a
+bounded `WorldClock` event with kind `atmosphere_tick` and the exact payload
+`{"expected_version": 0}`, then invoke its existing host-owned UTC tick with
+`AtmosphereUTCHandler(ledger, world_id="synthetic_world", other_handler=host_handler)`.
+The clock event ID is the atmosphere action receipt ID (must satisfy the
+atmosphere ID length/grammar). This integration handles *environment ticks
+only*, not player-initiated hatch/breach controls. Other event kinds are
+explicitly delegated to the trusted host handler. There is no background
+worker, default event scheduling, gateway route or world migration.
+
+`WorldClock.tick` invokes the wrapper's transaction-start evidence capture
+and **final precommit check** on the *same* SQLite connection, after every
+selected callback and clock/roster receipt. The wrapper requires its exact
+atmosphere state, complete receipt map, and world authority metadata to remain
+consistent between authorized environment effects, and again after later
+callbacks. Hostile late audit triggers that remove a completed atmosphere
+receipt now abort the whole UTC batch; a clean retry may execute once. Ordinary
+new say/audit events remain allowed. A trusted host must opt in by supplying
+this wrapper; directly calling `AtmosphereLedger.apply_in_transaction` from
+an arbitrary handler still has no outer-transaction final custody guarantee.
+
 For an event callback already inside a host-owned `BEGIN IMMEDIATE` world
 transaction, call `ledger.apply_in_transaction(db, ...)` with that SAME DB
 connection. Do not call `.apply()` from inside a clock tick: it would try
