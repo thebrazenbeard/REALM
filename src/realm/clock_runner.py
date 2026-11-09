@@ -9,6 +9,7 @@ from __future__ import annotations
 import math
 import sqlite3
 import time
+from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -23,6 +24,55 @@ class UnknownEventKind(RuntimeError):
 
 _FINALIZER_CONNECTION: ContextVar[sqlite3.Connection | None] = ContextVar(
     "realm_trusted_finalizer_connection", default=None)
+_HANDLER_GUARD: ContextVar[tuple[sqlite3.Connection, list[bool]] | None] = ContextVar(
+    "realm_trusted_handler_transaction_guard", default=None)
+
+
+@contextmanager
+def _guard_trusted_handler_transaction(db: sqlite3.Connection):
+    """Reject transaction escape by registered host callbacks before effects commit.
+
+    WorldClock owns the outer BEGIN/COMMIT/ROLLBACK. Selected handlers may use
+    their own nested SAVEPOINTs, but may not end the clock transaction. SQLite
+    executes the transaction authorizer *before* COMMIT/ROLLBACK, including the
+    sqlite3.Connection convenience methods and executescript's implicit COMMIT.
+
+    This protects a misconfigured trusted callback, not arbitrary hostile
+    Python with authority to replace the connection authorizer or perform IO.
+    """
+    if not db.in_transaction:
+        raise RuntimeError("Trusted host handler requires active world transaction")
+    current = _HANDLER_GUARD.get()
+    nested = current is not None and current[0] is db
+    denied = current[1] if nested else [False]
+    token = None
+
+    def block_transaction(action, arg1, arg2, database, source):
+        if action == sqlite3.SQLITE_TRANSACTION:
+            denied[0] = True
+            return sqlite3.SQLITE_DENY
+        return sqlite3.SQLITE_OK
+
+    try:
+        if not nested:
+            db.set_authorizer(block_transaction)
+            token = _HANDLER_GUARD.set((db, denied))
+        try:
+            yield
+        except BaseException as exc:
+            if denied[0]:
+                raise RuntimeError(
+                    "Trusted host handler attempted forbidden transaction control"
+                ) from exc
+            raise
+        if denied[0]:
+            raise RuntimeError("Trusted host handler attempted forbidden transaction control")
+        if not db.in_transaction:
+            raise RuntimeError("Trusted host handler lost the clock-owned transaction")
+    finally:
+        if token is not None:
+            _HANDLER_GUARD.reset(token)
+            db.set_authorizer(None)
 
 
 class _TrustedRegistryDispatcher:
@@ -54,13 +104,15 @@ class _TrustedRegistryDispatcher:
 
     def begin_host_tick(self, db, due_events: tuple[DueEvent, ...]) -> None:
         for begin, _ in self._custodians:
-            begin(db, due_events)
+            with _guard_trusted_handler_transaction(db):
+                begin(db, due_events)
 
     def __call__(self, db, event: DueEvent) -> object:
         handler = self._registry.get(event.kind)
         if handler is None:
             raise UnknownEventKind(f"Unregistered event kind {event.kind!r}")
-        return handler(db, event)
+        with _guard_trusted_handler_transaction(db):
+            return handler(db, event)
 
     @staticmethod
     def _sqlite_persistent_state(db) -> tuple:
