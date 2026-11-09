@@ -357,16 +357,30 @@ class Gateway:
             raise ValueError("Invalid player or cursor")
         db = self._read()
         try:
+            # One read transaction binds the player's current room, latest
+            # provable arrival, and event rows to the same SQLite snapshot.
+            # Otherwise a move between separate SELECTs could disclose
+            # history from a room the player was never authorized to see.
+            db.execute("BEGIN")
             subject = db.execute("SELECT id,room_id FROM players WHERE id=?", (player,)).fetchone()
             if subject is None:
                 raise ValueError("Join this REALM before reading the feed")
-            # Only events occurring in the player's CURRENT room are returned.
-            # Host-trusted player name: the HTTP handler authenticates the
-            # principal before reaching this method.
+            # Current-room membership alone does not grant retroactive access
+            # to its prior conversation. A join/move event is the evidence of
+            # the latest arrival; after leaving and returning, old history is
+            # again outside the authorized audience interval. No such event
+            # means fail closed, including on corrupted/legacy history.
+            entry = db.execute(
+                "SELECT MAX(id) FROM events WHERE actor=? COLLATE NOCASE "
+                "AND room_id=? AND kind IN ('join','move')",
+                (subject["id"], subject["room_id"]),
+            ).fetchone()[0]
+            if entry is None:
+                raise ValueError("No provable current-room arrival; feed denied")
             records = db.execute(
                 "SELECT id,occurred_at,actor,room_id,kind,payload_json FROM events "
-                "WHERE room_id=? AND id>? ORDER BY id LIMIT ?",
-                (subject["room_id"], after, MAX_FEED_EVENTS),
+                "WHERE room_id=? AND id>? AND id>=? ORDER BY id LIMIT ?",
+                (subject["room_id"], after, entry, MAX_FEED_EVENTS),
             ).fetchall()
             events = []
             for row in records:
