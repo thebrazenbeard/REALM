@@ -11,6 +11,7 @@ import json
 import re
 import sqlite3
 from datetime import datetime, timezone
+import threading
 from contextlib import closing
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -27,6 +28,10 @@ from .scoped_credentials import CredentialStateError, ScopedCredentialStore
 MAX_BODY_BYTES = 4096
 MAX_FEED_EVENTS = 100
 _WORLD_ID = re.compile(r"^[A-Za-z][A-Za-z0-9_-]{0,63}$")
+_GEOGRAPHY_SCHEMA_OBJECTS = frozenset({
+    "geo_places", "geo_maps", "geo_links", "geo_ships",
+    "geo_ship_events", "geo_ship_receipts", "idx_geo_parent",
+})
 
 
 class ShipAccessDenied(PermissionError):
@@ -51,8 +56,16 @@ class Gateway:
             raise ValueError("world_id must start with a letter and contain 1–64 letters, digits, '_' or '-'")
         self.engine = Engine(db_path)
         self._bind_world_id(world_id, adopt_unbound_world=adopt_unbound_world)
-        self.geography = Geography(db_path)
-        self.router = CommandRouter(self.engine)
+        # Geography is an optional world-authoring/map subsystem. Do not
+        # install its ship tables in an ordinary fantasy/medieval Gateway (or
+        # invalidate a still-pristine database before worldpack import).
+        self._geography: Geography | None = None
+        self._geography_lock = threading.Lock()
+        # CommandRouter constructs the optional Crafting schema. Ordinary
+        # Gateway startup and credential provisioning must not silently opt
+        # a pristine world into crafting before worldpack selection either.
+        self._router: CommandRouter | None = None
+        self._router_lock = threading.Lock()
         self.credentials = CredentialStore(self.engine)
         self.scoped_credentials = (
             ScopedCredentialStore(self.engine, world_id, guard_path=scoped_guard_path)
@@ -180,6 +193,28 @@ class Gateway:
             ]
         return {"ok": True, "world_id": self.world_id, "ship_id": ship_id,
                 "events": events, "cursor": events[-1]["id"] if events else after}
+    @property
+    def router(self) -> CommandRouter:
+        """Install optional crafting dispatch on first command use."""
+        if self._router is None:
+            with self._router_lock:
+                if self._router is None:
+                    self._router = CommandRouter(self.engine)
+        return self._router
+
+    @property
+    def geography(self) -> Geography:
+        """Initialize optional geography on first explicit host/map use.
+
+        A ThreadingHTTPServer may serve simultaneous first map reads. Keep
+        the schema install single-owner per Gateway without changing the
+        public gateway.geography API or creating any default ship content.
+        """
+        if self._geography is None:
+            with self._geography_lock:
+                if self._geography is None:
+                    self._geography = Geography(self.engine.db_path)
+        return self._geography
 
     def _bind_world_id(self, world_id: str, *, adopt_unbound_world: bool) -> None:
         """Persist the host's world identity before any gateway can serve it.
@@ -280,6 +315,19 @@ class Gateway:
             if row is None:
                 raise ValueError("Join this REALM before reading the map")
             room_id = row["room_id"]
+            # GET is a read boundary. An ordinary medieval world must not
+            # install the optional geo_* ship schema just because a player
+            # asked for an unconfigured map. Require an already complete
+            # explicitly installed geography schema before accessing the
+            # lazily cached host geography object.
+            existing = {
+                schema["name"] for schema in db.execute(
+                    "SELECT name FROM main.sqlite_master "
+                    "WHERE type IN ('table','index')"
+                )
+            }
+            if not _GEOGRAPHY_SCHEMA_OBJECTS.issubset(existing):
+                raise MapUnavailable("No map is configured for this location")
         finally:
             db.close()
         return {"ok": True, **self.geography.snapshot_for_room(room_id)}
