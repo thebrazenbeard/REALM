@@ -30,7 +30,11 @@ class GatherWorldStateCustodyTests(unittest.TestCase):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         self.path = Path(tmp.name) / "world.sqlite3"
-        Gateway(self.path, world_id="synthetic")
+        # This custody suite deliberately exercises geo_places/geo_links.
+        # Geography is optional in setting-neutral worlds, so opt in here
+        # rather than relying on Gateway construction to install ship schema.
+        gateway = Gateway(self.path, world_id="synthetic")
+        gateway.geography
         self.engine = Engine(self.path)
         self.engine.join("Ada")
         self.engine.join("Ben")

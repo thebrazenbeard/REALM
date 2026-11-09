@@ -143,6 +143,30 @@ and whole-file database rollback are outside this tick's authorization boundary.
 Owner history is a persisted observation surface, not a cryptographic
 attestation or assurance that arbitrary raw event payloads are secret-free.
 
+The scoped, authenticated `POST /api/v1/ship/depart` writer also checks **its
+own transaction's** complete ship-state/event/receipt delta before commit,
+including exact one-time replay, registered owner, route, and scheduled UTC
+arrival. A same-writer privileged trigger that forges an extra departure,
+changes another ship's history or removes a receipt rejects and rolls back the
+entire POST; unrelated permitted room `say` events still proceed. This is not
+global tamper-proofing: an explicitly caller-owned transaction may continue
+to write after `depart_in_transaction` returns, standalone host Geography
+methods and out-of-band privileged SQL do not use this guard, and a later
+whole-file rollback still lacks an external witness.
+
+The scoped departure writer separately snapshots **world/credential/clock
+authority** before authorization: all `world_meta` rows, scheduler queue and
+UTC watermark, roster attestations, player identity/credential tables, and
+scoped credential guard/capability rows. The only permitted queue change is
+the departure's exact new pending `ship_arrival` (or no change on replay).
+Privileged installed triggers cannot silently rebind `world_id`, grant another
+player a capability, revoke a credential, rewrite an earlier clock receipt or
+add an ungranted second deadline while returning successful HTTP departure;
+these mutations reject and roll back the request. The separate room event
+ledger still allows unrelated `say` records. This is an authenticated ship
+writer postcondition, not a universal attestation of every gameplay table or
+of privileged external database activity after commit.
+
 Each event is `{id,kind,actor,text,room,at}`. Movement creates a `leave` event
 in the source room and a `move` (arrival) event in the destination in one
 transaction. The feed is **polling**, not
