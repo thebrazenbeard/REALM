@@ -1,4 +1,4 @@
-"""Host-only, ship-scoped appointments cannot confer global character rank."""
+"""Ship appointments expose trusted rank separately from freeform display names."""
 
 import sys
 import tempfile
@@ -25,35 +25,41 @@ class ShipAppointmentTests(unittest.TestCase):
         profiles.set("Nova_Crew", "Nova Crew")
         profiles.set("Alia_Vale", "Alia Vale")
         self.roles = ShipAppointmentStore(self.engine)
+    def assert_identity(self, actor, ship, display, role, title):
+        identity = self.roles.identity(actor, trusted_ship_id=ship)
+        self.assertIsNotNone(identity)
+        self.assertEqual((display, role, title),
+                         (identity.display_name, identity.role, identity.title))
+        return identity
 
-    def test_role_requires_exact_trusted_ship_context(self):
+    def test_rank_only_from_exact_trusted_ship_context(self):
         self.roles.grant("Nova_Crew", "trader_7", "captain")
         self.assertEqual("captain", self.roles.role("Nova_Crew", "trader_7"))
-        self.assertEqual("Capt. Nova Crew", self.roles.label("Nova_Crew", trusted_ship_id="trader_7"))
-        self.assertEqual("Nova Crew", self.roles.label("Nova_Crew"))
-        self.assertEqual("Nova Crew", self.roles.label("Nova_Crew", trusted_ship_id="other_1"))
-        self.assertEqual("Nova_Crew", CredentialStore(self.engine).authenticate(
-            CredentialStore(self.engine).provision("Nova_Crew")
-        ))
+        view = self.assert_identity("Nova_Crew", "trader_7", "Nova Crew", "captain", "Capt.")
+        self.assertEqual("Nova_Crew", view.player_id)
+        self.assert_identity("Nova_Crew", None, "Nova Crew", None, None)
+        self.assert_identity("Nova_Crew", "other_1", "Nova Crew", None, None)
+        token = CredentialStore(self.engine).provision("Nova_Crew")
+        self.assertEqual("Nova_Crew", CredentialStore(self.engine).authenticate(token))
 
     def test_multiple_ships_and_scoped_first_officer(self):
         self.roles.grant("Nova_Crew", "trader_7", "captain")
         self.roles.grant("Nova_Crew", "freighter_9", "first_officer")
         self.roles.grant("Alia_Vale", "trader_7", "first_officer")
-        self.assertEqual("Capt. Nova Crew", self.roles.label("Nova_Crew", trusted_ship_id="trader_7"))
-        self.assertEqual("First Officer Nova Crew", self.roles.label("Nova_Crew", trusted_ship_id="freighter_9"))
-        self.assertEqual("First Officer Alia Vale", self.roles.label("Alia_Vale", trusted_ship_id="trader_7"))
-        self.assertIsNone(self.roles.role("Alia_Vale", "freighter_9"))
+        self.assert_identity("Nova_Crew", "trader_7", "Nova Crew", "captain", "Capt.")
+        self.assert_identity("Nova_Crew", "freighter_9", "Nova Crew", "first_officer", "First Officer")
+        self.assert_identity("Alia_Vale", "trader_7", "Alia Vale", "first_officer", "First Officer")
+        self.assert_identity("Alia_Vale", "freighter_9", "Alia Vale", None, None)
 
-    def test_unique_active_position_requires_explicit_revocation(self):
+    def test_unique_active_position_needs_explicit_revocation(self):
         self.roles.grant("Nova_Crew", "trader_7", "captain")
         with self.assertRaises(ValueError):
             self.roles.grant("Alia_Vale", "trader_7", "captain")
         self.assertEqual("captain", self.roles.role("Nova_Crew", "trader_7"))
         self.assertTrue(self.roles.revoke("Nova_Crew", "trader_7"))
         self.roles.grant("Alia_Vale", "trader_7", "captain")
-        self.assertEqual("Capt. Alia Vale", self.roles.label("Alia_Vale", trusted_ship_id="trader_7"))
-        self.assertEqual("Nova Crew", self.roles.label("Nova_Crew", trusted_ship_id="trader_7"))
+        self.assert_identity("Alia_Vale", "trader_7", "Alia Vale", "captain", "Capt.")
+        self.assert_identity("Nova_Crew", "trader_7", "Nova Crew", None, None)
 
     def test_existing_role_cannot_silently_change(self):
         self.roles.grant("Nova_Crew", "trader_7", "captain")
@@ -66,17 +72,16 @@ class ShipAppointmentTests(unittest.TestCase):
         other = Engine(Path(self.tmp.name) / "other.sqlite3")
         other.join("Nova_Crew")
         other_roles = ShipAppointmentStore(other)
-        self.assertIsNone(other_roles.role("Nova_Crew", "trader_7"))
-        self.assertEqual("Nova_Crew", other_roles.label("Nova_Crew", trusted_ship_id="trader_7"))
-
+        identity = other_roles.identity("Nova_Crew", trusted_ship_id="trader_7")
+        self.assertEqual(("Nova_Crew", None, None),
+                         (identity.display_name, identity.role, identity.title))
     def test_revocation_persists_across_engine_restart(self):
         self.roles.grant("Nova_Crew", "trader_7", "captain")
-        self.assertEqual("captain", ShipAppointmentStore(Engine(self.db_path)).role("nova_crew", "TRADER_7"))
+        restarted = ShipAppointmentStore(Engine(self.db_path))
+        self.assertEqual("captain", restarted.role("nova_crew", "TRADER_7"))
         self.assertTrue(self.roles.revoke("Nova_Crew", "TRADER_7"))
         self.assertFalse(self.roles.revoke("Nova_Crew", "trader_7"))
-        restarted = ShipAppointmentStore(Engine(self.db_path))
-        self.assertIsNone(restarted.role("Nova_Crew", "trader_7"))
-        self.assertEqual("Nova Crew", restarted.label("Nova_Crew", trusted_ship_id="trader_7"))
+        self.assert_identity("Nova_Crew", "trader_7", "Nova Crew", None, None)
         self.roles.grant("Nova_Crew", "trader_7", "captain")
         self.assertEqual("captain", restarted.role("Nova_Crew", "trader_7"))
 
@@ -94,48 +99,48 @@ class ShipAppointmentTests(unittest.TestCase):
         self.assertIsNone(self.roles.role("Nova_Crew", "trader_7"))
         self.assertEqual("Unknown command. Type 'help' for options.",
                          self.engine.act("Nova_Crew", "appoint trader_7 captain"))
-        self.assertIsNone(self.roles.label("Ghost"))
-        self.assertFalse(hasattr(self.roles, "provision"))
-
-    def test_host_controlled_display_text_cannot_create_role(self):
-        PlayerProfileStore(self.engine).set("Rin_Wolf", "Capt. Rin Wolf")
-        self.assertIsNone(self.roles.role("Rin_Wolf", "trader_7"))
-        self.assertEqual("Rin Wolf", self.roles.label("Rin_Wolf"))
-        self.roles.grant("Rin_Wolf", "trader_7", "first_officer")
-        self.assertEqual("First Officer Rin Wolf",
-                         self.roles.label("Rin_Wolf", trusted_ship_id="trader_7"))
-    def test_leading_quoted_and_confusable_rank_spoofs_are_neutralized(self):
+        self.assertIsNone(self.roles.identity("Ghost"))
+        self.assertFalse(hasattr(self.roles, "label"))
+    def test_rank_looking_display_never_becomes_authority(self):
         profiles = PlayerProfileStore(self.engine)
-        spoofed = (
+        rank_looking = (
+            "Capt. Rin Wolf",
             "“Capt. Rin Wolf”",
             "“First Officer Rin Wolf”",
-            "’Capt. Rin Wolf’",
-            "- Capt. Rin Wolf",
-            ". First Officer Rin Wolf",
+            "“Captain” Rin Wolf",
+            "“Capt” Rin Wolf",
+            "“First Officer” Rin Wolf",
+            "“First-Officer” Rin Wolf",
             "Ｃａｐｔ. Rin Wolf",
-            "Сapt. Rin Wolf",  # Cyrillic Es visually resembles Latin C.
-            "Cᴀᴘᴛ. Rin Wolf",
-            "Fiгst Officer Rin Wolf",  # Cyrillic Ghe in the title.
-            "“Capt. First Officer Rin Wolf”",
+            "Сapt. Rin Wolf",
+            "Ƈapt. Rin Wolf",
+            "ᑕapt. Rin Wolf",
         )
-        for label in spoofed:
+        for label in rank_looking:
             with self.subTest(label=label):
                 profiles.set("Rin_Wolf", label)
-                self.assertIsNone(self.roles.role("Rin_Wolf", "trader_7"))
-                self.assertEqual("Rin Wolf", self.roles.label("Rin_Wolf"))
+                view = self.assert_identity("Rin_Wolf", "trader_7", label, None, None)
+                self.assertEqual("Rin_Wolf", view.player_id)
         self.roles.grant("Rin_Wolf", "trader_7", "first_officer")
-        for label in spoofed:
-            with self.subTest(active_label=label):
+        for label in rank_looking:
+            with self.subTest(granted_label=label):
                 profiles.set("Rin_Wolf", label)
-                self.assertEqual("First Officer Rin Wolf",
-                                 self.roles.label("Rin_Wolf", trusted_ship_id="trader_7"))
-
-    def test_normal_quoted_names_and_non_rank_words_preserved(self):
+                self.assert_identity("Rin_Wolf", "trader_7", label, "first_officer", "First Officer")
+                self.assert_identity("Rin_Wolf", None, label, None, None)
+    def test_normal_names_are_preserved_without_rank(self):
         profiles = PlayerProfileStore(self.engine)
         for label in ("“Rin Wolf”", "Captaincy Rin", "First Officerly Rin"):
             with self.subTest(label=label):
                 profiles.set("Rin_Wolf", label)
-                self.assertEqual(label, self.roles.label("Rin_Wolf"))
+                self.assert_identity("Rin_Wolf", None, label, None, None)
+
+    def test_structured_role_does_not_depend_on_name_spelling(self):
+        profiles = PlayerProfileStore(self.engine)
+        profiles.set("Rin_Wolf", "Rin Wolf")
+        self.roles.grant("Rin_Wolf", "trader_7", "captain")
+        self.assert_identity("Rin_Wolf", "trader_7", "Rin Wolf", "captain", "Capt.")
+        profiles.set("Rin_Wolf", "“First-Officer” Rin Wolf")
+        self.assert_identity("Rin_Wolf", "trader_7", "“First-Officer” Rin Wolf", "captain", "Capt.")
 
 
 if __name__ == "__main__":

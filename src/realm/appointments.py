@@ -1,16 +1,17 @@
-"""Host-curated per-ship appointments and effective visible title labels.
+"""Host-curated per-ship appointments and structured identity presentation.
 
-This is a source-only role projection, not ship ownership proof, an endpoint,
-or an authority to choose current ship context. The runtime must supply a
-trusted ship ID from its verified ship ledger before rendering a title.
+Freeform profile names are never authoritative rank evidence. Only the
+appointment table supplies role/title, and a future UI must render that trusted
+role as a separate badge using verified ship context. This source is not an
+endpoint or proof of ship ownership.
 """
 
 from __future__ import annotations
 
 import re
 import sqlite3
-import unicodedata
 from contextlib import closing
+from dataclasses import dataclass
 from datetime import datetime, timezone
 
 from .engine import Engine, _PLAYER_RE
@@ -19,17 +20,6 @@ from .profiles import PlayerProfileStore
 
 _SHIP_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_-]{0,47}$")
 _ROLE_TITLE = {"captain": "Capt.", "first_officer": "First Officer"}
-_RESERVED_PREFIX = re.compile(
-    r"^(?:(?:capt(?:ain)?\.?|first[ -]+officer)(?: +|$)|capt(?:ain)?\.)"
-)
-# Common Unicode title lookalikes; this is *not* a complete confusables database.
-_TITLE_LOOKALIKES = str.maketrans(
-    {"с": "c", "ϲ": "c", "а": "a", "ɑ": "a", "р": "p", "т": "t",
-     "і": "i", "ι": "i", "о": "o", "ο": "o", "е": "e", "ε": "e",
-     "ѕ": "s", "ғ": "f", "һ": "h", "н": "h", "г": "r",
-     "ᴀ": "a", "ᴄ": "c", "ᴘ": "p", "ᴛ": "t", "ɪ": "i",
-     "ᴏ": "o", "ᴇ": "e", "ꜰ": "f", "ꜱ": "s", "ʜ": "h", "ʀ": "r", "ɴ": "n"}
-)
 _APPOINTMENT_SQL = """
 CREATE TABLE IF NOT EXISTS ship_appointments (
     ship_id TEXT NOT NULL COLLATE NOCASE,
@@ -56,29 +46,18 @@ def _ship(ship_id: str) -> str:
     return ship_id.lower()
 
 
-def _rank_prefix_end(value: str) -> int | None:
-    """Match title-shaped text through quotes, compatibility forms and lookalikes."""
-    offset = 0
-    while offset < len(value) and (
-        unicodedata.category(value[offset]).startswith("P") or value[offset].isspace()
-    ):
-        offset += 1
-    folded, ends = [], []
-    for index, char in enumerate(value[offset:], start=offset):
-        # Keep offsets into original text even if NFKD expands one character.
-        for unit in unicodedata.normalize("NFKD", char).casefold():
-            if not unicodedata.combining(unit):
-                folded.append(unit.translate(_TITLE_LOOKALIKES))
-                ends.append(index + 1)
-    matched = _RESERVED_PREFIX.match("".join(folded))
-    return ends[matched.end() - 1] if matched else None
+@dataclass(frozen=True, slots=True)
+class CharacterIdentity:
+    """Presentation data: display_name is untrusted for rank semantics.
 
+    The role and title are separately read from active appointments, never
+    parsed, cleaned, or inferred from display_name.
+    """
 
-def _clean_role_prefix(display_name: str, player_name: str) -> str:
-    """Render title-like profile prefixes inert; rank must come from appointment."""
-    while (end := _rank_prefix_end(display_name)) is not None:
-        display_name = display_name[end:].strip().strip("'’“”")
-    return display_name or player_name
+    player_id: str
+    display_name: str
+    role: str | None
+    title: str | None
 
 
 class ShipAppointmentStore:
@@ -89,6 +68,7 @@ class ShipAppointmentStore:
         self.profiles = PlayerProfileStore(engine)
         with closing(engine._connect()) as db, db:
             db.executescript(_APPOINTMENT_SQL)
+
     def grant(self, player_name: str, ship_id: str, role: str) -> str:
         """Grant a joined player one role on one ship; never a public route."""
         actor, ship = _actor(player_name), _ship(ship_id)
@@ -139,6 +119,7 @@ class ShipAppointmentStore:
                 (datetime.now(timezone.utc).isoformat(timespec="seconds"), ship, actor),
             )
             return changed.rowcount == 1
+
     def role(self, player_name: str, ship_id: str) -> str | None:
         """Return an active role scoped strictly to the supplied ship."""
         actor, ship = _actor(player_name), _ship(ship_id)
@@ -150,14 +131,35 @@ class ShipAppointmentStore:
             ).fetchone()
         return str(row["role"]) if row else None
 
-    def label(self, player_name: str, *, trusted_ship_id: str | None = None) -> str | None:
-        """Render one visible label only when a trusted ship context is supplied."""
+    def identity(
+        self, player_name: str, *, trusted_ship_id: str | None = None
+    ) -> CharacterIdentity | None:
+        """Return distinct principal, *freeform* name, and trusted scoped rank.
+
+        Callers must never infer titles from display_name, including strings
+        styled as 'Captain' or Unicode lookalikes. Only role/title are rank
+        authority. A client-supplied ship ID is NOT trusted context.
+        """
         actor = _actor(player_name)
-        display_name = self.profiles.get(actor)
-        if display_name is None:
-            return None
-        base = _clean_role_prefix(display_name, actor)
-        if trusted_ship_id is None:
-            return base
-        role = self.role(actor, trusted_ship_id)
-        return f"{_ROLE_TITLE[role]} {base}" if role else base
+        ship = _ship(trusted_ship_id) if trusted_ship_id is not None else None
+        with closing(self.engine._connect()) as db:
+            db.execute("BEGIN")
+            player = db.execute(
+                "SELECT p.id, COALESCE(r.display_name,p.id) AS display_name "
+                "FROM players AS p LEFT JOIN player_profiles AS r ON r.player_name=p.id "
+                "WHERE p.id=?", (actor,),
+            ).fetchone()
+            if player is None:
+                return None
+            rank = db.execute(
+                "SELECT role FROM ship_appointments "
+                "WHERE player_name=? AND ship_id=? AND revoked_at IS NULL",
+                (player["id"], ship),
+            ).fetchone() if ship is not None else None
+        role = str(rank["role"]) if rank else None
+        return CharacterIdentity(
+            player_id=str(player["id"]),
+            display_name=str(player["display_name"]),
+            role=role,
+            title=_ROLE_TITLE[role] if role else None,
+        )
