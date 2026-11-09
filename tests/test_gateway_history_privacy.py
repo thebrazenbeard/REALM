@@ -7,6 +7,7 @@ plain GatewayServer must enforce the same boundary for cursor=0 clients.
 from __future__ import annotations
 
 import json
+import sqlite3
 import sys
 import tempfile
 import threading
@@ -104,6 +105,112 @@ class DefaultFeedHistoryPrivacyTests(unittest.TestCase):
         other = Gateway(Path(self.temp.name) / "second.sqlite3", world_id="second")
         other.join("Bob")
         self.assertFalse(any("First world secret" in e["text"] for e in other.feed("Bob", 0)["events"]))
+
+    def test_missing_latest_return_arrival_must_not_resurrect_old_room_access(self) -> None:
+        self.join("Alice")
+        self.join("Bob")
+        self.act("Bob", "north", "bob-away")
+        self.act("Alice", "say Private during Bob absence", "private-absence")
+        self.act("Bob", "south", "bob-back")
+        # A trusted local database edit destroys the newest return-arrival
+        # evidence but leaves Bob's current room and earlier join intact.
+        # It must not make the old join a valid floor for retroactive speech.
+        with sqlite3.connect(self.gateway.engine.db_path) as db:
+            deleted = db.execute(
+                "DELETE FROM events WHERE actor='Bob' AND kind='move' AND room_id='atrium'"
+            ).rowcount
+        self.assertEqual(1, deleted)
+        status, response = self.http("Bob", "/api/v1/feed?after=0")
+        self.assertEqual(400, status)
+        self.assertNotIn("Private during Bob absence", json.dumps(response))
+
+    def test_revocation_during_default_feed_does_not_deliver_later_speech(self) -> None:
+        self.join("Alice")
+        self.join("Bob")
+        started, release = threading.Event(), threading.Event()
+        self.addCleanup(release.set)
+        original = self.gateway.feed
+
+        def held_feed(*args, **kwargs):
+            started.set()
+            if not release.wait(5):
+                raise RuntimeError("Synthetic gateway feed pause timed out")
+            return original(*args, **kwargs)
+
+        self.gateway.feed = held_feed
+        response = {}
+
+        def read_as_bob():
+            response["result"] = self.http("Bob", "/api/v1/feed?after=0")
+
+        client = threading.Thread(target=read_as_bob, daemon=True)
+        client.start()
+        self.assertTrue(started.wait(3), "Request did not pass initial bearer gate")
+        self.assertTrue(self.gateway.credentials.revoke("Bob"))
+        self.act("Alice", "say Speech written after Bob was revoked", "later-private")
+        release.set()
+        client.join(timeout=5)
+        self.assertFalse(client.is_alive())
+        self.assertEqual(401, response["result"][0])
+        self.assertNotIn("Speech written after Bob was revoked", json.dumps(response["result"][1]))
+
+    def test_scoped_bearer_rotation_during_read_denies_old_token(self) -> None:
+        scoped = Gateway(
+            Path(self.temp.name) / "scoped.sqlite3", world_id="scoped",
+            scoped_credentials=True,
+            scoped_guard_path=Path(self.temp.name) / "scoped-witness.json",
+        )
+        alice = scoped.scoped_credentials.provision("Alice")
+        bob = scoped.scoped_credentials.provision("Bob")
+        scoped.join_remote("Alice", alice)
+        scoped.join_remote("Bob", bob)
+        server = GatewayServer(scoped, (), port=0)
+        worker = threading.Thread(
+            target=server.serve_forever,
+            kwargs={"poll_interval": 0.02}, daemon=True,
+        )
+        worker.start()
+        self.addCleanup(lambda: (
+            server.shutdown(), server.server_close(), worker.join(timeout=2)
+        ))
+        started, release = threading.Event(), threading.Event()
+        self.addCleanup(release.set)
+        original = scoped.feed
+
+        def held_feed(*args, **kwargs):
+            started.set()
+            if not release.wait(5):
+                raise RuntimeError("Synthetic scoped feed pause timed out")
+            return original(*args, **kwargs)
+
+        scoped.feed = held_feed
+        response = {}
+
+        def old_token_read():
+            req = request.Request(
+                f"http://127.0.0.1:{server.server_port}/api/v1/feed?after=0",
+                headers={"Authorization": "Bearer " + bob},
+            )
+            try:
+                with request.urlopen(req, timeout=6) as result:
+                    response["status"] = result.status
+                    response["body"] = json.loads(result.read())
+            except error.HTTPError as exc:
+                with exc:
+                    response["status"] = exc.code
+                    response["body"] = json.loads(exc.read())
+
+        client = threading.Thread(target=old_token_read, daemon=True)
+        client.start()
+        self.assertTrue(started.wait(3), "Scoped request did not pass first authorization")
+        rotated = scoped.scoped_credentials.rotate(bob)
+        self.assertIsNotNone(scoped.scoped_credentials.authenticate(rotated))
+        scoped.command_remote("Alice", "say After scoped token rotation", "scoped-later", alice)
+        release.set()
+        client.join(timeout=6)
+        self.assertFalse(client.is_alive())
+        self.assertEqual(401, response.get("status"))
+        self.assertNotIn("After scoped token rotation", json.dumps(response.get("body")))
 
 
 if __name__ == "__main__":
