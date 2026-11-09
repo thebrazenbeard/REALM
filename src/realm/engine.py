@@ -251,14 +251,43 @@ class Engine:
                 if receipt is not None:
                     if receipt["command"] != command:
                         raise ValueError("Action ID already used for a different command")
-                    return receipt["response"]
+                    # Room history is a read whose authorization boundary
+                    # changes on every arrival. A cached old transcript is
+                    # not an idempotent mutation receipt: re-evaluate the
+                    # current room's entry floor even on a retried action ID.
+                    if verb not in {"history", "listen"}:
+                        return receipt["response"]
             response = self._perform(db, actor, room_id, verb, arg)
             if action_id is not None:
-                db.execute(
-                    "INSERT INTO action_receipts (actor,action_id,command,response) VALUES (?,?,?,?)",
-                    (actor, action_id, command, response),
-                )
+                if receipt is not None:
+                    db.execute(
+                        "UPDATE action_receipts SET response=? WHERE actor=? AND action_id=?",
+                        (response, actor, action_id),
+                    )
+                else:
+                    db.execute(
+                        "INSERT INTO action_receipts (actor,action_id,command,response) VALUES (?,?,?,?)",
+                        (actor, action_id, command, response),
+                    )
             return response
+
+    @staticmethod
+    def _room_entry_floor(db: sqlite3.Connection, actor: str, room_id: str) -> int:
+        """Prove current-room arrival, including any newer departures.
+
+        Do not fall back to an older arrival when a newer return move has been
+        removed or the event ledger contradicts persisted player location.
+        This is one snapshot inside the command's BEGIN IMMEDIATE transaction.
+        """
+        entry = db.execute(
+            "SELECT id,room_id,kind FROM events WHERE actor=? COLLATE NOCASE "
+            "AND kind IN ('join','leave','move') ORDER BY id DESC LIMIT 1",
+            (actor,),
+        ).fetchone()
+        if (entry is None or entry["kind"] not in {"join", "move"} or
+                entry["room_id"] != room_id):
+            raise ValueError("No provable current-room arrival; history denied")
+        return entry["id"]
 
     def _perform(self, db: sqlite3.Connection, actor: str, room_id: str, verb: str,
                  arg: str, *, emissions: list[tuple[int, str]] | None = None) -> str:
@@ -329,9 +358,11 @@ class Engine:
                 if arg and (not arg.isdigit() or not 1 <= int(arg) <= 50):
                     return "Use 'history' or 'history N' (1–50)."
                 limit = int(arg) if arg else 10
+                entry_id = self._room_entry_floor(db, actor, room_id)
                 events = db.execute(
-                    "SELECT actor,kind,payload_json FROM events WHERE room_id=? ORDER BY id DESC LIMIT ?",
-                    (room_id, limit),
+                    "SELECT actor,kind,payload_json FROM events "
+                    "WHERE room_id=? AND id>=? ORDER BY id DESC LIMIT ?",
+                    (room_id, entry_id, limit),
                 ).fetchall()
                 items = []
                 for event in reversed(events):
