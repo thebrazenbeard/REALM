@@ -1,0 +1,139 @@
+"""Opt-in, bounded foreground composition for REALM's two local transports.
+
+No listeners, clock ticks, actor handlers, or credentials are created at import.
+An authorized host supplies already-bound loopback servers, an enabled clock,
+and an explicit trusted kind-to-handler registry for one SQLite world.
+"""
+from __future__ import annotations
+
+import math
+import threading
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Callable, Mapping
+
+from .clock_runner import PumpReport, run_foreground
+from .gateway import GatewayServer
+from .telnet import LocalTelnetServer
+from .world_clock import WorldClock
+
+
+def _utc_now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def run_local_host(
+    http: GatewayServer,
+    telnet: LocalTelnetServer,
+    clock: WorldClock,
+    handlers: Mapping[str, Callable],
+    *,
+    pulses: int,
+    interval_seconds: float = 1.0,
+    batch_limit: int = 100,
+    now: Callable[[], datetime] = _utc_now,
+    monotonic: Callable[[], float] = time.monotonic,
+    stop_event: threading.Event | None = None,
+    acknowledge_forward_jump: bool = False,
+) -> PumpReport:
+    """Serve HTTP+Telnet and pump host UTC until bounded pulses or a stop signal.
+
+    This function blocks in its calling thread; it is not a daemon, persistent
+    service, installer, public network listener, or NPC policy implementation.
+    Each transport has a short-lived, explicitly joined request-loop thread.
+    HTTP/Telnet must already be bound to loopback and the clock's one world DB.
+
+    Handler exceptions propagate after both listeners have shut down. The
+    underlying SQLite clock transaction protects event effects and receipts;
+    the caller may retry with fresh servers against the same pending event.
+    """
+    if not isinstance(http, GatewayServer) or not isinstance(telnet, LocalTelnetServer):
+        raise TypeError("Bound REALM HTTP and Telnet server instances are required")
+    if not isinstance(clock, WorldClock):
+        raise TypeError("A bound WorldClock instance is required")
+    if (http.server_address[0] != "127.0.0.1"
+            or telnet.server_address[0] != "127.0.0.1"):
+        raise ValueError("Both local listeners must bind 127.0.0.1")
+    paths = (
+        Path(http.gateway.engine.db_path).resolve(),
+        Path(telnet.engine.db_path).resolve(),
+        Path(clock.db_path).resolve(),
+    )
+    if paths[0] != paths[1] or paths[0] != paths[2]:
+        raise ValueError("HTTP, Telnet and clock must share the same world database")
+    if type(pulses) is not int or not 1 <= pulses <= 1000:
+        raise ValueError("pulses must be an integer in 1..1000")
+    if (type(interval_seconds) not in (int, float)
+            or not math.isfinite(interval_seconds)
+            or not 0.01 <= interval_seconds <= 3600):
+        raise ValueError("interval_seconds must be finite in 0.01..3600")
+    if type(batch_limit) is not int or not 1 <= batch_limit <= 1000:
+        raise ValueError("batch_limit must be an integer in 1..1000")
+    if pulses * batch_limit > 100_000:
+        raise ValueError("One foreground run may process at most 100000 events")
+    if not isinstance(handlers, Mapping) or not handlers or any(
+            not isinstance(kind, str) or not kind or not callable(handler)
+            for kind, handler in handlers.items()):
+        raise ValueError("A nonempty trusted event-kind handler registry is required")
+    if (not callable(now) or not callable(monotonic)
+            or type(acknowledge_forward_jump) is not bool):
+        raise ValueError("Host UTC, pacing and forward-jump controls must be valid")
+    if stop_event is not None and not isinstance(stop_event, type(threading.Event())):
+        raise TypeError("stop_event must be a threading.Event")
+
+    stopping = threading.Event()
+    failures: list[BaseException] = []
+
+    def interrupted() -> bool:
+        if stop_event is not None and stop_event.is_set():
+            stopping.set()
+        return stopping.is_set()
+
+    def interruptible_wait(seconds: float) -> None:
+        # Wake on a caller stop rather than waiting out a potentially long
+        # bounded cadence. The internal signal also wakes on listener failure.
+        deadline = time.monotonic() + seconds
+        while not interrupted():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            stopping.wait(min(remaining, 0.05))
+
+    def serve_requests(server: GatewayServer | LocalTelnetServer) -> None:
+        # Unlike serve_forever/shutdown, a bounded handle_request loop cannot
+        # race shutdown against a serve_forever thread that has not entered yet.
+        server.timeout = 0.05
+        try:
+            while not interrupted():
+                server.handle_request()
+        except BaseException as exc:
+            failures.append(exc)
+            stopping.set()
+
+    threads: list[threading.Thread] = []
+    try:
+        if interrupted():
+            return PumpReport(0, (), "stopped")
+        for label, server in (("http", http), ("telnet", telnet)):
+            thread = threading.Thread(target=serve_requests, args=(server,),
+                                      name=f"REALM-local-{label}")
+            thread.start()
+            threads.append(thread)
+        result = run_foreground(
+            clock, handlers, pulses=pulses, interval_seconds=interval_seconds,
+            batch_limit=batch_limit, now=now, monotonic=monotonic,
+            sleep=interruptible_wait, stop=interrupted,
+            acknowledge_forward_jump=acknowledge_forward_jump,
+        )
+        if failures:
+            raise RuntimeError("Local listener stopped unexpectedly") from failures[0]
+        return result
+    finally:
+        stopping.set()
+        for thread in threads:
+            thread.join(timeout=2)
+        for server in (http, telnet):
+            server.server_close()
+        if any(thread.is_alive() for thread in threads):
+            raise RuntimeError("Local listener did not stop within two seconds")
