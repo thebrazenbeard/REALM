@@ -114,6 +114,7 @@ def preview_jsonl_chunks(payload: bytes | str) -> dict:
 
     sources: dict[tuple[str, str], dict] = {}
     by_name: dict[tuple[str, str], dict] = {}
+    first_supplied_name: dict[tuple[str, str], str] = {}
     evidence_owners: dict[tuple[str, str, str, int], tuple[str, tuple[str, str]]] = {}
     seen_records: set[str] = set()
     candidates = []
@@ -180,7 +181,8 @@ def preview_jsonl_chunks(payload: bytes | str) -> dict:
         if type(category) is not str or category not in _CATEGORIES:
             raise CandidateError("Unsupported candidate category")
         category = CATEGORIES.get(category, category)
-        name = unicodedata.normalize("NFC", _safe_text(candidate["name"], 100)).strip()
+        supplied_name = _safe_text(candidate["name"], 100)
+        name = unicodedata.normalize("NFC", supplied_name).strip()
         if not name:
             raise CandidateError("Empty candidate name")
         if candidate["status"] != "PROPOSED":
@@ -197,10 +199,11 @@ def preview_jsonl_chunks(payload: bytes | str) -> dict:
                 "evidence": [],
             }
             by_name[name_key] = item
+            first_supplied_name[name_key] = supplied_name
             candidates.append(item)
-        elif item["name"] != name:
+        elif first_supplied_name[name_key] != supplied_name:
             add_conflict("NAME_ALIAS_COLLISION_REVIEW", category=category,
-                         names=[item["name"], name])
+                         names=[first_supplied_name[name_key], supplied_name])
 
         evidence = _fields(record["evidence"], {
             "unit", "ordinal", "text", "text_sha256", "source_status",
@@ -249,6 +252,34 @@ def preview_jsonl_chunks(payload: bytes | str) -> dict:
             add_conflict(kind, source_id=source_id, revision=revision,
                          candidate_id=item["id"], detail=detail,
                          status="SUPPLIED_UNRESOLVED")
+
+    # A reported revision parent is merely a claim, not authenticated lineage.
+    # Still, any cycle *within this supplied batch* is an observable internal
+    # contradiction and must remain explicit in the review artifact. A parent
+    # outside the batch is unresolved, not proof of a broken or valid chain.
+    reported_cycles: set[frozenset[tuple[str, str]]] = set()
+    for initial_key in sources:
+        path: list[tuple[str, str]] = []
+        positions: dict[tuple[str, str], int] = {}
+        current = initial_key
+        while current in sources:
+            if current in positions:
+                cycle = path[positions[current]:]
+                identity = frozenset(cycle)
+                if identity not in reported_cycles:
+                    reported_cycles.add(identity)
+                    add_conflict(
+                        "REVISION_LINEAGE_CYCLE_REVIEW", source_id=current[0],
+                        revisions=[revision for _, revision in cycle] + [cycle[0][1]],
+                        status="SUPPLIED_UNRESOLVED",
+                    )
+                break
+            positions[current] = len(path)
+            path.append(current)
+            parent = sources[current]["reported_parent_revision"]
+            if parent is None:
+                break
+            current = (current[0], parent)
 
     return {
         "schema": SCHEMA,
