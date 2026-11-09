@@ -103,6 +103,133 @@ def _say_evidence(db: sqlite3.Connection) -> dict[str, object]:
     }
 
 
+def _transfer_evidence(db: sqlite3.Connection) -> dict[str, object]:
+    """Complete main-world snapshot for a typed go/take/drop effect."""
+    schema = tuple(tuple(row) for row in db.execute(
+        "SELECT type,name,tbl_name,sql FROM main.sqlite_schema "
+        "WHERE name NOT LIKE 'sqlite_%' ORDER BY type,name"
+    ))
+    tables = {}
+    for kind, name, _owner, _sql in schema:
+        if kind != "table" or name in (
+            "events", "action_receipts", "players", "items"
+        ):
+            continue
+        quoted_name = '"' + name.replace('"', '""') + '"'
+        tables[name] = Counter(tuple(row) for row in db.execute(
+            "SELECT * FROM main." + quoted_name))
+    return {
+        "schema": schema,
+        "tables": tables,
+        "players": _economy_rows(db, "players", ("id",)),
+        "items": _economy_rows(db, "items", ("id",)),
+        "events": _economy_rows(db, "events", ("id",)),
+        "receipts": _economy_rows(db, "action_receipts", ("actor", "action_id")),
+        "allocators": _allocator_rows(db),
+    }
+
+
+def _planned_transfer(db: sqlite3.Connection, before: dict, engine: Engine,
+                      actor: str, room: str, verb: str, arg: str) -> tuple:
+    """Plan one bound grant from pre-action state, not trigger-tainted rows.
+
+    Item lookup mirrors Engine's SQLite query, including ambiguous names.
+    """
+    players, items = dict(before["players"]), dict(before["items"])
+    events = []
+    if verb == "go":
+        direction = _DIRECTIONS.get(arg.casefold(), arg.casefold())
+        dest = db.execute(
+            "SELECT destination FROM main.exits WHERE room_id=? AND direction=?",
+            (room, direction),
+        ).fetchone()
+        if dest is None:
+            return f"No exit leads {direction or 'that way'}.", players, items, events
+        destination = dest[0]
+        player = players[(actor,)]
+        players[(actor,)] = (player[0], destination, player[2])
+        events = [
+            (actor, room, "leave", {"to": destination, "direction": direction}),
+            (actor, destination, "move", {"from": room, "direction": direction}),
+        ]
+        return engine._look(db, destination, actor), players, items, events
+    if not arg:
+        return ("Take what?" if verb == "take" else "Drop what?"), players, items, events
+    if verb == "take":
+        item = db.execute(
+            "SELECT id,name FROM main.items WHERE room_id=? AND "
+            "(id=? COLLATE NOCASE OR name=? COLLATE NOCASE)",
+            (room, arg, arg),
+        ).fetchone()
+        if item is None:
+            return "That item is not here.", players, items, events
+        original = items[(item["id"],)]
+        items[(item["id"],)] = (original[0], original[1], original[2], None, actor)
+        events = [(actor, room, "take", {"item": item["id"]})]
+        return f"You take {item['name']}.", players, items, events
+    item = db.execute(
+        "SELECT id,name FROM main.items WHERE held_by=? AND "
+        "(id=? COLLATE NOCASE OR name=? COLLATE NOCASE)",
+        (actor, arg, arg),
+    ).fetchone()
+    if item is None:
+        return "You are not carrying that item.", players, items, events
+    original = items[(item["id"],)]
+    items[(item["id"],)] = (original[0], original[1], original[2], room, None)
+    events = [(actor, room, "drop", {"item": item["id"]})]
+    return f"You drop {item['name']}.", players, items, events
+
+
+def _verify_transfer_effect(db: sqlite3.Connection, before: dict, domain: dict,
+                            *, plan: tuple, actor: str, action_id: str,
+                            command: str, response: str) -> None:
+    """Attest typed row/event/receipt/allocator effects before UTC ACK.
+
+    Other selected trusted handlers may emit unrelated events between calls;
+    installed triggers cannot add events within this individual grant.
+    """
+    after = _transfer_evidence(db)
+    expected_response, expected_players, expected_items, expected_events = plan
+    if response != expected_response:
+        raise ValueError("Host action response diverged from bound gameplay effect")
+    for stage in (domain, after):
+        if stage["schema"] != before["schema"] or stage["tables"] != before["tables"]:
+            raise ValueError("Host action changed ungranted world state")
+        if stage["players"] != expected_players or stage["items"] != expected_items:
+            raise ValueError("Host action changed ungranted player/item state")
+    if (domain["receipts"] != before["receipts"]
+            or after["events"] != domain["events"]
+            or any(domain["events"].get(key) != row
+                   for key, row in before["events"].items())):
+        raise ValueError("Host action gameplay event history diverged")
+    expected_receipts = dict(before["receipts"])
+    receipt_key = (actor, action_id)
+    if receipt_key in expected_receipts:
+        raise ValueError("Host action receipt unexpectedly preexists")
+    expected_receipts[receipt_key] = (actor, action_id, command, response)
+    if after["receipts"] != expected_receipts:
+        raise ValueError("Host action receipt effects diverged")
+    added = [row for key, row in domain["events"].items()
+             if key not in before["events"]]
+    added.sort(key=lambda row: row[0])
+    if len(added) != len(expected_events):
+        raise ValueError("Host action emitted ungranted gameplay events")
+    allocator = before["allocators"].get("events", 0)
+    for offset, (row, (source_actor, room, kind, payload)) in enumerate(
+        zip(added, expected_events), 1
+    ):
+        if (row[0] != allocator + offset
+                or row[2:6] != (source_actor, room, kind,
+                                   json.dumps(payload, sort_keys=True))):
+            raise ValueError("Host action history is not bound to its typed grant")
+    expected_allocators = dict(before["allocators"])
+    if added:
+        expected_allocators["events"] = allocator + len(added)
+    if (domain["allocators"] != expected_allocators
+            or after["allocators"] != expected_allocators):
+        raise ValueError("Host action changed ungranted event allocation")
+
+
 def _expected_gather(nodes: dict, room: str, arg: str):
     """Use Crafting's validated command grammar and pre-action stock/yield."""
     material, _, maybe_batches = arg.rpartition(" ")
@@ -365,6 +492,11 @@ def perform_in_transaction(
         else:
             gather_before = _gather_evidence(db) if verb == "gather" else None
             say_before = _say_evidence(db) if verb == "say" else None
+            transfer_before = (_transfer_evidence(db)
+                               if verb in ("go", "take", "drop") else None)
+            transfer_plan = (_planned_transfer(db, transfer_before, engine,
+                                               actual_actor, room, verb, arg)
+                             if transfer_before is not None else None)
             if verb in _ENGINE_ACTIONS:
                 response = engine._perform(db, actual_actor, room, verb, arg)
             elif verb == "gather":
@@ -373,6 +505,8 @@ def perform_in_transaction(
                 response = crafting._make(db, actual_actor, room, verb, arg)
             gather_domain = _gather_evidence(db) if gather_before is not None else None
             say_domain = _say_evidence(db) if say_before is not None else None
+            transfer_domain = (_transfer_evidence(db)
+                               if transfer_before is not None else None)
             say_emitted_id = (db.execute("SELECT last_insert_rowid()").fetchone()[0]
                               if say_before is not None else 0)
             db.execute(
@@ -389,6 +523,11 @@ def perform_in_transaction(
                                    actor=actual_actor, room=room, arg=arg,
                                    action_id=action_id, command=command,
                                    response=response, emitted_id=say_emitted_id)
+            if transfer_before is not None:
+                _verify_transfer_effect(db, transfer_before, transfer_domain,
+                                        plan=transfer_plan, actor=actual_actor,
+                                        action_id=action_id, command=command,
+                                        response=response)
     except BaseException:
         db.execute("ROLLBACK TO SAVEPOINT realm_clock_gameplay")
         db.execute("RELEASE SAVEPOINT realm_clock_gameplay")
