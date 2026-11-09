@@ -3,9 +3,9 @@
 Run from the repository root: python examples/synthetic_multiprocess_play.py
 All networking remains on loopback. No installed service or private world is used.
 
-The current player API exposes room events, not geo_ship_events. Therefore the
-clients witness NPC gathering while the host verifies the UTC ship arrival in
-SQLite; this fixture must not be called a client-visible ship-arrival feed.
+The room feed exposes NPC gatherings, not geo_ship_events. The existing scoped
+ship owner may separately read the ship's durable history; an ungranted
+Navigator remains denied. This is not an all-crew ship-arrival feed.
 """
 from __future__ import annotations
 
@@ -316,8 +316,16 @@ def run_demo() -> dict:
                 raise AssertionError("NPC and ship clock receipts lack committed UTC")
             if receipts != {"npc": 1, "ship_arrival": 1}:
                 raise AssertionError(f"Unexpected durable receipts: {receipts}")
-            # No authorized ship-event read route exists yet: both clients can
-            # read NPC room events, but cannot claim to witness geo_ship_events.
+            # The authenticated owner can now observe the same authoritative
+            # depart/arrive ledger through HTTP, from its distinct OS process.
+            timeline = _expect(captain, "/api/v1/ship/events?ship_id=test_ship&after=0")
+            kinds = [event["kind"] for event in timeline["events"]]
+            if kinds != ["depart", "arrive"]:
+                raise AssertionError(f"Owner did not observe durable ship history: {kinds}")
+            denied_status, _ = navigator.request("/api/v1/ship/events?ship_id=test_ship")
+            if denied_status != 401:
+                raise AssertionError("Navigator acquired an ungranted ship timeline")
+            # The owner-only timeline must not silently widen the room feed.
             for client in clients:
                 after = _expect(client, f"/api/v1/feed/wait?after={witnessed['Captain']}&wait_ms=0")
                 if any("ship" in e["kind"] for e in after["events"]):
@@ -329,9 +337,11 @@ def run_demo() -> dict:
                 "shared_npc_event_id": witnessed["Captain"],
                 "ship_departed_by_captain": original["ok"],
                 "ship_arrived_host_utc": ship["planet"],
+                "owner_ship_timeline_kinds": kinds,
                 "committed_utc_clock_receipts": len(clock_receipts),
                 "native_ship_feed_visible": False,
-                "scope_checks": {"wrong_player": 403, "navigator_ship_depart": 401},
+                "scope_checks": {"wrong_player": 403, "navigator_ship_depart": 401,
+                                 "navigator_ship_history": denied_status},
                 "ship_events": ship_events, "receipts": receipts,
             }
         finally:
