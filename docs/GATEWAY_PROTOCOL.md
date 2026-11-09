@@ -107,6 +107,42 @@ an authoring API, not an automatic galaxy generator or public worldpack
 loader. Ship departure/arrival state is persisted and advanced by explicit
 host ticks; no always-running simulation is implied.
 
+### Opt-in scoped ship-owner history (source-only)
+
+An explicitly scoped gateway can also serve:
+
+`GET /api/v1/ship/events?ship_id=vesta&after=0`
+
+This read-only route requires an **active scoped** bearer already carrying the
+existing `ship:depart` capability, a joined principal, and exact persisted
+`geo_ships.owner` equality for that ship in the gateway's bound world. It does
+not issue credentials, grant ship access to crew, use a legacy unscoped bearer,
+or expose a fleet list. Unknown and other-owned ships are both HTTP 403; missing,
+expired or revoked scoped pilot credentials are HTTP 401. Invalid, repeated,
+foreign-world-selector or future-cursor query parameters are HTTP 400.
+
+The bounded response has `{ok,world_id,ship_id,events,cursor}`; each event is
+`{id,at,ship_id,actor,kind,payload}` sourced from persistent `geo_ship_events`,
+ordered by increasing database ID, at most 100 per page. `at` is a UTC epoch
+second from the ship ledger. Repeating an earlier cursor may redeliver events;
+clients deduplicate by `(world_id,ship_id,id)` and persist the last consumed ID.
+This is **owner-only history**, not the room feed, an authorized crew timeline,
+live ship telemetry, or a perpetual world ticker. Ship arrival still needs an
+explicit host UTC tick. The provisional loopback transport remains unsuitable
+for public network exposure.
+
+`WorldClock.tick` additionally compares the complete persisted ship, ship-event
+and receipt ledgers before and after its trusted UTC callbacks, including idle
+and unrelated audit-only ticks. Only exact scheduled, in-transaction ship
+arrivals and bound host ship departures may add ledger effects; SQLite trigger
+injections that add, delete, or rewrite other ship history abort that tick.
+This is **clock-transaction custody**, not a proof that all rows returned by
+the GET were originally legitimate: independent gateway departure transactions,
+direct host `Geography` writes, out-of-band privileged SQLite modifications,
+and whole-file database rollback are outside this tick's authorization boundary.
+Owner history is a persisted observation surface, not a cryptographic
+attestation or assurance that arbitrary raw event payloads are secret-free.
+
 Each event is `{id,kind,actor,text,room,at}`. Movement creates a `leave` event
 in the source room and a `move` (arrival) event in the destination in one
 transaction. The feed is **polling**, not
