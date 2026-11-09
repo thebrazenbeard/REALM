@@ -81,6 +81,28 @@ def _gather_evidence(db: sqlite3.Connection) -> dict[str, dict]:
     }
 
 
+def _say_evidence(db: sqlite3.Connection) -> dict[str, object]:
+    """Complete source-world snapshot without requiring optional Crafting tables."""
+    schema = tuple(tuple(row) for row in db.execute(
+        "SELECT type,name,tbl_name,sql FROM main.sqlite_schema "
+        "WHERE name NOT LIKE 'sqlite_%' ORDER BY type,name"
+    ))
+    tables = {}
+    for kind, name, _owner, _sql in schema:
+        if kind != "table" or name in ("events", "action_receipts"):
+            continue
+        quoted_name = '"' + name.replace('"', '""') + '"'
+        tables[name] = Counter(tuple(row) for row in db.execute(
+            "SELECT * FROM main." + quoted_name))
+    return {
+        "schema": schema,
+        "tables": tables,
+        "events": _economy_rows(db, "events", ("id",)),
+        "receipts": _economy_rows(db, "action_receipts", ("actor", "action_id")),
+        "allocators": _allocator_rows(db),
+    }
+
+
 def _expected_gather(nodes: dict, room: str, arg: str):
     """Use Crafting's validated command grammar and pre-action stock/yield."""
     material, _, maybe_batches = arg.rpartition(" ")
@@ -192,6 +214,64 @@ def _verify_gather_effect(db: sqlite3.Connection, before: dict[str, dict],
             raise ValueError("Gather economic/receipt effect diverged")
 
 
+def _verify_say_effect(db: sqlite3.Connection, before: dict[str, dict],
+                       domain: dict[str, dict], *, actor: str, room: str,
+                       arg: str, action_id: str, command: str, response: str,
+                       emitted_id: int) -> None:
+    """A typed host `say` grants one exact speech event and one action receipt.
+
+    Privileged SQLite event/receipt triggers must not impersonate another
+    speaker, add ungranted events or exhaust the durable event ID allocator.
+    Separately selected trusted audit handlers may add unrelated speech after
+    this function returns; those are independent WorldClock handler stages.
+    """
+    after = _say_evidence(db)
+    # No say action grants inventory, geography, profiles or other MAIN rows.
+    for stage in (domain, after):
+        if (stage["schema"] != before["schema"]
+                or stage["tables"] != before["tables"]):
+            raise ValueError("Say action changed ungranted world effects")
+    if (domain["receipts"] != before["receipts"]
+            or any(domain["events"].get(key) != row
+                   for key, row in before["events"].items())
+            or after["events"] != domain["events"]):
+        raise ValueError("Say action changed ungranted gameplay event history")
+    expected_receipts = dict(before["receipts"])
+    key = (actor, action_id)
+    if key in expected_receipts:
+        raise ValueError("Say receipt unexpectedly preexists")
+    expected_receipts[key] = (actor, action_id, command, response)
+    if after["receipts"] != expected_receipts:
+        raise ValueError("Say action receipt effect diverged")
+
+    message = "".join(char for char in arg if char.isprintable()).strip()
+    valid = bool(message) and len(message) <= 280
+    expected_response = (f"You say: {message}" if valid else
+                         "Say what?" if not message else
+                         "Messages must be 280 characters or fewer.")
+    if response != expected_response:
+        raise ValueError("Say response differs from authorized text")
+    additions = [row for key, row in domain["events"].items()
+                 if key not in before["events"]]
+    if len(additions) != (1 if valid else 0):
+        raise ValueError("Say produced ungranted gameplay event history")
+    if valid:
+        row = additions[0]
+        prior_id = max((key[0] for key in before["events"]), default=0)
+        if (row[0] != emitted_id or row[0] <= prior_id
+                or row[2:6] != (actor, room, "say",
+                                   json.dumps({"text": message}, sort_keys=True))):
+            raise ValueError("Say history is not bound to the typed speaker/action")
+
+    expected_allocators = dict(before["allocators"])
+    if additions:
+        expected_allocators["events"] = max(
+            expected_allocators.get("events", 0), additions[0][0])
+    if (domain["allocators"] != expected_allocators
+            or after["allocators"] != expected_allocators):
+        raise ValueError("Say changed ungranted AUTOINCREMENT allocation")
+
+
 def _guard_connection(db: sqlite3.Connection, engine: Engine, crafting: Crafting | None) -> None:
     """Reject a wrong-world, unbound, or nontransactional connection."""
     if not isinstance(db, sqlite3.Connection):
@@ -284,6 +364,7 @@ def perform_in_transaction(
             response = previous["response"]
         else:
             gather_before = _gather_evidence(db) if verb == "gather" else None
+            say_before = _say_evidence(db) if verb == "say" else None
             if verb in _ENGINE_ACTIONS:
                 response = engine._perform(db, actual_actor, room, verb, arg)
             elif verb == "gather":
@@ -291,6 +372,9 @@ def perform_in_transaction(
             else:
                 response = crafting._make(db, actual_actor, room, verb, arg)
             gather_domain = _gather_evidence(db) if gather_before is not None else None
+            say_domain = _say_evidence(db) if say_before is not None else None
+            say_emitted_id = (db.execute("SELECT last_insert_rowid()").fetchone()[0]
+                              if say_before is not None else 0)
             db.execute(
                 "INSERT INTO main.action_receipts(actor,action_id,command,response) VALUES(?,?,?,?)",
                 (actual_actor, action_id, command, response),
@@ -300,6 +384,11 @@ def perform_in_transaction(
                                       actor=actual_actor,
                                       room=room, arg=arg, action_id=action_id,
                                       command=command, response=response)
+            if say_before is not None:
+                _verify_say_effect(db, say_before, say_domain,
+                                   actor=actual_actor, room=room, arg=arg,
+                                   action_id=action_id, command=command,
+                                   response=response, emitted_id=say_emitted_id)
     except BaseException:
         db.execute("ROLLBACK TO SAVEPOINT realm_clock_gameplay")
         db.execute("RELEASE SAVEPOINT realm_clock_gameplay")
