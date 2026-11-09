@@ -11,6 +11,7 @@ worlds nor runs background ship movement.
 """
 from __future__ import annotations
 
+import json
 import sqlite3
 from datetime import datetime, timezone
 from contextlib import closing
@@ -20,7 +21,8 @@ from .auth import CredentialStore
 from .gateway import Gateway
 from .scoped_credentials import CredentialStateError
 from .ship_clock_dispatch import depart_and_schedule_in_transaction
-from .world_clock import WorldClock
+from .ship_history_custody import ShipHistoryCustody
+from .world_clock import DueEvent, WorldClock
 
 
 class AuthenticatedShipCommands:
@@ -82,6 +84,9 @@ class AuthenticatedShipCommands:
         ).fetchone()
         if world is None or world[0] != self.gateway.world_id:
             raise ValueError("World identity mismatch")
+        # Bound complete persistent ship history before credential, roster,
+        # clock and departure work in this writer transaction.
+        custody = ShipHistoryCustody(db)
         if (not isinstance(bearer_token, str) or
                 not 16 <= len(bearer_token) <= 255 or not bearer_token.isascii()):
             raise PermissionError("Invalid or revoked ship command credential")
@@ -131,8 +136,37 @@ class AuthenticatedShipCommands:
                         raise RuntimeError("Host UTC precedes last processed world tick")
         # Geography verifies exact owner equality and records this true actor.
         # Delegated crew roles are not yet supported: never impersonate owner.
+        # Snapshot the complete persistent ship ledger BEFORE departure DML.
+        # Triggers on the authenticated gateway writer can otherwise insert a
+        # second forged event or rewrite an older rival event while the HTTP
+        # request returns a successful receipt.
+        prior_receipt = (
+            custody.receipts.get((ship_id, actor, action_id))
+            if custody.enabled else None
+        )
         departure = depart_and_schedule_in_transaction(
             self.clock, self.gateway.geography, db, ship_id, destination,
             actor=actor, now=now, action_id=action_id,
         )
+        if prior_receipt is not None:
+            # Exact action-ID replay is intentionally once-only and may occur
+            # after a ship arrived. It makes NO new ship-state/history effect.
+            if (prior_receipt[3] != "depart:" + destination
+                    or json.loads(prior_receipt[4]) != departure["departure"]):
+                raise ValueError("Ship writer replay receipt diverged from prior effect")
+            custody.before_commit(db)
+        else:
+            # Reuse the same typed ship-effect verifier as WorldClock, with
+            # the authenticated actor already constrained to persisted owner.
+            # Only the host UTC timestamp and scoped action are synthetic;
+            # no ship_departure clock event is enqueued by a gateway request.
+            custody.after_handler(
+                db, DueEvent(
+                    event_id=action_id,
+                    due_at=datetime.fromtimestamp(now, timezone.utc),
+                    kind="ship_departure",
+                    payload={"ship_id": ship_id, "destination": destination},
+                ),
+            )
+            custody.before_commit(db)
         return {"principal": actor, **departure}
