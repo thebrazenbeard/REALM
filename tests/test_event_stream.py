@@ -239,6 +239,21 @@ class FeedWaitTests(unittest.TestCase):
 
     def test_one_player_cannot_starve_another_waiter(self):
         cursor = self.gateway.cursor()
+        # A client's completed HTTP response is not a server handler-joined
+        # barrier: response bytes may arrive before do_GET's finally block
+        # calls release_wait. Observe the three real releases explicitly.
+        completed = threading.Condition()
+        released = 0
+        original_release = self.server.release_wait
+
+        def witness_release(principal):
+            nonlocal released
+            original_release(principal)
+            with completed:
+                released += 1
+                completed.notify_all()
+
+        self.server.release_wait = witness_release
         with ThreadPoolExecutor(max_workers=2) as pool:
             first = pool.submit(self.send, self.url(after=cursor, wait_ms=1200))
             second = pool.submit(self.send, self.url(after=cursor, wait_ms=1200))
@@ -254,15 +269,70 @@ class FeedWaitTests(unittest.TestCase):
             self.assertEqual([], response["events"])
             self.assertEqual(200, first.result(timeout=2)[0])
             self.assertEqual(200, second.result(timeout=2)[0])
+        with completed:
+            self.assertTrue(completed.wait_for(lambda: released == 3, timeout=2),
+                            "Three completed HTTP waits did not release their server slots")
         self.assertEqual({}, self.server.player_wait_counts)
 
     def test_rapid_reconnect_releases_all_waiter_slots(self):
+        completed = threading.Condition()
+        released = 0
+        original_release = self.server.release_wait
+
+        def witness_release(principal):
+            nonlocal released
+            original_release(principal)
+            with completed:
+                released += 1
+                completed.notify_all()
+
+        self.server.release_wait = witness_release
         cursor = self.gateway.cursor()
         for _ in range(20):
             status, response = self.send(self.url(after=cursor, wait_ms=1))
             self.assertEqual(200, status)
             self.assertEqual([], response["events"])
+        # The HTTP reader may complete before its server finally block. Wait
+        # for actual release callbacks instead of racing the request thread.
+        with completed:
+            self.assertTrue(completed.wait_for(lambda: released == 20, timeout=2),
+                            "Twenty completed responses did not release twenty slots")
         self.assertEqual({}, self.server.player_wait_counts)
+        self.assertEqual(8, self.server.feed_slots._value)
+
+    def test_client_read_does_not_imply_server_finally_has_released_slot(self):
+        """Deterministically expose the response/finally scheduling boundary."""
+        entered = threading.Event()
+        allow = threading.Event()
+        completed = threading.Event()
+        original_release = self.server.release_wait
+
+        def blocked_release(principal):
+            entered.set()
+            if not allow.wait(timeout=3):
+                raise RuntimeError("Synthetic test release gate timed out")
+            original_release(principal)
+            completed.set()
+
+        self.server.release_wait = blocked_release
+        try:
+            with ThreadPoolExecutor(max_workers=1) as pool:
+                status, response = pool.submit(
+                    self.send, self.url(after=self.gateway.cursor(), wait_ms=1),
+                ).result(timeout=3)
+            self.assertEqual(200, status)
+            self.assertEqual([], response["events"])
+            self.assertTrue(entered.wait(timeout=2))
+            # The received 200 is real, but server release is deliberately
+            # pending. This is why asserting idle immediately is a race.
+            with self.server.player_wait_lock:
+                self.assertEqual({"Patrick": 1}, self.server.player_wait_counts)
+            self.assertEqual(7, self.server.feed_slots._value)
+        finally:
+            allow.set()
+        self.assertTrue(completed.wait(timeout=2))
+        with self.server.player_wait_lock:
+            self.assertEqual({}, self.server.player_wait_counts)
         self.assertEqual(8, self.server.feed_slots._value)
 
     def test_get_query_cannot_inject_gameplay_commands(self):
