@@ -366,21 +366,24 @@ class Gateway:
             if subject is None:
                 raise ValueError("Join this REALM before reading the feed")
             # Current-room membership alone does not grant retroactive access
-            # to its prior conversation. A join/move event is the evidence of
-            # the latest arrival; after leaving and returning, old history is
-            # again outside the authorized audience interval. No such event
-            # means fail closed, including on corrupted/legacy history.
+            # to its prior conversation. Check the actor's latest *overall*
+            # location event, including departure. Looking only for a join or
+            # move into the current room could fall back to an older join if
+            # the newest return-arrival row had been removed, disclosing speech
+            # from the period when the actor was absent. An unprovable or
+            # contradictory history fails closed instead of guessing.
             entry = db.execute(
-                "SELECT MAX(id) FROM events WHERE actor=? COLLATE NOCASE "
-                "AND room_id=? AND kind IN ('join','move')",
-                (subject["id"], subject["room_id"]),
-            ).fetchone()[0]
-            if entry is None:
+                "SELECT id,room_id,kind FROM events WHERE actor=? COLLATE NOCASE "
+                "AND kind IN ('join','leave','move') ORDER BY id DESC LIMIT 1",
+                (subject["id"],),
+            ).fetchone()
+            if (entry is None or entry["kind"] not in ("join", "move") or
+                    entry["room_id"] != subject["room_id"]):
                 raise ValueError("No provable current-room arrival; feed denied")
             records = db.execute(
                 "SELECT id,occurred_at,actor,room_id,kind,payload_json FROM events "
                 "WHERE room_id=? AND id>? AND id>=? ORDER BY id LIMIT ?",
-                (subject["room_id"], after, entry, MAX_FEED_EVENTS),
+                (subject["room_id"], after, entry["id"], MAX_FEED_EVENTS),
             ).fetchall()
             events = []
             for row in records:
@@ -577,6 +580,15 @@ class GatewayHandler(BaseHTTPRequestHandler):
             return
         except ValueError as error:
             self._send(400, {"ok": False, "error": str(error)})
+            return
+        # A bearer may have been revoked/rotated while a room/feed/map read
+        # was executing. The initial authorization gate does not grant a
+        # standing right to deliver results after that revocation. Recheck at
+        # the response boundary, like the opt-in long-poll feed. This is not
+        # an atomic guarantee against revocation after this check but before
+        # the network write (nor a substitute for TLS/public-host policy).
+        if self._principal() != principal:
+            self._send(401, {"ok": False, "error": "Player bearer revoked or rotated"})
             return
         self._send(200, result)
 
