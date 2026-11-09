@@ -74,7 +74,7 @@ while time.monotonic() < deadline:
     if status != 200:
         break
     seen = [event["text"] for event in feed["events"]]
-    if "Mira: Mira returned to the green" in seen and "Bellkeeper: Noon bell" in seen:
+    if "Mira: Mira returned to the green" in seen:
         break
     time.sleep(.02)
 print(json.dumps({
@@ -218,8 +218,21 @@ class FantasyTwoClientPlayTests(unittest.TestCase):
                 self.assertIn("Village Green", terminal["green"])
                 self.assertIn("Goodbye", terminal["goodbye"])
                 self.assertIn("Mira: Mira returned to the green", browser["feed"])
-                self.assertIn("Bellkeeper: Noon bell", browser["feed"])
                 with closing(sqlite3.connect(path)) as db:
+                    # The UTC bell is durable even if emitted before Rowan's
+                    # most recent return to the green. Entry-bound privacy
+                    # permits observation only when it follows that arrival.
+                    bell_id = db.execute(
+                        "SELECT id FROM events WHERE actor='Bellkeeper' AND kind='say'"
+                    ).fetchone()[0]
+                    arrival_id = db.execute(
+                        "SELECT MAX(id) FROM events WHERE actor='Rowan' "
+                        "AND room_id='village_green' AND kind IN ('join','move')"
+                    ).fetchone()[0]
+                    self.assertEqual(
+                        bell_id >= arrival_id,
+                        "Bellkeeper: Noon bell" in browser["feed"],
+                    )
                     schema = {r[0] for r in db.execute(
                         "SELECT name FROM sqlite_master WHERE type='table'")}
                     self.assertFalse(any(name.startswith(("geo_", "atm_", "ship_"))

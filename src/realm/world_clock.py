@@ -30,6 +30,64 @@ _MAX_FORWARD_SECONDS = 86400
 _UTC = timezone.utc
 
 
+class _PolicyPreservingConnection(sqlite3.Connection):
+    """Clock-owned SQLite connection with composable host authorization.
+
+    sqlite3 exposes set_authorizer but *not* get_authorizer. Replacing a host
+    policy with a temporary transaction guard and resetting it to None silently
+    removes host restrictions. Keep the host's opt-in policy and temporary
+    clock guards separately, and install their conjunction at the C boundary.
+
+    This is a connection policy contract, not a sandbox for unrestricted Python:
+    an authorized host holding the raw SQLite type can deliberately invoke its
+    unbound C methods or act through another database connection.
+    """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._realm_host_authorizer = None
+        self._realm_authorizer_guards = []
+
+    def _refresh_authorizer(self):
+        host = self._realm_host_authorizer
+        guards = tuple(self._realm_authorizer_guards)
+        if not guards:
+            return super().set_authorizer(host)
+
+        def composed(action, arg1, arg2, database, source):
+            for guard in guards:
+                decision = guard(action, arg1, arg2, database, source)
+                if decision != sqlite3.SQLITE_OK:
+                    return decision
+            return (host(action, arg1, arg2, database, source)
+                    if host is not None else sqlite3.SQLITE_OK)
+
+        return super().set_authorizer(composed)
+
+    def set_authorizer(self, callback):
+        if callback is not None and not callable(callback):
+            raise TypeError("SQLite authorizer must be callable or None")
+        self._realm_host_authorizer = callback
+        return self._refresh_authorizer()
+
+    def _push_clock_authorizer(self, callback):
+        if not callable(callback):
+            raise TypeError("Clock authorizer guard must be callable")
+        self._realm_authorizer_guards.append(callback)
+        try:
+            self._refresh_authorizer()
+        except BaseException:
+            self._realm_authorizer_guards.pop()
+            self._refresh_authorizer()
+            raise
+
+    def _pop_clock_authorizer(self, callback):
+        if not self._realm_authorizer_guards or self._realm_authorizer_guards[-1] is not callback:
+            raise RuntimeError("Clock authorizer guard stack is inconsistent")
+        self._realm_authorizer_guards.pop()
+        self._refresh_authorizer()
+
+
 def _nonclock_world_state(db: sqlite3.Connection) -> tuple[tuple, dict]:
     """World-local persistent state guarded across scheduler receipt writes.
 
@@ -313,7 +371,8 @@ class WorldClock:
     def _connect(self):
         if not self.db_path.is_file():
             raise RuntimeError("World clock must be explicitly enabled")
-        db = sqlite3.connect(str(self.db_path), timeout=10)
+        db = sqlite3.connect(str(self.db_path), timeout=10,
+                             factory=_PolicyPreservingConnection)
         try:
             db.row_factory = sqlite3.Row
             db.execute("PRAGMA foreign_keys=ON")

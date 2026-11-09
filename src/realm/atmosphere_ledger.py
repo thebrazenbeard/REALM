@@ -181,7 +181,7 @@ class AtmosphereLedger:
 
     def apply_in_transaction(self, db, *, world_id, action_id, operation, params, expected_version):
         """Host-owned BEGIN IMMEDIATE SQLite connection; nested savepoint on failure."""
-        if type(db) is not sqlite3.Connection:
+        if not isinstance(db, sqlite3.Connection):
             raise ValueError("SQLite connection required")
         self._bound(db, world_id, require_transaction=True)
         if type(action_id) is not str or not _RECEIPT_ID.fullmatch(action_id):

@@ -11,7 +11,7 @@ import sys
 import sqlite3
 import tempfile
 import unittest
-from contextlib import closing
+from contextlib import closing, contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -99,7 +99,9 @@ class ClockRunnerHookTests(unittest.TestCase):
 
     def test_live_registered_handler_cannot_escape_world_transaction(self):
         for operation in ("commit", "rollback", "commit_then_begin",
-                          "rollback_then_begin", "sql_commit", "sql_rollback"):
+                          "rollback_then_begin", "sql_commit", "sql_rollback",
+                          "unbound_commit", "unbound_rollback",
+                          "cursor_commit", "cursor_rollback", "cursor_script"):
             with self.subTest(operation=operation):
                 # Each adversarial variant starts from the same durable world
                 # even when a deliberately broken predecessor leaked COMMIT.
@@ -116,6 +118,14 @@ class ClockRunnerHookTests(unittest.TestCase):
                                "WHERE key='world_id'")
                     if operation.startswith("sql_"):
                         db.execute(operation.removeprefix("sql_").upper())
+                    elif operation.startswith("unbound_"):
+                        getattr(sqlite3.Connection, operation.removeprefix("unbound_"))(db)
+                    elif operation.startswith("cursor_"):
+                        cursor = db.cursor()
+                        if operation == "cursor_script":
+                            cursor.executescript("SELECT 1;")
+                        else:
+                            cursor.execute(operation.removeprefix("cursor_").upper())
                     else:
                         getattr(db, operation.split("_then_")[0])()
                     if operation.endswith("_then_begin"):
@@ -179,6 +189,64 @@ class ClockRunnerHookTests(unittest.TestCase):
             self.assertIsNotNone(db.execute(
                 "SELECT processed_utc FROM clock_events "
                 "WHERE event_id='safe_nested_savepoint'").fetchone()[0])
+
+    def test_preinstalled_host_authorizer_survives_trusted_handler_guard(self):
+        def deny_world_meta(action, arg1, arg2, database, source):
+            if action == sqlite3.SQLITE_UPDATE and arg1 == "world_meta":
+                return sqlite3.SQLITE_DENY
+            return sqlite3.SQLITE_OK
+
+        class PolicyClock(WorldClock):
+            @contextmanager
+            def _connect(self):
+                with super()._connect() as db:
+                    db.set_authorizer(deny_world_meta)
+                    yield db
+
+        clock = PolicyClock(self.db)
+        clock.schedule("policy_host_action", due_at=NOW, kind="policy", payload={})
+
+        def policy_handler(db, event):
+            db.execute("UPDATE main.world_meta SET value='not_authorized' "
+                       "WHERE key='world_id'")
+            return event.event_id
+
+        with self.assertRaises(sqlite3.DatabaseError):
+            run_foreground(clock, {"policy": policy_handler}, pulses=1, now=lambda: NOW)
+        with closing(sqlite3.connect(self.db)) as db:
+            self.assertEqual("hook_test", db.execute(
+                "SELECT value FROM world_meta WHERE key='world_id'").fetchone()[0])
+            self.assertIsNone(db.execute(
+                "SELECT processed_utc FROM clock_events "
+                "WHERE event_id='policy_host_action'").fetchone()[0])
+
+    def test_begin_hook_host_authorizer_is_preserved_across_handler_and_finalizer(self):
+        class HostPolicy:
+            def begin_host_tick(self, db, due_events):
+                def deny_world_meta(action, arg1, arg2, database, source):
+                    if action == sqlite3.SQLITE_UPDATE and arg1 == "world_meta":
+                        return sqlite3.SQLITE_DENY
+                    return sqlite3.SQLITE_OK
+                db.set_authorizer(deny_world_meta)
+
+            def __call__(self, db, event):
+                db.execute("UPDATE main.world_meta SET value='forbidden' "
+                           "WHERE key='world_id'")
+                return event.event_id
+
+            def verify_final_precommit(self, db, processed):
+                return None
+
+        clock = WorldClock(self.db)
+        clock.schedule("policy_begin_hook", due_at=NOW, kind="policy_hook", payload={})
+        with self.assertRaises(sqlite3.DatabaseError):
+            run_foreground(clock, {"policy_hook": HostPolicy()}, pulses=1, now=lambda: NOW)
+        with closing(sqlite3.connect(self.db)) as db:
+            self.assertEqual("hook_test", db.execute(
+                "SELECT value FROM world_meta WHERE key='world_id'").fetchone()[0])
+            self.assertIsNone(db.execute(
+                "SELECT processed_utc FROM clock_events "
+                "WHERE event_id='policy_begin_hook'").fetchone()[0])
 
     def test_swallowed_transaction_denial_still_rejects_entire_tick(self):
         clock = WorldClock(self.db)
@@ -510,12 +578,13 @@ class ClockRunnerHookTests(unittest.TestCase):
 
     def test_attached_file_side_effect_can_escape_world_receipt_custody(self):
         # Document the actual boundary, not a fictional SQLite/Python sandbox.
-        # Unrestricted trusted Python can explicitly remove the authorizer,
+        # Unrestricted trusted Python can deliberately bypass the managed
+        # sqlite3.Connection subclass using the native base-type method,
         # create a file, detach it, and leave no in-world world-state delta.
         external = self.db.parent / "trusted-attached-then-detached.sqlite3"
         class ExternalHostEffect(HookOwner):
             def verify_final_precommit(self, db, processed):
-                db.set_authorizer(None)
+                sqlite3.Connection.set_authorizer(db, None)
                 db.execute("PRAGMA query_only=OFF")
                 db.execute("ATTACH DATABASE ? AS injected", (str(external),))
                 db.execute("DETACH DATABASE injected")
