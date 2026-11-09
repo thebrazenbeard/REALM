@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from collections import Counter
 from pathlib import Path
 
 from .crafting import Crafting, _MAX_BATCHES, _name
@@ -19,6 +20,10 @@ from .engine import Engine, _DIRECTIONS, _LONG_DIRECTIONS
 
 _ENGINE_ACTIONS = frozenset({"go", "take", "drop", "say"})
 _CRAFT_ACTIONS = frozenset({"gather", "craft", "build"})
+_GATHER_EFFECT_TABLES = frozenset({
+    "gathering_nodes", "material_pouches", "crafted_goods",
+    "built_structures", "craft_recipes", "events", "action_receipts",
+})
 
 
 def _economy_rows(db: sqlite3.Connection, table: str, keys: tuple[str, ...]) -> dict:
@@ -29,8 +34,40 @@ def _economy_rows(db: sqlite3.Connection, table: str, keys: tuple[str, ...]) -> 
     }
 
 
+def _other_world_state(db: sqlite3.Connection) -> tuple[tuple, dict[str, Counter]]:
+    """Require every other main-world table/schema to remain unchanged.
+
+    A signed gather has no grant to move players, transfer items, edit maps,
+    credentials, ship state, future clock entries or host extension tables.
+    Capture duplicates too, not only rows addressable by a known primary key.
+    SQLite's internal sequence bookkeeping is deliberately excluded: a valid
+    newly emitted gather/event can advance it. Attached databases and external
+    host effects are outside this in-world transaction contract.
+    """
+    schema = tuple(tuple(row) for row in db.execute(
+        "SELECT type,name,tbl_name,sql FROM main.sqlite_schema "
+        "WHERE name NOT LIKE 'sqlite_%' ORDER BY type,name"
+    ))
+    tables = {}
+    for kind, name, _owner, _sql in schema:
+        if kind != "table" or name in _GATHER_EFFECT_TABLES:
+            continue
+        quoted_name = '"' + name.replace('"', '""') + '"'
+        tables[name] = Counter(tuple(row) for row in db.execute(
+            "SELECT * FROM main." + quoted_name))
+    return schema, tables
+
+
+def _allocator_rows(db: sqlite3.Connection) -> dict[str, int]:
+    """The SQLite event allocator is state, even though it is internal DDL."""
+    if not db.execute("SELECT 1 FROM main.sqlite_schema "
+                      "WHERE type='table' AND name='sqlite_sequence'").fetchone():
+        return {}
+    return dict(db.execute("SELECT name,seq FROM main.sqlite_sequence"))
+
+
 def _gather_evidence(db: sqlite3.Connection) -> dict[str, dict]:
-    """Only the six persistence families a gather is allowed to touch/read."""
+    """Signed gather deltas plus a complete main-world non-gather guard."""
     return {
         "nodes": _economy_rows(db, "gathering_nodes", ("room_id", "material")),
         "pouches": _economy_rows(db, "material_pouches", ("actor", "material")),
@@ -39,6 +76,8 @@ def _gather_evidence(db: sqlite3.Connection) -> dict[str, dict]:
         "recipes": _economy_rows(db, "craft_recipes", ("id",)),
         "events": _economy_rows(db, "events", ("id",)),
         "receipts": _economy_rows(db, "action_receipts", ("actor", "action_id")),
+        "other_world": _other_world_state(db),
+        "allocators": _allocator_rows(db),
     }
 
 
@@ -73,6 +112,23 @@ def _verify_gather_effect(db: sqlite3.Connection, before: dict[str, dict],
     Ordinary unrelated room `say` events remain an explicit separate lane.
     """
     after = _gather_evidence(db)
+    if after["other_world"] != before["other_world"]:
+        raise ValueError("Gather changed ungranted world gameplay state")
+
+    # The genuine gather event and a permitted separate say event can advance
+    # events AUTOINCREMENT. A trigger cannot increase that durable allocator
+    # without a corresponding surviving event row, nor poison another family.
+    def expected_allocators(events):
+        result = dict(before["allocators"])
+        new_event_ids = [row[0] for key, row in events.items()
+                         if key not in before["events"]]
+        if new_event_ids:
+            result["events"] = max(result.get("events", 0), *new_event_ids)
+        return result
+
+    if (domain["allocators"] != expected_allocators(domain["events"])
+            or after["allocators"] != expected_allocators(after["events"])):
+        raise ValueError("Gather changed ungranted AUTOINCREMENT allocation")
     # A late receipt trigger might DELETE the genuine gather event and INSERT
     # a semantically identical replacement with a new event ID. Preserve the
     # exact domain-emitted rows captured BEFORE receipt-trigger callbacks.
@@ -84,7 +140,8 @@ def _verify_gather_effect(db: sqlite3.Connection, before: dict[str, dict],
            for key, row in after["events"].items()
            if key not in domain["events"]):
         raise ValueError("Receipt trigger inserted an ungranted gameplay event")
-    expected = {name: dict(rows) for name, rows in before.items()}
+    expected = {name: dict(rows) for name, rows in before.items()
+                if name not in ("other_world", "allocators")}
     key = (actor, action_id)
     if key in expected["receipts"]:
         raise ValueError("Gather receipt unexpectedly preexists")

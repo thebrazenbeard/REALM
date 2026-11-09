@@ -616,7 +616,7 @@ class RosterUtcTests(unittest.TestCase):
             "VALUES('atrium','gold',99,1);"
         )
 
-    def test_postverify_unrelated_say_event_is_permitted(self):
+    def test_postverify_receipt_trigger_say_without_handler_grant_rejected(self):
         plan = self.proposal()
         policy, mac = self.grant(plan)
         with closing(sqlite3.connect(self.dbpath)) as db, db:
@@ -630,12 +630,22 @@ class RosterUtcTests(unittest.TestCase):
                            '{"text":"hi"}');
                 END
             """)
+        # A SQLite scheduler receipt trigger has no independent right to
+        # impersonate a speaker. Only selected trusted handlers may append
+        # unrelated say history. This is intentionally stricter than the
+        # previous broad kind!='gather' allowance.
+        with self.assertRaisesRegex(ValueError, "Clock receipt"):
+            self.run_grant(policy, mac)
+        self.assertEqual(self.counts(), (0, 0, 6))
+        self.assertIsNone(self.clock.lookup("roster_test_1").processed_at)
+        with closing(sqlite3.connect(self.dbpath)) as db, db:
+            db.execute("DROP TRIGGER main.benign_say_after_clock_ack")
         self.assertEqual(self.run_grant(policy, mac).executed, 2)
         self.assertEqual(self.counts(), (2, 2, 0))
         with closing(sqlite3.connect(self.dbpath)) as db:
             self.assertEqual(db.execute(
                 "SELECT COUNT(*) FROM events WHERE kind='say'"
-            ).fetchone()[0], 1)
+            ).fetchone()[0], 0)
 
     def _postverify_full_ledger_trigger(self, body, *, old_gather=False,
                                         high_id=False):
@@ -834,11 +844,11 @@ class RosterUtcTests(unittest.TestCase):
             before_roster=True,
         )
 
-    def test_full_ledger_allows_early_batch_benign_say(self):
+    def test_full_ledger_rejects_early_batch_extra_receipt_say(self):
         self._postverify_other_batch_event(
             "INSERT INTO events(occurred_at,actor,room_id,kind,payload_json) "
             "VALUES('2026-11-07T21:00:00+00:00','Cora','atrium','say','{}');",
-            before_roster=True, expect_rejection=False,
+            before_roster=True,
         )
 
 
