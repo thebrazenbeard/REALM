@@ -37,8 +37,9 @@ def _nonclock_world_state(db: sqlite3.Connection) -> tuple[tuple, dict]:
     the clock observes that state *before* writing the processed receipt.
     Neither its receipt nor its final UTC watermark grants any additional
     gameplay, credential, geography, crafting or host-extension mutation.
-    Core events are guarded separately so unrelated new `say` history remains
-    permitted; clock tables have their own exact receipt/watermark checks.
+    Core events are guarded separately: selected trusted host callbacks may
+    emit unrelated `say`, but scheduler receipt triggers cannot. Clock tables
+    have their own exact receipt/watermark checks.
     """
     schema = tuple(tuple(row) for row in db.execute(
         "SELECT type,name,tbl_name,sql FROM main.sqlite_schema "
@@ -66,6 +67,85 @@ def _autoincrement_state(db: sqlite3.Connection) -> Counter | None:
         return Counter(tuple(row) for row in db.execute(
             "SELECT name,seq FROM main.sqlite_sequence"))
     return None
+
+
+def _schema_versions(db: sqlite3.Connection) -> tuple[int, int]:
+    """Detect schema/trigger DDL even when it changes no DML counter."""
+    return (db.execute("PRAGMA main.schema_version").fetchone()[0],
+            db.execute("PRAGMA temp.schema_version").fetchone()[0])
+
+
+def _clock_budget_eligible(db: sqlite3.Connection) -> bool:
+    """Conservatively admit only direct ordinary scheduler-table DML.
+
+    A clock receipt is a fixed one-row UPDATE; its watermark is a one-row
+    UPSERT. Installed MAIN or TEMP clock triggers, unexpected column layouts,
+    virtual tables, and FKs depending on the *updated* columns retain the
+    original full-row comparison path instead. This is not a trusted-handler
+    sandbox or a replacement for the final exact clock receipt readback.
+    """
+    # Exact known DDL is intentional: a same-column replacement with a CHECK
+    # UDF, generated expression, or other unknown SQL semantics must not gain
+    # the shortcut. enable() stores CREATE without the IF NOT EXISTS clause.
+    expected = {
+        "clock_events": ("event_id", "due_utc", "kind", "payload_json", "processed_utc"),
+        "clock_state": ("id", "last_utc"),
+    }
+    expected_sql = {
+        "clock_events": ("CREATE TABLE clock_events (\n"
+                         "    event_id TEXT PRIMARY KEY,\n"
+                         "    due_utc TEXT NOT NULL,\n"
+                         "    kind TEXT NOT NULL,\n"
+                         "    payload_json TEXT NOT NULL,\n"
+                         "    processed_utc TEXT\n)"),
+        "clock_state": ("CREATE TABLE clock_state (\n"
+                        "    id INTEGER PRIMARY KEY CHECK(id = 1),\n"
+                        "    last_utc TEXT NOT NULL\n)"),
+    }
+    for name, columns in expected.items():
+        # table_xinfo exposes hidden/generated columns that table_info omits.
+        actual = tuple(row[1] for row in db.execute(f"PRAGMA main.table_xinfo('{name}')"))
+        if actual != columns:
+            return False
+        ddl = db.execute("SELECT type,sql FROM main.sqlite_schema WHERE name=?", (name,)).fetchone()
+        if ddl is None or tuple(ddl) != ("table", expected_sql[name]):
+            return False
+    indexes = {
+        (row[0], row[1]) for row in db.execute(
+            "SELECT name,sql FROM main.sqlite_schema WHERE type='index' "
+            "AND tbl_name IN ('clock_events','clock_state')"
+        )
+    }
+    if indexes != {
+        ("sqlite_autoindex_clock_events_1", None),
+        ("idx_clock_due", "CREATE INDEX idx_clock_due\n"
+                           "    ON clock_events(due_utc, event_id) "
+                           "WHERE processed_utc IS NULL"),
+    }:
+        return False
+    for namespace in ("main", "temp"):
+        if db.execute(
+            f"SELECT 1 FROM {namespace}.sqlite_schema WHERE type='trigger' "
+            "AND tbl_name IN ('clock_events','clock_state') LIMIT 1"
+        ).fetchone():
+            return False
+    # A shadow or virtual table can have side effects not reflected by the
+    # ordinary table-row budget. Keep the established snapshot route there.
+    if db.execute(
+        "SELECT 1 FROM main.sqlite_schema WHERE type='table' "
+        "AND lower(sql) LIKE 'create virtual table%' LIMIT 1"
+    ).fetchone():
+        return False
+    for (name,) in db.execute(
+        "SELECT name FROM main.sqlite_schema WHERE type='table'"
+    ):
+        quoted = '"' + name.replace('"', '""') + '"'
+        for foreign in db.execute(f"PRAGMA main.foreign_key_list({quoted})"):
+            parent, target = foreign[2], foreign[4]
+            if ((parent == "clock_events" and target == "processed_utc")
+                    or (parent == "clock_state" and target == "last_utc")):
+                return False
+    return True
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS clock_events (
@@ -448,6 +528,13 @@ class WorldClock:
             expected_new_schedules = new_clock_schedules()
             expected_autoincrement = _autoincrement_state(db)
             unexpected_allocator_drift = False
+            # A direct clock receipt/watermark has an exact one-row DML
+            # budget. In the ordinary no-trigger schema this removes repeated
+            # O(world rows) custody scans. With installed clock triggers or
+            # unknown scheduler effects, retain the original full scans.
+            budget_schema = _schema_versions(db)
+            budget_eligible = _clock_budget_eligible(db)
+            previous_receipt_budget_passed = False
             for row in rows:
                 event = _event(row)
                 # A previous scheduler receipt trigger must not contaminate
@@ -455,7 +542,8 @@ class WorldClock:
                 if (node_state() != expected_nodes or pouch_state() != expected_pouches
                         or gather_state() != expected_gathers):
                     raise ValueError("Roster inventory drifted before next UTC action")
-                if _nonclock_world_state(db) != expected_world_state:
+                if (not previous_receipt_budget_passed
+                        and _nonclock_world_state(db) != expected_world_state):
                     raise ValueError("Host UTC receipt altered ungranted world state")
                 if (new_nongather_state() != expected_new_nongather
                         or new_clock_schedules() != expected_new_schedules):
@@ -465,14 +553,22 @@ class WorldClock:
                     prior_event_ids = {
                         r["id"] for r in db.execute("SELECT id FROM main.events")
                     }
+                handler_changes = db.total_changes
+                handler_schema = _schema_versions(db)
                 outcome = handler(db, event)
                 ship_custody.after_handler(db, event)
                 # The trusted callback owns its authorized state transition.
                 # Freeze the full main-world nonclock result at this boundary,
                 # before our scheduler receipt can fire privileged triggers.
-                expected_world_state = _nonclock_world_state(db)
-                if expected_world_state[0] != initial_world_schema:
-                    raise ValueError("Host UTC handler changed main-world schema")
+                updated_schema = _schema_versions(db)
+                if (not budget_eligible or db.total_changes != handler_changes
+                        or updated_schema != handler_schema):
+                    expected_world_state = _nonclock_world_state(db)
+                    if expected_world_state[0] != initial_world_schema:
+                        raise ValueError("Host UTC handler changed main-world schema")
+                if updated_schema != budget_schema:
+                    budget_schema = updated_schema
+                    budget_eligible = _clock_budget_eligible(db)
                 expected_new_nongather = new_nongather_state()
                 expected_new_schedules = new_clock_schedules()
                 expected_autoincrement = _autoincrement_state(db)
@@ -538,6 +634,8 @@ class WorldClock:
                     expected_gathers.update(gather_events)
                 if gather_state() != expected_gathers:
                     raise ValueError("Roster gather history changed within ungranted UTC action")
+                receipt_changes = db.total_changes
+                receipt_schema = _schema_versions(db)
                 updated = db.execute(
                     "UPDATE main.clock_events SET processed_utc=? "
                     "WHERE event_id=? AND processed_utc IS NULL",
@@ -545,27 +643,40 @@ class WorldClock:
                 )
                 if updated.rowcount != 1:
                     raise RuntimeError("A clock receipt changed during host transaction")
-                if _nonclock_world_state(db) != expected_world_state:
-                    raise ValueError("Clock receipt introduced ungranted world effects")
-                if (new_nongather_state() != expected_new_nongather
-                        or new_clock_schedules() != expected_new_schedules):
-                    raise ValueError("Clock receipt inserted ungranted event or future action")
+                previous_receipt_budget_passed = (
+                    budget_eligible and db.total_changes - receipt_changes == 1
+                    and _schema_versions(db) == receipt_schema)
+                if not previous_receipt_budget_passed:
+                    if _nonclock_world_state(db) != expected_world_state:
+                        raise ValueError("Clock receipt introduced ungranted world effects")
+                    if (new_nongather_state() != expected_new_nongather
+                            or new_clock_schedules() != expected_new_schedules):
+                        raise ValueError("Clock receipt inserted ungranted event or future action")
                 # Retain this alarm until the *existing* signed gather and
                 # ship-history verifiers have produced their specific errors.
                 # A later handler must never erase evidence of receipt drift.
                 unexpected_allocator_drift |= (
                     _autoincrement_state(db) != expected_autoincrement)
                 processed.append(event)
-            db.execute(
+            watermark_changes = db.total_changes
+            watermark_schema = _schema_versions(db)
+            watermark = db.execute(
                 "INSERT INTO main.clock_state(id,last_utc) VALUES(1,?) "
                 "ON CONFLICT(id) DO UPDATE SET last_utc=excluded.last_utc",
                 (stamp,),
             )
-            if _nonclock_world_state(db) != expected_world_state:
-                raise ValueError("UTC watermark introduced ungranted world effects")
-            if (new_nongather_state() != expected_new_nongather
-                    or new_clock_schedules() != expected_new_schedules):
-                raise ValueError("UTC watermark inserted ungranted event or future action")
+            watermark_budget_passed = (
+                budget_eligible and watermark.rowcount == 1
+                and db.total_changes - watermark_changes == 1
+                and _schema_versions(db) == watermark_schema)
+            if not watermark_budget_passed:
+                if _nonclock_world_state(db) != expected_world_state:
+                    raise ValueError("UTC watermark introduced ungranted world effects")
+                if (new_nongather_state() != expected_new_nongather
+                        or new_clock_schedules() != expected_new_schedules):
+                    raise ValueError("UTC watermark inserted ungranted event or future action")
+                if watermark.rowcount != 1:
+                    raise RuntimeError("UTC watermark changed during host transaction")
             unexpected_allocator_drift |= (
                 _autoincrement_state(db) != expected_autoincrement)
             # Handler-created TEMP triggers can alter the durable receipts or
@@ -629,12 +740,16 @@ class WorldClock:
             # selected callbacks, scheduler receipts, watermark writes, and
             # roster postconditions. Neither may observe a later tick write.
             finalizer = getattr(handler, "verify_final_precommit", None)
+            finalizer_changes = db.total_changes
+            finalizer_schema = _schema_versions(db)
             if finalizer is not None:
                 if not callable(finalizer):
                     raise TypeError("Host tick finalizer must be callable")
                 finalizer(db, tuple(processed))
             ship_custody.before_commit(db)
-            if _nonclock_world_state(db) != expected_world_state:
+            if ((not budget_eligible or db.total_changes != finalizer_changes
+                    or _schema_versions(db) != finalizer_schema)
+                    and _nonclock_world_state(db) != expected_world_state):
                 raise ValueError("Finalizer introduced ungranted world effects")
             if (new_nongather_state() != expected_new_nongather
                     or new_clock_schedules() != expected_new_schedules):
