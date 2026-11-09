@@ -251,6 +251,107 @@ def _expected_gather(nodes: dict, room: str, arg: str):
     return material, min(node[2], batches * node[3])
 
 
+def _planned_make(before: dict, actor: str, room: str, kind: str, arg: str) -> tuple:
+    """Plan a recipe's exact economic grant from pre-domain rows only.
+
+    Source recipes are world-owner configured and already validated by Crafting;
+    no trigger-tainted result may authorize an extra output or material debit.
+    The construction timestamp is separately captured at its real INSERT.
+    """
+    pouches = dict(before["pouches"])
+    goods = dict(before["goods"])
+    structures = dict(before["structures"])
+    if not arg:
+        return f"{kind.capitalize()} what? Type 'recipes' for options.", pouches, goods, structures, None
+    recipe = before["recipes"].get((arg.lower(),))
+    if recipe is None or recipe[1] != kind:
+        return f"No {kind} recipe named {arg!r}.", pouches, goods, structures, None
+    if kind == "build" and any(
+        row[1:4] == (room, recipe[0], actor) for row in structures.values()
+    ):
+        return f"You already built {recipe[3]} here.", pouches, goods, structures, None
+    ingredients = json.loads(recipe[2])
+    holdings = {key[1]: row[2] for key, row in pouches.items() if key[0] == actor}
+    missing = [f"{material} x{quantity - holdings.get(material, 0)}"
+               for material, quantity in ingredients.items()
+               if holdings.get(material, 0) < quantity]
+    if missing:
+        return "Missing materials: " + ", ".join(missing), pouches, goods, structures, None
+    for material, quantity in ingredients.items():
+        old = pouches[(actor, material)]
+        pouches[(actor, material)] = (actor, material, old[2] - quantity)
+    if kind == "craft":
+        key = (actor, recipe[3])
+        old = goods.get(key)
+        goods[key] = (actor, recipe[3], (old[2] if old else 0) + recipe[4])
+        response = f"You craft {recipe[3]} x{recipe[4]}."
+    else:
+        response = f"You build {recipe[3]} here."
+    return response, pouches, goods, structures, (recipe[0], recipe[3])
+
+
+def _verify_make_effect(db: sqlite3.Connection, before: dict, domain: dict,
+                        *, actor: str, room: str, verb: str, arg: str,
+                        action_id: str, command: str, response: str,
+                        emissions: list[tuple[int, str]],
+                        constructions: list[tuple[int, str]]) -> None:
+    """Attest the complete typed craft/build economy and event grant.
+
+    A signed recipe can consume precisely its configured ingredients and add
+    precisely one output batch/structure, event and receipt. Installed triggers
+    cannot append, delete or change any other world row, including previous
+    history, other actors' inventory or AUTOINCREMENT sequence state.
+    """
+    after = _gather_evidence(db)
+    planned_response, pouches, goods, structures, output = _planned_make(
+        before, actor, room, verb, arg)
+    if response != planned_response:
+        raise ValueError("Craft/build response conflicts with pre-action recipe")
+    expected = {key: dict(value) for key, value in before.items()
+                if key not in ("other_world", "allocators")}
+    expected["pouches"], expected["goods"] = pouches, goods
+    valid = output is not None
+    if len(constructions) != (1 if valid and verb == "build" else 0):
+        raise ValueError("Craft/build construction provenance diverged")
+    expected_allocators = dict(before["allocators"])
+    if valid and verb == "build":
+        structure_id = expected_allocators.get("built_structures", 0) + 1
+        if constructions[0][0] != structure_id:
+            raise ValueError("Construction allocator/identity was forged")
+        structures[(structure_id,)] = (
+            structure_id, room, output[0], actor, constructions[0][1])
+        expected_allocators["built_structures"] = structure_id
+    expected["structures"] = structures
+    receipt_key = (actor, action_id)
+    if receipt_key in expected["receipts"]:
+        raise ValueError("Craft/build receipt unexpectedly preexists")
+    expected["receipts"][receipt_key] = (actor, action_id, command, response)
+    if len(emissions) != (1 if valid else 0):
+        raise ValueError("Craft/build gameplay event provenance diverged")
+    if valid:
+        new_id = expected_allocators.get("events", 0) + 1
+        if emissions[0][0] != new_id:
+            raise ValueError("Craft/build event allocator/identity was forged")
+        expected["events"][(new_id,)] = (
+            new_id, emissions[0][1], actor, room, verb,
+            json.dumps({"recipe": output[0], "output": output[1]}, sort_keys=True))
+        expected_allocators["events"] = new_id
+    # Receipt insertion happens after the domain transition; its only grant is
+    # exactly one receipt, never another event or economic row mutation.
+    for stage in (domain, after):
+        if stage["other_world"] != before["other_world"]:
+            raise ValueError("Craft/build changed ungranted world state")
+        if stage["nodes"] != before["nodes"] or stage["recipes"] != before["recipes"]:
+            raise ValueError("Craft/build changed ungranted stock/recipes")
+        for key in ("pouches", "goods", "structures", "events"):
+            if stage[key] != expected[key]:
+                raise ValueError(f"Craft/build {key} gameplay effect diverged")
+        if stage["allocators"] != expected_allocators:
+            raise ValueError("Craft/build changed ungranted ID allocation")
+    if domain["receipts"] != before["receipts"] or after["receipts"] != expected["receipts"]:
+        raise ValueError("Craft/build receipt effects diverged")
+
+
 def _verify_gather_effect(db: sqlite3.Connection, before: dict[str, dict],
                           domain: dict[str, dict],
                           *, actor: str, room: str, arg: str, action_id: str,
@@ -496,6 +597,8 @@ def perform_in_transaction(
             response = previous["response"]
         else:
             gather_before = _gather_evidence(db) if verb == "gather" else None
+            make_before = (_gather_evidence(db)
+                           if verb in ("craft", "build") else None)
             say_before = _say_evidence(db) if verb == "say" else None
             transfer_before = (_transfer_evidence(db)
                                if verb in ("go", "take", "drop") else None)
@@ -505,6 +608,7 @@ def perform_in_transaction(
             # Only the trusted domain emitter can return the exact original
             # insertion time/ID before SQLite AFTER triggers rewrite rows.
             emissions: list[tuple[int, str]] = []
+            constructions: list[tuple[int, str]] = []
             if verb in _ENGINE_ACTIONS:
                 response = engine._perform(db, actual_actor, room, verb, arg,
                                            emissions=emissions)
@@ -512,8 +616,11 @@ def perform_in_transaction(
                 response = crafting._gather(db, actual_actor, room, arg,
                                             emissions=emissions)
             else:
-                response = crafting._make(db, actual_actor, room, verb, arg)
+                response = crafting._make(db, actual_actor, room, verb, arg,
+                                          emissions=emissions,
+                                          structures=constructions)
             gather_domain = _gather_evidence(db) if gather_before is not None else None
+            make_domain = _gather_evidence(db) if make_before is not None else None
             say_domain = _say_evidence(db) if say_before is not None else None
             transfer_domain = (_transfer_evidence(db)
                                if transfer_before is not None else None)
@@ -527,6 +634,13 @@ def perform_in_transaction(
                                       room=room, arg=arg, action_id=action_id,
                                       command=command, response=response,
                                       emissions=emissions)
+            if make_before is not None:
+                _verify_make_effect(db, make_before, make_domain,
+                                    actor=actual_actor, room=room, verb=verb,
+                                    arg=arg, action_id=action_id,
+                                    command=command, response=response,
+                                    emissions=emissions,
+                                    constructions=constructions)
             if say_before is not None:
                 _verify_say_effect(db, say_before, say_domain,
                                    actor=actual_actor, room=room, arg=arg,
