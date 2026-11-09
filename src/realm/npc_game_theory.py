@@ -75,7 +75,7 @@ def choose_economic_site(
     if _connection is None:
         context = closing(sqlite3.connect(db_path.as_uri() + "?mode=ro", uri=True))
     else:
-        if type(_connection) is not sqlite3.Connection or not _connection.in_transaction:
+        if not isinstance(_connection, sqlite3.Connection) or not _connection.in_transaction:
             raise ValueError("Host must provide an open, owned SQLite transaction")
         if _connection.row_factory is not sqlite3.Row:
             raise ValueError("Host transaction must use sqlite3.Row")
@@ -192,7 +192,7 @@ def verify_economic_choice_in_transaction(
     """
     if type(choice) is not ResourceChoice or choice.status != "HOST_REVIEW_REQUIRED":
         raise ValueError("Only an original host-review-required choice may be adjudicated")
-    if type(db) is not sqlite3.Connection or not db.in_transaction:
+    if not isinstance(db, sqlite3.Connection) or not db.in_transaction:
         raise ValueError("Adjudication requires a caller-owned SQLite transaction")
     if db.row_factory is not sqlite3.Row:
         raise ValueError("Adjudication requires sqlite3.Row")

@@ -15,7 +15,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Callable, Mapping
 
-from .world_clock import DueEvent, WorldClock
+from .world_clock import DueEvent, WorldClock, _PolicyPreservingConnection
 
 
 class UnknownEventKind(RuntimeError):
@@ -55,7 +55,12 @@ def _guard_trusted_handler_transaction(db: sqlite3.Connection):
 
     try:
         if not nested:
-            db.set_authorizer(block_transaction)
+            if isinstance(db, _PolicyPreservingConnection):
+                db._push_clock_authorizer(block_transaction)
+            else:
+                # Legacy direct-dispatch test connections do not own REALM's
+                # composable host policy. Real WorldClock connections do.
+                db.set_authorizer(block_transaction)
             token = _HANDLER_GUARD.set((db, denied))
         try:
             yield
@@ -72,7 +77,10 @@ def _guard_trusted_handler_transaction(db: sqlite3.Connection):
     finally:
         if token is not None:
             _HANDLER_GUARD.reset(token)
-            db.set_authorizer(None)
+            if isinstance(db, _PolicyPreservingConnection):
+                db._pop_clock_authorizer(block_transaction)
+            else:
+                db.set_authorizer(None)
 
 
 class _TrustedRegistryDispatcher:
@@ -183,7 +191,10 @@ class _TrustedRegistryDispatcher:
         try:
             if not nested:
                 db.execute("PRAGMA query_only=ON")
-                db.set_authorizer(reject_mutation)
+                if isinstance(db, _PolicyPreservingConnection):
+                    db._push_clock_authorizer(reject_mutation)
+                else:
+                    db.set_authorizer(reject_mutation)
                 token = _FINALIZER_CONNECTION.set(db)
             for _, final in self._custodians:
                 try:
@@ -202,7 +213,10 @@ class _TrustedRegistryDispatcher:
         finally:
             if token is not None:
                 _FINALIZER_CONNECTION.reset(token)
-                db.set_authorizer(None)
+                if isinstance(db, _PolicyPreservingConnection):
+                    db._pop_clock_authorizer(reject_mutation)
+                else:
+                    db.set_authorizer(None)
                 db.execute("PRAGMA query_only=ON" if previous else "PRAGMA query_only=OFF")
 
 
