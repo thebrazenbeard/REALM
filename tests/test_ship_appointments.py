@@ -104,6 +104,38 @@ class ShipAppointmentTests(unittest.TestCase):
         self.roles.grant("Rin_Wolf", "trader_7", "first_officer")
         self.assertEqual("First Officer Rin Wolf",
                          self.roles.label("Rin_Wolf", trusted_ship_id="trader_7"))
+    def test_leading_quoted_and_confusable_rank_spoofs_are_neutralized(self):
+        profiles = PlayerProfileStore(self.engine)
+        spoofed = (
+            "“Capt. Rin Wolf”",
+            "“First Officer Rin Wolf”",
+            "’Capt. Rin Wolf’",
+            "- Capt. Rin Wolf",
+            ". First Officer Rin Wolf",
+            "Ｃａｐｔ. Rin Wolf",
+            "Сapt. Rin Wolf",  # Cyrillic Es visually resembles Latin C.
+            "Cᴀᴘᴛ. Rin Wolf",
+            "Fiгst Officer Rin Wolf",  # Cyrillic Ghe in the title.
+            "“Capt. First Officer Rin Wolf”",
+        )
+        for label in spoofed:
+            with self.subTest(label=label):
+                profiles.set("Rin_Wolf", label)
+                self.assertIsNone(self.roles.role("Rin_Wolf", "trader_7"))
+                self.assertEqual("Rin Wolf", self.roles.label("Rin_Wolf"))
+        self.roles.grant("Rin_Wolf", "trader_7", "first_officer")
+        for label in spoofed:
+            with self.subTest(active_label=label):
+                profiles.set("Rin_Wolf", label)
+                self.assertEqual("First Officer Rin Wolf",
+                                 self.roles.label("Rin_Wolf", trusted_ship_id="trader_7"))
+
+    def test_normal_quoted_names_and_non_rank_words_preserved(self):
+        profiles = PlayerProfileStore(self.engine)
+        for label in ("“Rin Wolf”", "Captaincy Rin", "First Officerly Rin"):
+            with self.subTest(label=label):
+                profiles.set("Rin_Wolf", label)
+                self.assertEqual(label, self.roles.label("Rin_Wolf"))
 
 
 if __name__ == "__main__":

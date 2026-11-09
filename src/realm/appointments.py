@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import re
 import sqlite3
+import unicodedata
 from contextlib import closing
 from datetime import datetime, timezone
 
@@ -18,7 +19,17 @@ from .profiles import PlayerProfileStore
 
 _SHIP_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_-]{0,47}$")
 _ROLE_TITLE = {"captain": "Capt.", "first_officer": "First Officer"}
-_RESERVED_PREFIX = re.compile(r"^(?:capt(?:ain)?\.?|first officer) +", re.IGNORECASE)
+_RESERVED_PREFIX = re.compile(
+    r"^(?:(?:capt(?:ain)?\.?|first[ -]+officer)(?: +|$)|capt(?:ain)?\.)"
+)
+# Common Unicode title lookalikes; this is *not* a complete confusables database.
+_TITLE_LOOKALIKES = str.maketrans(
+    {"с": "c", "ϲ": "c", "а": "a", "ɑ": "a", "р": "p", "т": "t",
+     "і": "i", "ι": "i", "о": "o", "ο": "o", "е": "e", "ε": "e",
+     "ѕ": "s", "ғ": "f", "һ": "h", "н": "h", "г": "r",
+     "ᴀ": "a", "ᴄ": "c", "ᴘ": "p", "ᴛ": "t", "ɪ": "i",
+     "ᴏ": "o", "ᴇ": "e", "ꜰ": "f", "ꜱ": "s", "ʜ": "h", "ʀ": "r", "ɴ": "n"}
+)
 _APPOINTMENT_SQL = """
 CREATE TABLE IF NOT EXISTS ship_appointments (
     ship_id TEXT NOT NULL COLLATE NOCASE,
@@ -45,10 +56,28 @@ def _ship(ship_id: str) -> str:
     return ship_id.lower()
 
 
+def _rank_prefix_end(value: str) -> int | None:
+    """Match title-shaped text through quotes, compatibility forms and lookalikes."""
+    offset = 0
+    while offset < len(value) and (
+        unicodedata.category(value[offset]).startswith("P") or value[offset].isspace()
+    ):
+        offset += 1
+    folded, ends = [], []
+    for index, char in enumerate(value[offset:], start=offset):
+        # Keep offsets into original text even if NFKD expands one character.
+        for unit in unicodedata.normalize("NFKD", char).casefold():
+            if not unicodedata.combining(unit):
+                folded.append(unit.translate(_TITLE_LOOKALIKES))
+                ends.append(index + 1)
+    matched = _RESERVED_PREFIX.match("".join(folded))
+    return ends[matched.end() - 1] if matched else None
+
+
 def _clean_role_prefix(display_name: str, player_name: str) -> str:
-    """Do not let an inherited display string counterfeit a title prefix."""
-    while match := _RESERVED_PREFIX.match(display_name):
-        display_name = display_name[match.end():].strip()
+    """Render title-like profile prefixes inert; rank must come from appointment."""
+    while (end := _rank_prefix_end(display_name)) is not None:
+        display_name = display_name[end:].strip().strip("'’“”")
     return display_name or player_name
 
 
