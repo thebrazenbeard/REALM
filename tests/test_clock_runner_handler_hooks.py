@@ -97,6 +97,132 @@ class ClockRunnerHookTests(unittest.TestCase):
                   for i, kind in enumerate(kinds, start=1)]
         return HookAwareClockSpy(self.db, events, read_only_before=read_only_before)
 
+    def test_live_registered_handler_cannot_escape_world_transaction(self):
+        for operation in ("commit", "rollback", "commit_then_begin",
+                          "rollback_then_begin", "sql_commit", "sql_rollback"):
+            with self.subTest(operation=operation):
+                # Each adversarial variant starts from the same durable world
+                # even when a deliberately broken predecessor leaked COMMIT.
+                with closing(sqlite3.connect(self.db)) as baseline:
+                    baseline.execute("UPDATE main.world_meta SET value='hook_test' "
+                                     "WHERE key='world_id'")
+                    baseline.commit()
+                event_id = "handler_escape_" + operation
+                clock = WorldClock(self.db)
+                clock.schedule(event_id, due_at=NOW, kind="trusted_escape", payload={})
+
+                def escaping(db, event):
+                    db.execute("UPDATE main.world_meta SET value='escaped' "
+                               "WHERE key='world_id'")
+                    if operation.startswith("sql_"):
+                        db.execute(operation.removeprefix("sql_").upper())
+                    else:
+                        getattr(db, operation.split("_then_")[0])()
+                    if operation.endswith("_then_begin"):
+                        db.execute("BEGIN IMMEDIATE")
+                    raise RuntimeError("injected after forbidden transaction control")
+
+                with self.assertRaisesRegex(RuntimeError, "transaction control"):
+                    run_foreground(clock, {"trusted_escape": escaping}, pulses=1,
+                                   now=lambda: NOW)
+                with closing(sqlite3.connect(self.db)) as db:
+                    self.assertEqual("hook_test", db.execute(
+                        "SELECT value FROM world_meta WHERE key='world_id'").fetchone()[0])
+                    self.assertIsNone(db.execute(
+                        "SELECT processed_utc FROM clock_events WHERE event_id=?",
+                        (event_id,)).fetchone()[0])
+
+    def test_live_preparation_hook_cannot_commit_without_utc_receipt(self):
+        class EscapingPreparation:
+            def begin_host_tick(self, db, due_events):
+                db.execute("UPDATE main.world_meta SET value='precommitted' "
+                           "WHERE key='world_id'")
+                db.commit()
+                db.execute("BEGIN IMMEDIATE")
+
+            def __call__(self, db, event):
+                return event.event_id
+
+            def verify_final_precommit(self, db, processed):
+                return None
+
+        clock = WorldClock(self.db)
+        clock.schedule("preparation_escape", due_at=NOW, kind="escape", payload={})
+        with self.assertRaisesRegex(RuntimeError, "transaction control"):
+            run_foreground(clock, {"escape": EscapingPreparation()}, pulses=1,
+                           now=lambda: NOW)
+        with closing(sqlite3.connect(self.db)) as db:
+            self.assertEqual("hook_test", db.execute(
+                "SELECT value FROM world_meta WHERE key='world_id'").fetchone()[0])
+            self.assertIsNone(db.execute(
+                "SELECT processed_utc FROM clock_events "
+                "WHERE event_id='preparation_escape'").fetchone()[0])
+
+    def test_live_nested_savepoints_remain_allowed(self):
+        clock = WorldClock(self.db)
+        clock.schedule("safe_nested_savepoint", due_at=NOW,
+                       kind="savepoint", payload={})
+
+        def scoped(db, event):
+            db.execute("SAVEPOINT realm_scoped_gameplay")
+            db.execute("UPDATE main.world_meta SET value='safe_scoped' "
+                       "WHERE key='world_id'")
+            db.execute("RELEASE SAVEPOINT realm_scoped_gameplay")
+            return event.event_id
+
+        report = run_foreground(clock, {"savepoint": scoped}, pulses=1,
+                                now=lambda: NOW)
+        self.assertEqual(("safe_nested_savepoint",), report.event_ids)
+        with closing(sqlite3.connect(self.db)) as db:
+            self.assertEqual("safe_scoped", db.execute(
+                "SELECT value FROM world_meta WHERE key='world_id'").fetchone()[0])
+            self.assertIsNotNone(db.execute(
+                "SELECT processed_utc FROM clock_events "
+                "WHERE event_id='safe_nested_savepoint'").fetchone()[0])
+
+    def test_swallowed_transaction_denial_still_rejects_entire_tick(self):
+        clock = WorldClock(self.db)
+        clock.schedule("swallowed_commit", due_at=NOW, kind="swallower", payload={})
+
+        def swallower(db, event):
+            db.execute("UPDATE main.world_meta SET value='should_rollback' "
+                       "WHERE key='world_id'")
+            try:
+                db.commit()
+            except sqlite3.DatabaseError:
+                pass
+            return event.event_id
+
+        with self.assertRaisesRegex(RuntimeError, "transaction control"):
+            run_foreground(clock, {"swallower": swallower}, pulses=1,
+                           now=lambda: NOW)
+        with closing(sqlite3.connect(self.db)) as db:
+            self.assertEqual("hook_test", db.execute(
+                "SELECT value FROM world_meta WHERE key='world_id'").fetchone()[0])
+            self.assertIsNone(db.execute(
+                "SELECT processed_utc FROM clock_events "
+                "WHERE event_id='swallowed_commit'").fetchone()[0])
+
+    def test_executescript_implicit_commit_is_denied_before_execution(self):
+        clock = WorldClock(self.db)
+        clock.schedule("script_escape", due_at=NOW, kind="script", payload={})
+
+        def script(db, event):
+            db.execute("UPDATE main.world_meta SET value='should_rollback' "
+                       "WHERE key='world_id'")
+            db.executescript("SELECT 1;")
+            return event.event_id
+
+        with self.assertRaisesRegex(RuntimeError, "transaction control"):
+            run_foreground(clock, {"script": script}, pulses=1,
+                           now=lambda: NOW)
+        with closing(sqlite3.connect(self.db)) as db:
+            self.assertEqual("hook_test", db.execute(
+                "SELECT value FROM world_meta WHERE key='world_id'").fetchone()[0])
+            self.assertIsNone(db.execute(
+                "SELECT processed_utc FROM clock_events "
+                "WHERE event_id='script_escape'").fetchone()[0])
+
     def test_finalizer_cannot_rollback_owner_transaction(self):
         # A native SQLite transaction, not the protocol-spy fake clock. The
         # combined #137 WorldClock path receives its own independent probe.

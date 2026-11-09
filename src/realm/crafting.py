@@ -13,7 +13,7 @@ from __future__ import annotations
 import json
 import re
 import sqlite3
-from contextlib import contextmanager
+from contextlib import closing, contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Mapping
@@ -221,7 +221,8 @@ class Crafting:
                 )
             return response
 
-    def _gather(self, db: sqlite3.Connection, actor: str, room: str, arg: str) -> str:
+    def _gather(self, db: sqlite3.Connection, actor: str, room: str, arg: str,
+                *, emissions: list[tuple[int, str]] | None = None) -> str:
         if not arg:
             nodes = db.execute(
                 "SELECT material,remaining FROM gathering_nodes WHERE room_id=? ORDER BY material", (room,)
@@ -255,7 +256,8 @@ class Crafting:
             "INSERT INTO material_pouches VALUES (?,?,?) ON CONFLICT(actor,material) DO UPDATE SET quantity=quantity+excluded.quantity",
             (actor, material, amount),
         )
-        self._event(db, actor, room, "gather", {"material": material, "amount": amount})
+        self._event(db, actor, room, "gather", {"material": material, "amount": amount},
+                    emissions=emissions)
         return f"You gather {material} x{amount}."
 
     def _make(self, db: sqlite3.Connection, actor: str, room: str, kind: str, arg: str) -> str:
@@ -302,8 +304,17 @@ class Crafting:
         return response
 
     @staticmethod
-    def _event(db: sqlite3.Connection, actor: str, room: str, kind: str, payload: dict) -> None:
-        db.execute(
-            "INSERT INTO events (occurred_at,actor,room_id,kind,payload_json) VALUES (?,?,?,?,?)",
-            (_now(), actor, room, kind, json.dumps(payload, sort_keys=True)),
-        )
+    def _event(db: sqlite3.Connection, actor: str, room: str, kind: str,
+               payload: dict, *, emissions: list[tuple[int, str]] | None = None) -> None:
+        values = (_now(), actor, room, kind, json.dumps(payload, sort_keys=True))
+        sql = "INSERT INTO events (occurred_at,actor,room_id,kind,payload_json) VALUES (?,?,?,?,?)"
+        if emissions is None:
+            db.execute(sql, values)
+        else:
+            # The RETURNING tuple is the original outer insert, unaffected by
+            # AFTER INSERT triggers that can rewrite durable event timestamps.
+            with closing(db.execute(sql + " RETURNING id,occurred_at", values)) as cursor:
+                emitted = cursor.fetchone()
+            if emitted is None:
+                raise ValueError("Gather emitter did not return its inserted row")
+            emissions.append((emitted[0], emitted[1]))

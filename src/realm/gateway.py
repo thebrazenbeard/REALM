@@ -28,13 +28,24 @@ from .scoped_credentials import CredentialStateError, ScopedCredentialStore
 MAX_BODY_BYTES = 4096
 MAX_FEED_EVENTS = 100
 _WORLD_ID = re.compile(r"^[A-Za-z][A-Za-z0-9_-]{0,63}$")
-_GEOGRAPHY_SCHEMA_OBJECTS = frozenset({
-    "geo_places", "geo_maps", "geo_links", "geo_ships",
-    "geo_ship_events", "geo_ship_receipts", "idx_geo_parent",
-})
-_SHIP_CLOCK_SCHEMA_OBJECTS = frozenset({
-    "clock_events", "idx_clock_due", "clock_state", "npc_roster_utc_attestations",
-})
+_GEOGRAPHY_COLUMNS = {
+    "geo_places": frozenset(("id", "name", "kind", "parent_id", "x", "y")),
+    "geo_maps": frozenset(("space_id", "width", "height", "rows_json")),
+    "geo_links": frozenset(("origin", "destination", "mode", "seconds")),
+    "geo_ships": frozenset(("id", "name", "owner", "planet_id", "destination", "arrival_at")),
+    "geo_ship_events": frozenset(("id", "occurred_at", "ship_id", "actor", "kind", "payload_json")),
+    "geo_ship_receipts": frozenset(("ship_id", "actor", "action_id", "command", "response_json")),
+}
+_GEOGRAPHY_INDEXES = {"idx_geo_parent": ("parent_id",)}
+_SHIP_CLOCK_COLUMNS = {
+    "clock_events": frozenset(("event_id", "due_utc", "kind", "payload_json", "processed_utc")),
+    "clock_state": frozenset(("id", "last_utc")),
+    "npc_roster_utc_attestations": frozenset((
+        "event_id", "world_id", "policy_id", "due_utc", "outcome_sha256",
+        "grant_mac_hex", "execution_mac_hex",
+    )),
+}
+_SHIP_CLOCK_INDEXES = {"idx_clock_due": ("due_utc", "event_id")}
 
 
 class ShipAccessDenied(PermissionError):
@@ -141,11 +152,10 @@ class Gateway:
         # install ship schema *before* its disabled-clock denial. Preflight the
         # already-enabled host subsystems through a query-only connection.
         with closing(self._read()) as db:
-            schema = self._schema_objects(db)
-        if not _SHIP_CLOCK_SCHEMA_OBJECTS.issubset(schema):
-            raise RuntimeError("Ship world clock is not enabled")
-        if not _GEOGRAPHY_SCHEMA_OBJECTS.issubset(schema):
-            raise RuntimeError("Ship geography is not configured")
+            if not self._schema_shape_ready(db, _SHIP_CLOCK_COLUMNS, _SHIP_CLOCK_INDEXES):
+                raise RuntimeError("Ship world clock is not enabled or its schema is incomplete")
+            if not self._schema_shape_ready(db, _GEOGRAPHY_COLUMNS, _GEOGRAPHY_INDEXES):
+                raise RuntimeError("Ship geography is not configured or its schema is incomplete")
         from .ship_command_auth import AuthenticatedShipCommands
         from .world_clock import WorldClock
         pilot = AuthenticatedShipCommands(self, WorldClock(self.engine.db_path))
@@ -184,8 +194,8 @@ class Gateway:
             # The same optional-schema boundary applies to this read. Missing
             # or partially installed geography means there is no owner ship
             # entitlement; never query absent tables or install them on GET.
-            if joined is None or not _GEOGRAPHY_SCHEMA_OBJECTS.issubset(
-                    self._schema_objects(db)):
+            if joined is None or not self._schema_shape_ready(
+                    db, _GEOGRAPHY_COLUMNS, _GEOGRAPHY_INDEXES):
                 raise ShipAccessDenied("Ship is not owned by the authenticated pilot")
             ship = db.execute(
                 "SELECT owner FROM main.geo_ships WHERE id=?", (ship_id,)
@@ -293,11 +303,30 @@ class Gateway:
         return conn
 
     @staticmethod
-    def _schema_objects(db: sqlite3.Connection) -> frozenset[str]:
-        """Inspect optional host schema without DDL or writer authority."""
-        return frozenset(row["name"] for row in db.execute(
-            "SELECT name FROM main.sqlite_master WHERE type IN ('table','index')"
-        ))
+    def _schema_shape_ready(db: sqlite3.Connection, columns: dict, indexes: dict) -> bool:
+        """Bounded read-only optional subsystem shape check, not a schema migration.
+
+        Names alone are insufficient: host DDL may leave a named but malformed
+        table, which would otherwise close the HTTP socket on a missing column.
+        These are runtime-required columns/indexes, not full SQLite constraint
+        or privileged-host tamper attestation.
+        """
+        kinds = {row["name"]: row["type"] for row in db.execute(
+            "SELECT name,type FROM main.sqlite_master WHERE type IN ('table','index')"
+        )}
+        for name, required in columns.items():
+            if kinds.get(name) != "table":
+                return False
+            actual = {row["name"] for row in db.execute(f'PRAGMA main.table_info("{name}")')}
+            if not required.issubset(actual):
+                return False
+        for name, required in indexes.items():
+            if kinds.get(name) != "index":
+                return False
+            actual = tuple(row["name"] for row in db.execute(f'PRAGMA main.index_info("{name}")'))
+            if actual != required:
+                return False
+        return True
 
     def cursor(self) -> int:
         db = self._read()
@@ -346,7 +375,7 @@ class Gateway:
             # asked for an unconfigured map. Require an already complete
             # explicitly installed geography schema before accessing the
             # lazily cached host geography object.
-            if not _GEOGRAPHY_SCHEMA_OBJECTS.issubset(self._schema_objects(db)):
+            if not self._schema_shape_ready(db, _GEOGRAPHY_COLUMNS, _GEOGRAPHY_INDEXES):
                 raise MapUnavailable("No map is configured for this location")
         finally:
             db.close()

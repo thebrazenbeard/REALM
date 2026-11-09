@@ -156,11 +156,21 @@ class Engine:
     def _now() -> str:
         return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
-    def _event(self, db: sqlite3.Connection, actor: str, room: str, kind: str, payload: dict) -> None:
-        db.execute(
-            "INSERT INTO events (occurred_at,actor,room_id,kind,payload_json) VALUES (?,?,?,?,?)",
-            (self._now(), actor, room, kind, json.dumps(payload, sort_keys=True)),
-        )
+    def _event(self, db: sqlite3.Connection, actor: str, room: str, kind: str,
+               payload: dict, *, emissions: list[tuple[int, str]] | None = None) -> None:
+        values = (self._now(), actor, room, kind, json.dumps(payload, sort_keys=True))
+        sql = "INSERT INTO events (occurred_at,actor,room_id,kind,payload_json) VALUES (?,?,?,?,?)"
+        if emissions is None:
+            db.execute(sql, values)
+        else:
+            # RETURNING exposes the actual outer INSERT's tuple, prior to any
+            # installed AFTER trigger rewriting it. Never infer original time
+            # from the subsequently mutated events table or wall-clock range.
+            with closing(db.execute(sql + " RETURNING id,occurred_at", values)) as cursor:
+                emitted = cursor.fetchone()
+            if emitted is None:
+                raise ValueError("Event emitter did not return its inserted row")
+            emissions.append((emitted[0], emitted[1]))
 
     def join(self, name: str, *, writer_guard: Callable[[sqlite3.Connection], None] | None = None) -> str:
         if not _PLAYER_RE.fullmatch(name):
@@ -250,7 +260,8 @@ class Engine:
                 )
             return response
 
-    def _perform(self, db: sqlite3.Connection, actor: str, room_id: str, verb: str, arg: str) -> str:
+    def _perform(self, db: sqlite3.Connection, actor: str, room_id: str, verb: str,
+                 arg: str, *, emissions: list[tuple[int, str]] | None = None) -> str:
             if verb in {"look", "l"}:
                 return self._look(db, room_id, actor)
             if verb in {"where", "location"}:
@@ -263,8 +274,10 @@ class Engine:
                 db.execute("UPDATE players SET room_id=? WHERE id=?", (dest[0], actor))
                 # One transaction records both audiences: people left behind
                 # learn about departure; destination occupants see arrival.
-                self._event(db, actor, room_id, "leave", {"to": dest[0], "direction": direction})
-                self._event(db, actor, dest[0], "move", {"from": room_id, "direction": direction})
+                self._event(db, actor, room_id, "leave", {"to": dest[0], "direction": direction},
+                            emissions=emissions)
+                self._event(db, actor, dest[0], "move", {"from": room_id, "direction": direction},
+                            emissions=emissions)
                 return self._look(db, dest[0], actor)
             if verb in {"inventory", "inv", "i"}:
                 held = db.execute("SELECT name FROM items WHERE held_by=? ORDER BY id", (actor,)).fetchall()
@@ -284,7 +297,8 @@ class Engine:
                 )
                 if updated.rowcount != 1:
                     return "Someone else took that item first."
-                self._event(db, actor, room_id, "take", {"item": item["id"]})
+                self._event(db, actor, room_id, "take", {"item": item["id"]},
+                            emissions=emissions)
                 return f"You take {item['name']}."
             if verb == "drop":
                 if not arg:
@@ -296,7 +310,8 @@ class Engine:
                 if item is None:
                     return "You are not carrying that item."
                 db.execute("UPDATE items SET held_by=NULL,room_id=? WHERE id=? AND held_by=?", (room_id, item["id"], actor))
-                self._event(db, actor, room_id, "drop", {"item": item["id"]})
+                self._event(db, actor, room_id, "drop", {"item": item["id"]},
+                            emissions=emissions)
                 return f"You drop {item['name']}."
             if verb == "who":
                 people = db.execute("SELECT id FROM players ORDER BY id COLLATE NOCASE").fetchall()
@@ -307,7 +322,8 @@ class Engine:
                     return "Say what?"
                 if len(message) > 280:
                     return "Messages must be 280 characters or fewer."
-                self._event(db, actor, room_id, "say", {"text": message})
+                self._event(db, actor, room_id, "say", {"text": message},
+                            emissions=emissions)
                 return f"You say: {message}"
             if verb in {"history", "listen"}:
                 if arg and (not arg.isdigit() or not 1 <= int(arg) <= 50):
