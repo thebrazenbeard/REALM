@@ -7,6 +7,7 @@ No process starts at import, no OS schedule/service, network or model inference.
 from __future__ import annotations
 
 import math
+import sqlite3
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -57,8 +58,29 @@ class _TrustedRegistryDispatcher:
         return handler(db, event)
 
     def verify_final_precommit(self, db, processed: tuple[DueEvent, ...]) -> None:
-        for _, final in self._custodians:
-            final(db, processed)
+        # A later registered custodian must not mutate SQLite after an earlier
+        # custodian's successful final attestation. WorldClock calls this hook
+        # after its own receipt/effect checks, so any extra DML here could
+        # otherwise yield a durable false UTC ACK. Scope query_only to the
+        # entire finalizer phase and restore its prior setting even on failure.
+        previous = db.execute("PRAGMA query_only").fetchone()[0]
+        changes_before = db.total_changes
+        try:
+            db.execute("PRAGMA query_only=ON")
+            for _, final in self._custodians:
+                try:
+                    final(db, processed)
+                except sqlite3.OperationalError as exc:
+                    if exc.sqlite_errorcode == sqlite3.SQLITE_READONLY:
+                        raise RuntimeError("Host UTC finalizers must remain read-only") from exc
+                    raise
+                # A trusted callback could itself toggle query_only. Do not
+                # silently accept any committed DML during final attestation.
+                if (db.total_changes != changes_before
+                        or db.execute("PRAGMA query_only").fetchone()[0] != 1):
+                    raise RuntimeError("Host UTC finalizers must remain read-only")
+        finally:
+            db.execute("PRAGMA query_only=ON" if previous else "PRAGMA query_only=OFF")
 
 
 @dataclass(frozen=True)
