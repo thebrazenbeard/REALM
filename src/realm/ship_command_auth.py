@@ -21,6 +21,7 @@ from .auth import CredentialStore
 from .gateway import Gateway
 from .scoped_credentials import CredentialStateError
 from .ship_clock_dispatch import depart_and_schedule_in_transaction
+from .ship_gateway_authority import GatewayShipAuthorityCustody
 from .ship_history_custody import ShipHistoryCustody
 from .world_clock import DueEvent, WorldClock
 
@@ -87,6 +88,7 @@ class AuthenticatedShipCommands:
         # Bound complete persistent ship history before credential, roster,
         # clock and departure work in this writer transaction.
         custody = ShipHistoryCustody(db)
+        authority = GatewayShipAuthorityCustody(db, scoped=scoped)
         if (not isinstance(bearer_token, str) or
                 not 16 <= len(bearer_token) <= 255 or not bearer_token.isascii()):
             raise PermissionError("Invalid or revoked ship command credential")
@@ -169,4 +171,8 @@ class AuthenticatedShipCommands:
                 ),
             )
             custody.before_commit(db)
+        # Final read-only snapshot proves this authenticated POST did not also
+        # rebind world identity, mutate credential permissions, alter earlier
+        # UTC receipts, or enqueue a second forged deadline through triggers.
+        authority.verify(db, departure=departure, replay=prior_receipt is not None)
         return {"principal": actor, **departure}

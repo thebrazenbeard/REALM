@@ -154,6 +154,19 @@ to write after `depart_in_transaction` returns, standalone host Geography
 methods and out-of-band privileged SQL do not use this guard, and a later
 whole-file rollback still lacks an external witness.
 
+The scoped departure writer separately snapshots **world/credential/clock
+authority** before authorization: all `world_meta` rows, scheduler queue and
+UTC watermark, roster attestations, player identity/credential tables, and
+scoped credential guard/capability rows. The only permitted queue change is
+the departure's exact new pending `ship_arrival` (or no change on replay).
+Privileged installed triggers cannot silently rebind `world_id`, grant another
+player a capability, revoke a credential, rewrite an earlier clock receipt or
+add an ungranted second deadline while returning successful HTTP departure;
+these mutations reject and roll back the request. The separate room event
+ledger still allows unrelated `say` records. This is an authenticated ship
+writer postcondition, not a universal attestation of every gameplay table or
+of privileged external database activity after commit.
+
 Each event is `{id,kind,actor,text,room,at}`. Movement creates a `leave` event
 in the source room and a `move` (arrival) event in the destination in one
 transaction. The feed is **polling**, not
