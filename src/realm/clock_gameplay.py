@@ -182,7 +182,8 @@ def _planned_transfer(db: sqlite3.Connection, before: dict, engine: Engine,
 
 def _verify_transfer_effect(db: sqlite3.Connection, before: dict, domain: dict,
                             *, plan: tuple, actor: str, action_id: str,
-                            command: str, response: str) -> None:
+                            command: str, response: str,
+                            emissions: list[tuple[int, str]]) -> None:
     """Attest typed row/event/receipt/allocator effects before UTC ACK.
 
     Other selected trusted handlers may emit unrelated events between calls;
@@ -212,16 +213,17 @@ def _verify_transfer_effect(db: sqlite3.Connection, before: dict, domain: dict,
     added = [row for key, row in domain["events"].items()
              if key not in before["events"]]
     added.sort(key=lambda row: row[0])
-    if len(added) != len(expected_events):
+    if len(added) != len(expected_events) or len(emissions) != len(expected_events):
         raise ValueError("Host action emitted ungranted gameplay events")
     allocator = before["allocators"].get("events", 0)
     for offset, (row, (source_actor, room, kind, payload)) in enumerate(
         zip(added, expected_events), 1
     ):
-        if (row[0] != allocator + offset
+        if (row[0:2] != emissions[offset - 1]
+                or row[0] != allocator + offset
                 or row[2:6] != (source_actor, room, kind,
                                    json.dumps(payload, sort_keys=True))):
-            raise ValueError("Host action history is not bound to its typed grant")
+            raise ValueError("Host action event timestamp/history is not bound to its typed grant")
     expected_allocators = dict(before["allocators"])
     if added:
         expected_allocators["events"] = allocator + len(added)
@@ -252,7 +254,8 @@ def _expected_gather(nodes: dict, room: str, arg: str):
 def _verify_gather_effect(db: sqlite3.Connection, before: dict[str, dict],
                           domain: dict[str, dict],
                           *, actor: str, room: str, arg: str, action_id: str,
-                          command: str, response: str) -> None:
+                          command: str, response: str,
+                          emissions: list[tuple[int, str]]) -> None:
     """A legacy gather grants only typed stock→pouch→event→receipt deltas.
 
     The realm clock's older host_action callback may be followed by installed
@@ -310,7 +313,8 @@ def _verify_gather_effect(db: sqlite3.Connection, before: dict[str, dict],
     # No new non-gather rows are permitted within the direct typed gather
     # domain, including privileged triggers fired by Crafting._gather itself.
     new_gathers = list(new_events.values())
-    if (any(row[0] <= max((key[0] for key in old_event_ids), default=0)
+    if (len(emissions) != (1 if planned else 0)
+            or any(row[0] <= max((key[0] for key in old_event_ids), default=0)
             for row in new_events.values())
             or len(new_gathers) != (1 if planned else 0)
             or any(row[4] != "gather" for row in new_gathers)):
@@ -332,10 +336,11 @@ def _verify_gather_effect(db: sqlite3.Connection, before: dict[str, dict],
         expected["pouches"][(actor, material)] = (
             actor, material, (previous[2] if previous else 0) + amount)
         event = new_gathers[0]
-        if (event[2:5] != (actor, room, "gather")
+        if (event[0:2] != emissions[0]
+                or event[2:5] != (actor, room, "gather")
                 or event[5] != json.dumps({"material": material, "amount": amount},
                                          sort_keys=True)):
-            raise ValueError("Gather history is not bound to the actual stock grant")
+            raise ValueError("Gather timestamp/history is not bound to the actual stock grant")
     for name in ("nodes", "pouches", "goods", "structures", "recipes", "receipts"):
         if after[name] != expected[name]:
             raise ValueError("Gather economic/receipt effect diverged")
@@ -344,7 +349,7 @@ def _verify_gather_effect(db: sqlite3.Connection, before: dict[str, dict],
 def _verify_say_effect(db: sqlite3.Connection, before: dict[str, dict],
                        domain: dict[str, dict], *, actor: str, room: str,
                        arg: str, action_id: str, command: str, response: str,
-                       emitted_id: int) -> None:
+                       emissions: list[tuple[int, str]]) -> None:
     """A typed host `say` grants one exact speech event and one action receipt.
 
     Privileged SQLite event/receipt triggers must not impersonate another
@@ -380,15 +385,15 @@ def _verify_say_effect(db: sqlite3.Connection, before: dict[str, dict],
         raise ValueError("Say response differs from authorized text")
     additions = [row for key, row in domain["events"].items()
                  if key not in before["events"]]
-    if len(additions) != (1 if valid else 0):
+    if len(additions) != (1 if valid else 0) or len(emissions) != (1 if valid else 0):
         raise ValueError("Say produced ungranted gameplay event history")
     if valid:
         row = additions[0]
         prior_id = max((key[0] for key in before["events"]), default=0)
-        if (row[0] != emitted_id or row[0] <= prior_id
+        if (row[0:2] != emissions[0] or row[0] <= prior_id
                 or row[2:6] != (actor, room, "say",
                                    json.dumps({"text": message}, sort_keys=True))):
-            raise ValueError("Say history is not bound to the typed speaker/action")
+            raise ValueError("Say timestamp/history is not bound to the typed speaker/action")
 
     expected_allocators = dict(before["allocators"])
     if additions:
@@ -497,18 +502,21 @@ def perform_in_transaction(
             transfer_plan = (_planned_transfer(db, transfer_before, engine,
                                                actual_actor, room, verb, arg)
                              if transfer_before is not None else None)
+            # Only the trusted domain emitter can return the exact original
+            # insertion time/ID before SQLite AFTER triggers rewrite rows.
+            emissions: list[tuple[int, str]] = []
             if verb in _ENGINE_ACTIONS:
-                response = engine._perform(db, actual_actor, room, verb, arg)
+                response = engine._perform(db, actual_actor, room, verb, arg,
+                                           emissions=emissions)
             elif verb == "gather":
-                response = crafting._gather(db, actual_actor, room, arg)
+                response = crafting._gather(db, actual_actor, room, arg,
+                                            emissions=emissions)
             else:
                 response = crafting._make(db, actual_actor, room, verb, arg)
             gather_domain = _gather_evidence(db) if gather_before is not None else None
             say_domain = _say_evidence(db) if say_before is not None else None
             transfer_domain = (_transfer_evidence(db)
                                if transfer_before is not None else None)
-            say_emitted_id = (db.execute("SELECT last_insert_rowid()").fetchone()[0]
-                              if say_before is not None else 0)
             db.execute(
                 "INSERT INTO main.action_receipts(actor,action_id,command,response) VALUES(?,?,?,?)",
                 (actual_actor, action_id, command, response),
@@ -517,17 +525,18 @@ def perform_in_transaction(
                 _verify_gather_effect(db, gather_before, gather_domain,
                                       actor=actual_actor,
                                       room=room, arg=arg, action_id=action_id,
-                                      command=command, response=response)
+                                      command=command, response=response,
+                                      emissions=emissions)
             if say_before is not None:
                 _verify_say_effect(db, say_before, say_domain,
                                    actor=actual_actor, room=room, arg=arg,
                                    action_id=action_id, command=command,
-                                   response=response, emitted_id=say_emitted_id)
+                                   response=response, emissions=emissions)
             if transfer_before is not None:
                 _verify_transfer_effect(db, transfer_before, transfer_domain,
                                         plan=transfer_plan, actor=actual_actor,
                                         action_id=action_id, command=command,
-                                        response=response)
+                                        response=response, emissions=emissions)
     except BaseException:
         db.execute("ROLLBACK TO SAVEPOINT realm_clock_gameplay")
         db.execute("RELEASE SAVEPOINT realm_clock_gameplay")
