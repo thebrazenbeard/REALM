@@ -260,7 +260,9 @@ class Crafting:
                     emissions=emissions)
         return f"You gather {material} x{amount}."
 
-    def _make(self, db: sqlite3.Connection, actor: str, room: str, kind: str, arg: str) -> str:
+    def _make(self, db: sqlite3.Connection, actor: str, room: str, kind: str, arg: str,
+              *, emissions: list[tuple[int, str]] | None = None,
+              structures: list[tuple[int, str]] | None = None) -> str:
         if not arg:
             return f"{kind.capitalize()} what? Type 'recipes' for options."
         recipe = db.execute("SELECT * FROM craft_recipes WHERE id=? AND kind=?", (arg.lower(), kind)).fetchone()
@@ -295,12 +297,21 @@ class Crafting:
             )
             response = f"You craft {recipe['output']} x{recipe['output_count']}."
         else:
-            db.execute(
-                "INSERT INTO built_structures (room_id,recipe,owner,constructed_at) VALUES (?,?,?,?)",
-                (room, recipe["id"], actor, _now()),
-            )
+            sql = "INSERT INTO built_structures (room_id,recipe,owner,constructed_at) VALUES (?,?,?,?)"
+            values = (room, recipe["id"], actor, _now())
+            if structures is None:
+                db.execute(sql, values)
+            else:
+                # Preserve the outer emitter's original identity/time before
+                # any host-installed AFTER INSERT trigger can rewrite it.
+                with closing(db.execute(sql + " RETURNING id,constructed_at", values)) as cursor:
+                    original = cursor.fetchone()
+                if original is None:
+                    raise ValueError("Construction emitter did not return its row")
+                structures.append((original[0], original[1]))
             response = f"You build {recipe['output']} here."
-        self._event(db, actor, room, kind, {"recipe": recipe["id"], "output": recipe["output"]})
+        self._event(db, actor, room, kind, {"recipe": recipe["id"], "output": recipe["output"]},
+                    emissions=emissions)
         return response
 
     @staticmethod
