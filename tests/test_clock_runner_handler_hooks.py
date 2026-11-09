@@ -97,6 +97,61 @@ class ClockRunnerHookTests(unittest.TestCase):
                   for i, kind in enumerate(kinds, start=1)]
         return HookAwareClockSpy(self.db, events, read_only_before=read_only_before)
 
+    def test_finalizer_cannot_rollback_owner_transaction(self):
+        # A native SQLite transaction, not the protocol-spy fake clock. The
+        # combined #137 WorldClock path receives its own independent probe.
+        class RollbackFinalizer(HookOwner):
+            def verify_final_precommit(self, db, processed):
+                db.rollback()
+        dispatcher = _TrustedRegistryDispatcher({"trusted": RollbackFinalizer("rollback", [])})
+        with closing(sqlite3.connect(self.db)) as db:
+            db.execute("BEGIN IMMEDIATE")
+            db.execute("UPDATE main.world_meta SET value='transient' WHERE key='world_id'")
+            with self.assertRaisesRegex(RuntimeError, "remain read-only"):
+                dispatcher.verify_final_precommit(db, ())
+            self.assertTrue(db.in_transaction)
+            db.rollback()
+        with closing(sqlite3.connect(self.db)) as db:
+            self.assertEqual("hook_test", db.execute(
+                "SELECT value FROM world_meta WHERE key='world_id'").fetchone()[0])
+
+    def test_finalizer_cannot_commit_before_crash(self):
+
+        class CommitThenCrash(HookOwner):
+            def verify_final_precommit(self, db, processed):
+                db.commit()
+                raise RuntimeError("injected host crash")
+
+        dispatcher = _TrustedRegistryDispatcher({"trusted": CommitThenCrash("commit", [])})
+        with closing(sqlite3.connect(self.db)) as db:
+            db.execute("BEGIN IMMEDIATE")
+            db.execute("UPDATE main.world_meta SET value='transient' WHERE key='world_id'")
+            with self.assertRaisesRegex(RuntimeError, "remain read-only"):
+                dispatcher.verify_final_precommit(db, ())
+            self.assertTrue(db.in_transaction)
+            db.rollback()
+        with closing(sqlite3.connect(self.db)) as db:
+            self.assertEqual("hook_test", db.execute(
+                "SELECT value FROM world_meta WHERE key='world_id'").fetchone()[0])
+
+    def test_finalizer_sql_transaction_control_is_denied_before_execution(self):
+        for statement in ("COMMIT", "ROLLBACK", "END", "SAVEPOINT escaped",
+                          "ROLLBACK TO SAVEPOINT escaped", "RELEASE SAVEPOINT escaped",
+                          "BEGIN"):
+            with self.subTest(statement=statement):
+                class SqlTransactionFinalizer(HookOwner):
+                    def verify_final_precommit(self, db, processed):
+                        db.execute(statement)
+
+                dispatcher = _TrustedRegistryDispatcher({
+                    "trusted": SqlTransactionFinalizer("sql", [])})
+                with closing(sqlite3.connect(self.db)) as db:
+                    db.execute("BEGIN IMMEDIATE")
+                    with self.assertRaisesRegex(RuntimeError, "remain read-only"):
+                        dispatcher.verify_final_precommit(db, ())
+                    self.assertTrue(db.in_transaction)
+                    db.rollback()
+
     def test_registered_hook_owners_prepare_all_before_any_callback_and_finalize_once(self):
         trace = []
         atmosphere = HookOwner("atmosphere", trace)
@@ -257,6 +312,96 @@ class ClockRunnerHookTests(unittest.TestCase):
                                    pulses=1, now=lambda: NOW, monotonic=lambda: 1.0,
                                    sleep=lambda _: None)
                 self.assertEqual(0, clock.query_only_after)
+
+    def test_finalizer_toggle_cannot_hide_durable_schema_or_pragma_changes(self):
+        hostile_sql = (
+            "CREATE TABLE main.finalizer_poison(value INTEGER)",
+            "CREATE VIEW main.finalizer_poison AS SELECT 1 AS value",
+            "CREATE INDEX main.finalizer_poison ON events(kind)",
+            "CREATE TRIGGER main.finalizer_poison AFTER INSERT ON events BEGIN SELECT 1; END",
+            "ALTER TABLE main.events ADD COLUMN finalizer_poison INTEGER",
+            "DROP TABLE main.events",
+            "CREATE TEMP TABLE finalizer_poison(value INTEGER)",
+            "PRAGMA main.user_version=31337",
+            "PRAGMA main.application_id=31337",
+            "PRAGMA main.schema_version=31337",
+        )
+        for sql in hostile_sql:
+            with self.subTest(sql=sql):
+                class SchemaEvasion(HookOwner):
+                    def verify_final_precommit(self, db, processed):
+                        db.execute("PRAGMA query_only=OFF")
+                        db.execute(sql)
+                        db.execute("PRAGMA query_only=ON")
+                clock = self.fake_clock("trusted")
+                with self.assertRaisesRegex(RuntimeError, "remain read-only"):
+                    run_foreground(clock, {"trusted": SchemaEvasion("schema", [])},
+                                   pulses=1, now=lambda: NOW, monotonic=lambda: 1.0,
+                                   sleep=lambda _: None)
+                self.assertEqual(0, clock.query_only_after)
+                with closing(sqlite3.connect(self.db)) as db:
+                    self.assertEqual(0, db.execute("SELECT COUNT(*) FROM main.events").fetchone()[0])
+                    self.assertFalse(db.execute("SELECT 1 FROM main.sqlite_schema "
+                                                "WHERE name='finalizer_poison'").fetchone())
+                    self.assertEqual(0, db.execute("PRAGMA user_version").fetchone()[0])
+                    self.assertEqual(0, db.execute("PRAGMA application_id").fetchone()[0])
+
+    def test_new_attached_database_is_blocked_before_external_file_creation(self):
+        external = self.db.parent / "trusted-callback-attached.sqlite3"
+        class AttachedWriter(HookOwner):
+            def verify_final_precommit(self, db, processed):
+                db.execute("PRAGMA query_only=OFF")
+                db.execute("ATTACH DATABASE ? AS injected", (str(external),))
+                db.execute("CREATE TABLE injected.finalizer_poison(value INTEGER)")
+                db.execute("PRAGMA query_only=ON")
+        clock = self.fake_clock("trusted")
+        with self.assertRaisesRegex(RuntimeError, "remain read-only"):
+            run_foreground(clock, {"trusted": AttachedWriter("attached", [])},
+                           pulses=1, now=lambda: NOW, monotonic=lambda: 1.0,
+                           sleep=lambda _: None)
+        self.assertEqual(0, clock.query_only_after)
+        with closing(sqlite3.connect(self.db)) as db:
+            self.assertEqual(0, db.execute("SELECT COUNT(*) FROM main.events").fetchone()[0])
+        # The authorizer denies mutating PRAGMA / ATTACH before execution.
+        self.assertFalse(external.exists())
+
+    def test_udf_ddl_is_rejected_when_trusted_finalizer_toggles_readonly(self):
+        class UdfWriter(HookOwner):
+            def verify_final_precommit(self, db, processed):
+                db.create_function("finalizer_ddl", 0, lambda: db.execute(
+                    "CREATE TABLE main.finalizer_poison(value INTEGER)").rowcount)
+                db.execute("PRAGMA query_only=OFF")
+                db.execute("SELECT finalizer_ddl()").fetchone()
+                db.execute("PRAGMA query_only=ON")
+        clock = self.fake_clock("trusted")
+        with self.assertRaisesRegex(RuntimeError, "remain read-only"):
+            run_foreground(clock, {"trusted": UdfWriter("udf", [])},
+                           pulses=1, now=lambda: NOW, monotonic=lambda: 1.0,
+                           sleep=lambda _: None)
+        with closing(sqlite3.connect(self.db)) as db:
+            self.assertFalse(db.execute("SELECT 1 FROM sqlite_schema "
+                                        "WHERE name='finalizer_poison'").fetchone())
+
+    def test_attached_file_side_effect_can_escape_world_receipt_custody(self):
+        # Document the actual boundary, not a fictional SQLite/Python sandbox.
+        # Unrestricted trusted Python can explicitly remove the authorizer,
+        # create a file, detach it, and leave no in-world world-state delta.
+        external = self.db.parent / "trusted-attached-then-detached.sqlite3"
+        class ExternalHostEffect(HookOwner):
+            def verify_final_precommit(self, db, processed):
+                db.set_authorizer(None)
+                db.execute("PRAGMA query_only=OFF")
+                db.execute("ATTACH DATABASE ? AS injected", (str(external),))
+                db.execute("DETACH DATABASE injected")
+                db.execute("PRAGMA query_only=ON")
+        clock = self.fake_clock("trusted")
+        report = run_foreground(clock, {"trusted": ExternalHostEffect("external", [])},
+                                pulses=1, now=lambda: NOW, monotonic=lambda: 1.0,
+                                sleep=lambda _: None)
+        self.assertEqual(("hook_1",), report.event_ids)
+        self.assertTrue(external.exists(), "External filesystem effect is outside world custody")
+        with closing(sqlite3.connect(self.db)) as db:
+            self.assertEqual(0, db.execute("SELECT COUNT(*) FROM main.events").fetchone()[0])
 
 
 if __name__ == "__main__":

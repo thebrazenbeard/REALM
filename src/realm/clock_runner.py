@@ -9,6 +9,7 @@ from __future__ import annotations
 import math
 import sqlite3
 import time
+from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Callable, Mapping
@@ -18,6 +19,10 @@ from .world_clock import DueEvent, WorldClock
 
 class UnknownEventKind(RuntimeError):
     """Scheduled event has no trusted host handler; receipt must stay pending."""
+
+
+_FINALIZER_CONNECTION: ContextVar[sqlite3.Connection | None] = ContextVar(
+    "realm_trusted_finalizer_connection", default=None)
 
 
 class _TrustedRegistryDispatcher:
@@ -57,6 +62,32 @@ class _TrustedRegistryDispatcher:
             raise UnknownEventKind(f"Unregistered event kind {event.kind!r}")
         return handler(db, event)
 
+    @staticmethod
+    def _sqlite_persistent_state(db) -> tuple:
+        """Fingerprint visible SQLite schema/metadata, not arbitrary Python IO.
+
+        SQLite's total_changes deliberately omits CREATE/DROP/ALTER and
+        persistent PRAGMA writes. Finalizers must not change any of those
+        either. Initialize the temporary schema before reading database_list
+        so first-use TEMP metadata cannot appear as a false positive.
+        """
+        db.execute("SELECT COUNT(*) FROM temp.sqlite_schema").fetchone()
+        databases = tuple((name, filename)
+                          for _, name, filename in db.execute("PRAGMA database_list"))
+        state = []
+        for name, filename in databases:
+            # ATTACH identifiers are caller-controlled SQL identifiers, not
+            # string literals. Quote them rather than interpolating raw names.
+            identifier = '"' + name.replace('"', '""') + '"'
+            schema = tuple(db.execute(
+                f"SELECT rowid,type,name,tbl_name,sql FROM {identifier}.sqlite_schema "
+                "ORDER BY rowid"
+            ))
+            metadata = tuple(db.execute(f"PRAGMA {identifier}.{flag}").fetchone()[0]
+                             for flag in ("schema_version", "user_version", "application_id"))
+            state.append((name, filename, schema, metadata))
+        return tuple(state)
+
     def verify_final_precommit(self, db, processed: tuple[DueEvent, ...]) -> None:
         # A later registered custodian must not mutate SQLite after an earlier
         # custodian's successful final attestation. WorldClock calls this hook
@@ -65,22 +96,62 @@ class _TrustedRegistryDispatcher:
         # entire finalizer phase and restore its prior setting even on failure.
         previous = db.execute("PRAGMA query_only").fetchone()[0]
         changes_before = db.total_changes
+        persistent_before = self._sqlite_persistent_state(db)
+        transaction_before = db.in_transaction
+        if not transaction_before:
+            raise RuntimeError("Host UTC finalizers require the active world transaction")
+
+        # query_only blocks writes, but SQLite permits COMMIT and ROLLBACK even
+        # while it is ON. A callback could otherwise prematurely commit a UTC
+        # receipt, or roll it back and still receive a false ACK. This per-
+        # connection authorizer denies transaction control *before* execution,
+        # including a rollback followed by BEGIN intended to hide the escape.
+        # WorldClock owns a freshly opened transaction connection here. This
+        # contract does not sandbox unrestricted trusted Python code (which can
+        # deliberately replace the authorizer or perform external effects).
+        read_actions = {sqlite3.SQLITE_SELECT, sqlite3.SQLITE_READ,
+                        sqlite3.SQLITE_FUNCTION}
+        recursive = getattr(sqlite3, "SQLITE_RECURSIVE", None)
+        if recursive is not None:
+            read_actions.add(recursive)
+        read_pragmas = {"query_only", "database_list", "schema_version",
+                        "user_version", "application_id", "table_info",
+                        "table_xinfo", "foreign_key_check", "foreign_key_list"}
+
+        def reject_mutation(action, arg1, arg2, database, source):
+            if action in read_actions:
+                return sqlite3.SQLITE_OK
+            if (action == sqlite3.SQLITE_PRAGMA and arg2 is None
+                    and isinstance(arg1, str) and arg1.lower() in read_pragmas):
+                return sqlite3.SQLITE_OK
+            return sqlite3.SQLITE_DENY
+
+        nested = _FINALIZER_CONNECTION.get() is db
+        token = None
         try:
-            db.execute("PRAGMA query_only=ON")
+            if not nested:
+                db.execute("PRAGMA query_only=ON")
+                db.set_authorizer(reject_mutation)
+                token = _FINALIZER_CONNECTION.set(db)
             for _, final in self._custodians:
                 try:
                     final(db, processed)
-                except sqlite3.OperationalError as exc:
-                    if exc.sqlite_errorcode == sqlite3.SQLITE_READONLY:
+                except sqlite3.DatabaseError as exc:
+                    if exc.sqlite_errorcode in (sqlite3.SQLITE_READONLY, sqlite3.SQLITE_AUTH):
                         raise RuntimeError("Host UTC finalizers must remain read-only") from exc
                     raise
                 # A trusted callback could itself toggle query_only. Do not
                 # silently accept any committed DML during final attestation.
                 if (db.total_changes != changes_before
-                        or db.execute("PRAGMA query_only").fetchone()[0] != 1):
+                        or not db.in_transaction
+                        or db.execute("PRAGMA query_only").fetchone()[0] != 1
+                        or self._sqlite_persistent_state(db) != persistent_before):
                     raise RuntimeError("Host UTC finalizers must remain read-only")
         finally:
-            db.execute("PRAGMA query_only=ON" if previous else "PRAGMA query_only=OFF")
+            if token is not None:
+                _FINALIZER_CONNECTION.reset(token)
+                db.set_authorizer(None)
+                db.execute("PRAGMA query_only=ON" if previous else "PRAGMA query_only=OFF")
 
 
 @dataclass(frozen=True)
