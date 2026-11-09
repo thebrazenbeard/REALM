@@ -52,9 +52,11 @@ lineage edge, not a verified custody chain. Accordingly:
 - Every candidate remains `status=PROPOSED`, `review_status=UNREVIEWED`.
 - Evidence `reported_source_status` preserves the sender's claim; effective
   `source_status=SUPPLIED_NOT_REVERIFIED` does **not** repeat it as verified.
-- Conflicting source revisions, name-case aliases and evidence assignments are
-  surfaced alongside explicitly reported unresolved conflicts. No conflict is
-  auto-resolved into canon.
+- Conflicting source revisions, supplied parent-revision cycles *within the
+  batch*, name aliases (including whitespace/case/Unicode-normalized spellings)
+  and evidence assignments are surfaced alongside explicitly reported
+  unresolved conflicts. Parent links outside the batch remain unknown, not
+  silently accepted as a verified chain. No conflict is auto-resolved into canon.
 - Rights remain `UNVERIFIED`, canon `UNAPPROVED`, worldpack release `HELD`, and
   effect `REVIEW_ONLY_NO_IMPORT`. Metadata-only records do not gain source
   authority by entering this adapter.
