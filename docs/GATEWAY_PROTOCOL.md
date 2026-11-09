@@ -131,6 +131,18 @@ live ship telemetry, or a perpetual world ticker. Ship arrival still needs an
 explicit host UTC tick. The provisional loopback transport remains unsuitable
 for public network exposure.
 
+`WorldClock.tick` additionally compares the complete persisted ship, ship-event
+and receipt ledgers before and after its trusted UTC callbacks, including idle
+and unrelated audit-only ticks. Only exact scheduled, in-transaction ship
+arrivals and bound host ship departures may add ledger effects; SQLite trigger
+injections that add, delete, or rewrite other ship history abort that tick.
+This is **clock-transaction custody**, not a proof that all rows returned by
+the GET were originally legitimate: independent gateway departure transactions,
+direct host `Geography` writes, out-of-band privileged SQLite modifications,
+and whole-file database rollback are outside this tick's authorization boundary.
+Owner history is a persisted observation surface, not a cryptographic
+attestation or assurance that arbitrary raw event payloads are secret-free.
+
 Each event is `{id,kind,actor,text,room,at}`. Movement creates a `leave` event
 in the source room and a `move` (arrival) event in the destination in one
 transaction. The feed is **polling**, not

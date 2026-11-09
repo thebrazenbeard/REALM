@@ -20,6 +20,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable
 
+from .ship_history_custody import ShipHistoryCustody
+
 _EVENT_ID = re.compile(r"^[A-Za-z][A-Za-z0-9_-]{0,127}$")
 _KIND = re.compile(r"^[A-Za-z][A-Za-z0-9_-]{0,63}$")
 _MAX_PAYLOAD_BYTES = 4096
@@ -282,6 +284,10 @@ class WorldClock:
                     "FROM main.clock_events"
                 )
             }
+            # The ship ledger belongs to this world and must remain stable on
+            # *every* tick, not only when one selected event is an arrival.
+            # Snapshot before any callback/clock receipt trigger can touch it.
+            ship_custody = ShipHistoryCustody(db)
             rows = db.execute(
                 "SELECT * FROM main.clock_events WHERE processed_utc IS NULL AND due_utc <= ? "
                 "ORDER BY due_utc, event_id LIMIT ?", (stamp, limit),
@@ -331,6 +337,7 @@ class WorldClock:
                         r["id"] for r in db.execute("SELECT id FROM main.events")
                     }
                 outcome = handler(db, event)
+                ship_custody.after_handler(db, event)
                 if event.kind == "npc_roster_gather":
                     initial_proof = _verify_roster_utc_ack(db, event, outcome)
                     roster_proofs.append((event, outcome, initial_proof))
@@ -479,4 +486,8 @@ class WorldClock:
                        and r["id"] not in gather_events
                        for r in final_event_rows):
                     raise ValueError("Roster gather history contains ungranted effects")
+            # This is deliberately LAST: MAIN triggers attached to scheduler
+            # receipt or watermark writes may run after per-event verification.
+            # Also protects audit-only/idle batches against historical drift.
+            ship_custody.before_commit(db)
             return processed
