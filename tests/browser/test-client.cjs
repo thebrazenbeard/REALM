@@ -99,6 +99,46 @@ function instantiate({ missingMap = false, mapOnMove = false, rejectUnauthorized
     send: () => get("command-form").events.submit(event) };
 }
 
+test("expected world ID binds a browser join to the host-reported world", async () => {
+  const client = instantiate();
+  client.get("host-url").value = "http://127.0.0.1:8765";
+  client.get("expected-world-id").value = "test-world";
+  client.get("player-name").value = "Explorer";
+  client.get("access-token").value = "secret-token";
+  await client.connect();
+  assert.equal(client.get("world-name").textContent, "test-world");
+  assert.ok(client.requests.some(({ url }) => url.includes("/api/v1/join")));
+  assert.equal(client.get("expected-world-id").disabled, true);
+  client.disconnect();
+  assert.equal(client.get("expected-world-id").disabled, false);
+});
+
+test("wrong expected world ID refuses the authenticated join before sending bearer token", async () => {
+  const client = instantiate();
+  client.get("host-url").value = "http://127.0.0.1:8765";
+  client.get("expected-world-id").value = "driftspace";
+  client.get("player-name").value = "Explorer";
+  client.get("access-token").value = "secret-token";
+  await client.connect();
+  assert.equal(client.get("world-name").textContent, "Unconnected");
+  assert.equal(client.requests.length, 1, "must only make unauthenticated health request");
+  assert.match(client.requests[0].url, /\/api\/v1\/health$/);
+  assert.equal(client.requests[0].options.headers.Authorization, undefined);
+  assert.equal(client.get("access-token").value, "");
+  assert.match(client.get("connection-note").textContent, /World mismatch: expected driftspace, host reports test-world/);
+});
+
+test("invalid expected world ID fails locally without sending a credential", async () => {
+  const client = instantiate();
+  client.get("host-url").value = "http://127.0.0.1:8765";
+  client.get("expected-world-id").value = "wrong world";
+  client.get("player-name").value = "Explorer";
+  client.get("access-token").value = "secret-token";
+  await client.connect();
+  assert.equal(client.requests.length, 0);
+  assert.match(client.get("connection-note").textContent, /Expected world ID/);
+});
+
 test("successful join requests authorized map, clears DOM token, and renders host tiles", async () => {
   const client = instantiate();
   client.get("host-url").value = "http://127.0.0.1:8765";

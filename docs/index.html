@@ -44,6 +44,10 @@
         <label for="host-url">REALM host URL
           <input id="host-url" type="url" inputmode="url" autocomplete="url" spellcheck="false" placeholder="https://your-realm-host.example" required>
         </label>
+        <label for="expected-world-id">Expected world ID <span class="hint">(optional — ask your host)</span>
+          <input id="expected-world-id" type="text" maxlength="64" autocomplete="off" spellcheck="false" placeholder="driftspace" pattern="[A-Za-z][A-Za-z0-9_-]{0,63}" aria-describedby="world-id-help">
+          <span class="hint" id="world-id-help">Checked before your token is sent; guards against accidentally joining the wrong world.</span>
+        </label>
         <label for="player-name">Character name
           <input id="player-name" type="text" minlength="1" maxlength="24" autocomplete="off" spellcheck="false" placeholder="Explorer" pattern="[A-Za-z][A-Za-z0-9_-]{0,23}" required>
         </label>
