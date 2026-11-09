@@ -135,11 +135,14 @@ def _verify_gather_effect(db: sqlite3.Connection, before: dict[str, dict],
     if any(after["events"].get(key) != row
            for key, row in domain["events"].items()):
         raise ValueError("Gather history was replaced after domain execution")
-    domain_event_max = max((key[0] for key in domain["events"]), default=0)
-    if any(row[4] != "say" or row[0] <= domain_event_max
-           for key, row in after["events"].items()
-           if key not in domain["events"]):
-        raise ValueError("Receipt trigger inserted an ungranted gameplay event")
+    # The *typed gather* domain contract emits only its own gather history.
+    # In particular an AFTER INSERT receipt trigger and an AFTER INSERT gather
+    # event trigger may not launder a new `say`, even with a plausible speaker
+    # or huge explicit event ID. Separately selected trusted host handlers may
+    # emit permitted unrelated speech AFTER this adapter returns; WorldClock
+    # captures that explicit handler stage before scheduler acknowledgment.
+    if after["events"] != domain["events"]:
+        raise ValueError("Gather receipt inserted an ungranted gameplay event")
     expected = {name: dict(rows) for name, rows in before.items()
                 if name not in ("other_world", "allocators")}
     key = (actor, action_id)
@@ -155,17 +158,25 @@ def _verify_gather_effect(db: sqlite3.Connection, before: dict[str, dict],
     if any(after["events"].get(key) != row
            for key, row in before["events"].items()):
         raise ValueError("Gather changed prior gameplay history")
-    # SAY is an unrelated permitted event family; it must not serve as a
-    # surrogate for the one typed gather history row or disguise an extra one.
-    new_gathers = [row for row in new_events.values() if row[4] != "say"]
+    # No new non-gather rows are permitted within the direct typed gather
+    # domain, including privileged triggers fired by Crafting._gather itself.
+    new_gathers = list(new_events.values())
     if (any(row[0] <= max((key[0] for key in old_event_ids), default=0)
             for row in new_events.values())
-            or len(new_gathers) != (1 if planned else 0)):
+            or len(new_gathers) != (1 if planned else 0)
+            or any(row[4] != "gather" for row in new_gathers)):
         raise ValueError("Gather produced ungranted gameplay history")
     if planned is not None:
         material, amount = planned
         if response != f"You gather {material} x{amount}.":
             raise ValueError("Gather response conflicts with authorized stock")
+        # SQLite AUTOINCREMENT advances exactly once for the one gather event.
+        # Compare with the *pre-domain* allocator, not with a trigger-tainted
+        # post-domain snapshot: an installed events INSERT trigger could delete
+        # the real event and replace it with an otherwise identical MAXINT id.
+        expected_event_id = before["allocators"].get("events", 0) + 1
+        if set(new_events) != {(expected_event_id,)}:
+            raise ValueError("Gather history did not use its authorized event ID")
         node = before["nodes"][(room, material)]
         expected["nodes"][(room, material)] = (room, material, node[2] - amount, node[3])
         previous = before["pouches"].get((actor, material))

@@ -145,17 +145,24 @@ class LegacyGatherEffectCustodyTests(unittest.TestCase):
             db.rollback()
         self.assertEqual(before, self._snapshot())
 
-    def test_benign_say_side_effect_and_multi_batch_gather_still_work(self):
+    def test_receipt_trigger_say_rejected_but_multi_batch_gather_still_works(self):
         self._sql("""CREATE TRIGGER benign_say AFTER INSERT ON action_receipts
             WHEN NEW.action_id='gather_once' BEGIN
               INSERT INTO events(occurred_at,actor,room_id,kind,payload_json)
                 VALUES('2026-11-09T13:00:00+00:00','Ada','atrium','say',
                        '{"message":"ordinary"}');
             END""")
+        before = self._snapshot()
+        # Receipt-trigger speech has no independent authorization from this
+        # typed gathering command, even when actor/room/payload look valid.
+        with self.assertRaisesRegex(ValueError, "ungranted gameplay event"):
+            self._run("gather_once", "gather silver 2")
+        self.assertEqual(before, self._snapshot())
+        self._sql("DROP TRIGGER benign_say;")
         self.assertEqual(["gather_once"], [e.event_id for e in
             self._run("gather_once", "gather silver 2")])
         snapshot = self._snapshot()
-        self.assertEqual(1, len([row for row in snapshot["events"] if row[4] == "say"]))
+        self.assertEqual(0, len([row for row in snapshot["events"] if row[4] == "say"]))
         self.assertEqual(2, dict(((r[0], r[1]), r[2]) for r in
             snapshot["material_pouches"])[("Ada", "silver")])
         # Clock replay remains once-only; explicit action replay is also exact.

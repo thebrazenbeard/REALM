@@ -63,6 +63,11 @@ class GatherWorldStateCustodyTests(unittest.TestCase):
                             payload={"actor": "Ada", "command": "gather silver"})
 
         def callback(db, event):
+            if event.kind == "audit":
+                db.execute("INSERT INTO main.events(occurred_at,actor,room_id,kind,payload_json) "
+                           "VALUES(?,?,?,?,?)", (UTC.isoformat(), "Ada", "atrium",
+                                                "say", '{"message":"handler approved"}'))
+                return None
             return perform_in_transaction(
                 db, engine=self.engine, crafting=self.crafting,
                 actor=event.payload["actor"], command=event.payload["command"],
@@ -209,6 +214,57 @@ class GatherWorldStateCustodyTests(unittest.TestCase):
             END;
         """)
 
+    def test_in_handler_receipt_cannot_forge_unknown_speaker(self):
+        self._reject_and_retry("""
+            CREATE TRIGGER forge_receipt AFTER INSERT ON action_receipts
+            WHEN NEW.action_id='signed_gather' BEGIN
+              INSERT INTO events(occurred_at,actor,room_id,kind,payload_json)
+              VALUES('2026-11-09T16:00:00+00:00','GhostAccount','invalid_room',
+                     'say','{"bad":true}');
+            END;
+        """)
+
+    def test_in_handler_receipt_cannot_impersonate_valid_speaker(self):
+        self._reject_and_retry("""
+            CREATE TRIGGER forge_receipt AFTER INSERT ON action_receipts
+            WHEN NEW.action_id='signed_gather' BEGIN
+              INSERT INTO events(occurred_at,actor,room_id,kind,payload_json)
+              VALUES('2026-11-09T16:00:00+00:00','Ben','atrium',
+                     'say','{"message":"I never said that"}');
+            END;
+        """)
+
+    def test_in_handler_receipt_cannot_exhaust_allocator_with_forged_say(self):
+        self._reject_and_retry("""
+            CREATE TRIGGER forge_receipt AFTER INSERT ON action_receipts
+            WHEN NEW.action_id='signed_gather' BEGIN
+              INSERT INTO events(id,occurred_at,actor,room_id,kind,payload_json)
+              VALUES(9223372036854775807,'2026-11-09T16:00:00+00:00',
+                     'Ada','atrium','say','{}');
+            END;
+        """)
+
+    def test_gather_domain_trigger_cannot_inject_max_id_say(self):
+        self._reject_and_retry("""
+            CREATE TRIGGER forge_receipt AFTER INSERT ON events
+            WHEN NEW.kind='gather' BEGIN
+              INSERT INTO events(id,occurred_at,actor,room_id,kind,payload_json)
+              VALUES(9223372036854775807,'2026-11-09T16:00:00+00:00',
+                     'GhostAccount','invalid_room','say','{}');
+            END;
+        """)
+
+    def test_gather_domain_trigger_cannot_replace_gather_with_max_id(self):
+        self._reject_and_retry("""
+            CREATE TRIGGER forge_receipt AFTER INSERT ON events
+            WHEN NEW.kind='gather' BEGIN
+              DELETE FROM events WHERE id=NEW.id;
+              INSERT INTO events(id,occurred_at,actor,room_id,kind,payload_json)
+              VALUES(9223372036854775807,NEW.occurred_at,NEW.actor,
+                     NEW.room_id,NEW.kind,NEW.payload_json);
+            END;
+        """)
+
     def test_final_utc_watermark_cannot_insert_unauthorized_say(self):
         # clock_state starts empty; first host tick inserts its UTC watermark.
         self._reject_and_retry("""
@@ -260,15 +316,10 @@ class GatherWorldStateCustodyTests(unittest.TestCase):
                                             "WHERE kind='say'").fetchone()[0])
 
     def test_distinct_valid_typed_movement_and_say_still_commit(self):
+        self.clock.schedule("t_audit_say", due_at=UTC, kind="audit", payload={})
         self.clock.schedule("z_move", due_at=UTC, kind="host_action",
                             payload={"actor": "Ben", "command": "north"})
-        self._sql("""CREATE TRIGGER harmless_say AFTER INSERT ON action_receipts
-            WHEN NEW.action_id='signed_gather' BEGIN
-              INSERT INTO events(occurred_at,actor,room_id,kind,payload_json)
-              VALUES('2026-11-09T16:00:00+00:00','Ada','atrium','say',
-                     '{"message":"allowed"}');
-            END;""")
-        self.assertEqual(["signed_gather", "z_move"],
+        self.assertEqual(["signed_gather", "t_audit_say", "z_move"],
                          [e.event_id for e in self._tick()])
         with closing(sqlite3.connect(self.path)) as db:
             self.assertEqual("corridor", db.execute("SELECT room_id FROM players "
