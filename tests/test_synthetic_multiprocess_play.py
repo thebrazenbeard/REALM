@@ -19,11 +19,13 @@ class SyntheticMultiprocessPlayTests(unittest.TestCase):
         self.assertEqual(64, len(result["worldpack_sha256"]))
         self.assertTrue(result["ship_departed_by_captain"])
         self.assertEqual("destination", result["ship_arrived_host_utc"])
+        self.assertEqual(["depart", "arrive"], result["owner_ship_timeline_kinds"])
         self.assertEqual(2, result["committed_utc_clock_receipts"])
         self.assertGreater(result["shared_npc_event_id"], 0)
         self.assertEqual({"depart": 1, "arrive": 1}, result["ship_events"])
         self.assertEqual({"npc": 1, "ship_arrival": 1}, result["receipts"])
-        self.assertEqual({"wrong_player": 403, "navigator_ship_depart": 401},
+        self.assertEqual({"wrong_player": 403, "navigator_ship_depart": 401,
+                          "navigator_ship_history": 401},
                          result["scope_checks"])
         self.assertFalse(result["native_ship_feed_visible"])
         self.assertEqual([0, 0], result["client_exit_codes"])

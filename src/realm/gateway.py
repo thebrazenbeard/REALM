@@ -19,7 +19,7 @@ from urllib.parse import parse_qs, urlsplit
 
 from .auth import CredentialStore
 from .engine import Engine, _SEED_EXITS, _SEED_ITEMS, _SEED_ROOMS, _pristine_schema, _schema_snapshot
-from .geography import Geography, MapUnavailable
+from .geography import Geography, MapUnavailable, _check_id
 from .router import CommandRouter
 from .scoped_credentials import CredentialStateError, ScopedCredentialStore
 
@@ -27,6 +27,10 @@ from .scoped_credentials import CredentialStateError, ScopedCredentialStore
 MAX_BODY_BYTES = 4096
 MAX_FEED_EVENTS = 100
 _WORLD_ID = re.compile(r"^[A-Za-z][A-Za-z0-9_-]{0,63}$")
+
+
+class ShipAccessDenied(PermissionError):
+    """An authenticated pilot has no owner entitlement to this ship."""
 
 
 class Gateway:
@@ -63,8 +67,10 @@ class Gateway:
             return self.scoped_credentials.authenticate(
                 token, required_capability=required_capability
             )
-        except CredentialStateError:
+        except (CredentialStateError, ValueError):
             # A missing witness or clock rollback must fail closed, not expose a traceback.
+            # A changed bound world ID is likewise a denied credential, not a
+            # connection-aborting exception before the HTTP authorization gate.
             return None
 
     def _scoped_writer_guard(
@@ -123,6 +129,57 @@ class Gateway:
             action_id=action_id, scoped=True,
         )
         return {"ok": True, **result}
+
+    def ship_events_remote(self, token: str, ship_id: str, after: int) -> dict:
+        """Read ONLY a scoped ship pilot's own durable departure/arrival log.
+
+        Existing ship:depart plus recorded ship ownership is the entire
+        entitlement. There is no delegated crew read scope or public fleet feed.
+        This read-only endpoint never grants pilot or host authority.
+        """
+        if self.scoped_credentials is None:
+            raise PermissionError("Scoped ship pilot credential required")
+        principal = self.authenticate_remote(token, required_capability="ship:depart")
+        if principal is None:
+            raise PermissionError("Active scoped ship pilot credential required")
+        _check_id(ship_id, "Ship ID")
+        if type(after) is not int or not 0 <= after <= 2**63 - 1:
+            raise ValueError("Invalid ship history cursor")
+        with closing(self._read()) as db:
+            db.execute("BEGIN")
+            world = db.execute(
+                "SELECT value FROM main.world_meta WHERE key='world_id'"
+            ).fetchone()
+            if world is None or world[0] != self.world_id:
+                raise PermissionError("Ship world identity is not current")
+            joined = db.execute(
+                "SELECT 1 FROM main.players WHERE id=? COLLATE NOCASE", (principal,)
+            ).fetchone()
+            ship = db.execute(
+                "SELECT owner FROM main.geo_ships WHERE id=?", (ship_id,)
+            ).fetchone()
+            if joined is None or ship is None or ship["owner"] != principal:
+                # Unknown and other-owned ships have identical visibility.
+                raise ShipAccessDenied("Ship is not owned by the authenticated pilot")
+            head = db.execute(
+                "SELECT COALESCE(MAX(id),0) FROM main.geo_ship_events WHERE ship_id=?",
+                (ship_id,),
+            ).fetchone()[0]
+            if after > head:
+                raise ValueError("Cursor exceeds this ship's event head")
+            rows = db.execute(
+                "SELECT id,occurred_at,ship_id,actor,kind,payload_json "
+                "FROM main.geo_ship_events WHERE ship_id=? AND id>? "
+                "ORDER BY id LIMIT ?", (ship_id, after, MAX_FEED_EVENTS),
+            ).fetchall()
+            events = [
+                {"id": row["id"], "at": row["occurred_at"],
+                 "ship_id": row["ship_id"], "actor": row["actor"],
+                 "kind": row["kind"], "payload": json.loads(row["payload_json"])}
+                for row in rows
+            ]
+        return {"ok": True, "world_id": self.world_id, "ship_id": ship_id,
+                "events": events, "cursor": events[-1]["id"] if events else after}
 
     def _bind_world_id(self, world_id: str, *, adopt_unbound_world: bool) -> None:
         """Persist the host's world identity before any gateway can serve it.
@@ -342,6 +399,7 @@ class GatewayHandler(BaseHTTPRequestHandler):
             "/api/v1/feed": "feed:read",
             "/api/v1/feed/wait": "feed:read",
             "/api/v1/ship/depart": "ship:depart",
+            "/api/v1/ship/events": "ship:depart",
         }.get(path)
         if capability is None:
             return None
@@ -403,9 +461,35 @@ class GatewayHandler(BaseHTTPRequestHandler):
                 if not self._player_matches(params.get("player", [None])[0], principal):
                     return
                 result = self.server.gateway.map(principal)
+            elif path == "/api/v1/ship/events":
+                # Strict query shape: no world selector, actor assertion, fleet
+                # enumeration or repeated cursor/ship parameters.
+                query = parse_qs(urlsplit(self.path).query, keep_blank_values=True)
+                if (set(query) - {"ship_id", "after"} or
+                        "ship_id" not in query or
+                        any(len(values) != 1 for values in query.values())):
+                    raise ValueError("Ship ID and optional cursor required")
+                raw_after = query.get("after", ["0"])[0]
+                if (not raw_after.isascii() or not raw_after.isdecimal() or
+                        len(raw_after) > 19 or int(raw_after) > 2**63 - 1):
+                    raise ValueError("Cursor must be a bounded nonnegative integer")
+                _, _, token = self.headers.get("Authorization", "").partition(" ")
+                result = self.server.gateway.ship_events_remote(
+                    token, query["ship_id"][0], int(raw_after),
+                )
+                # Revoke/rotation during the read cannot return a stale grant.
+                if self._principal() != principal:
+                    self._send(401, {"ok": False, "error": "Active scoped pilot required"})
+                    return
             else:
                 self._send(404, {"ok": False, "error": "Unknown endpoint"})
                 return
+        except ShipAccessDenied:
+            self._send(403, {"ok": False, "error": "Ship is not owned by this pilot"})
+            return
+        except PermissionError:
+            self._send(401, {"ok": False, "error": "Active scoped pilot required"})
+            return
         except MapUnavailable as error:
             self._send(404, {"ok": False, "error": str(error)})
             return
