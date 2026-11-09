@@ -140,7 +140,7 @@ def perform_host_npc_gather_in_transaction(
         raise ValueError("Queued payload is not bound to this host policy")
     if type(event.event_id) is not str or not _ID.fullmatch(event.event_id):
         raise ValueError("A bounded host-issued event ID is required")
-    if (type(db) is not sqlite3.Connection or not db.in_transaction
+    if (not isinstance(db, sqlite3.Connection) or not db.in_transaction
             or db.row_factory is not sqlite3.Row):
         raise ValueError("NPC action requires the host's SQLite transaction")
     if not isinstance(crafting, Crafting) or not isinstance(engine, Engine):
