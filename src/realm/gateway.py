@@ -32,6 +32,9 @@ _GEOGRAPHY_SCHEMA_OBJECTS = frozenset({
     "geo_places", "geo_maps", "geo_links", "geo_ships",
     "geo_ship_events", "geo_ship_receipts", "idx_geo_parent",
 })
+_SHIP_CLOCK_SCHEMA_OBJECTS = frozenset({
+    "clock_events", "idx_clock_due", "clock_state", "npc_roster_utc_attestations",
+})
 
 
 class ShipAccessDenied(PermissionError):
@@ -133,6 +136,16 @@ class Gateway:
         if (not isinstance(ship_id, str) or not isinstance(destination, str)
                 or not isinstance(action_id, str)):
             raise ValueError("Ship ID, destination and stable action ID are required")
+        # Instantiating AuthenticatedShipCommands dereferences gateway.geography
+        # for host path binding. On an unconfigured medieval world that would
+        # install ship schema *before* its disabled-clock denial. Preflight the
+        # already-enabled host subsystems through a query-only connection.
+        with closing(self._read()) as db:
+            schema = self._schema_objects(db)
+        if not _SHIP_CLOCK_SCHEMA_OBJECTS.issubset(schema):
+            raise RuntimeError("Ship world clock is not enabled")
+        if not _GEOGRAPHY_SCHEMA_OBJECTS.issubset(schema):
+            raise RuntimeError("Ship geography is not configured")
         from .ship_command_auth import AuthenticatedShipCommands
         from .world_clock import WorldClock
         pilot = AuthenticatedShipCommands(self, WorldClock(self.engine.db_path))
@@ -168,10 +181,16 @@ class Gateway:
             joined = db.execute(
                 "SELECT 1 FROM main.players WHERE id=? COLLATE NOCASE", (principal,)
             ).fetchone()
+            # The same optional-schema boundary applies to this read. Missing
+            # or partially installed geography means there is no owner ship
+            # entitlement; never query absent tables or install them on GET.
+            if joined is None or not _GEOGRAPHY_SCHEMA_OBJECTS.issubset(
+                    self._schema_objects(db)):
+                raise ShipAccessDenied("Ship is not owned by the authenticated pilot")
             ship = db.execute(
                 "SELECT owner FROM main.geo_ships WHERE id=?", (ship_id,)
             ).fetchone()
-            if joined is None or ship is None or ship["owner"] != principal:
+            if ship is None or ship["owner"] != principal:
                 # Unknown and other-owned ships have identical visibility.
                 raise ShipAccessDenied("Ship is not owned by the authenticated pilot")
             head = db.execute(
@@ -273,6 +292,13 @@ class Gateway:
         conn.execute("PRAGMA query_only=ON")
         return conn
 
+    @staticmethod
+    def _schema_objects(db: sqlite3.Connection) -> frozenset[str]:
+        """Inspect optional host schema without DDL or writer authority."""
+        return frozenset(row["name"] for row in db.execute(
+            "SELECT name FROM main.sqlite_master WHERE type IN ('table','index')"
+        ))
+
     def cursor(self) -> int:
         db = self._read()
         try:
@@ -320,13 +346,7 @@ class Gateway:
             # asked for an unconfigured map. Require an already complete
             # explicitly installed geography schema before accessing the
             # lazily cached host geography object.
-            existing = {
-                schema["name"] for schema in db.execute(
-                    "SELECT name FROM main.sqlite_master "
-                    "WHERE type IN ('table','index')"
-                )
-            }
-            if not _GEOGRAPHY_SCHEMA_OBJECTS.issubset(existing):
+            if not _GEOGRAPHY_SCHEMA_OBJECTS.issubset(self._schema_objects(db)):
                 raise MapUnavailable("No map is configured for this location")
         finally:
             db.close()
