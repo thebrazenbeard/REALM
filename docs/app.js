@@ -243,7 +243,8 @@
     const expectedWorld = ui.expectedWorld.value.trim();
     const token = ui.accessToken.value.trim();
     if (!NAME_PATTERN.test(player)) return setNote("Player names must use letters, digits, underscores, or hyphens, starting with a letter.", true);
-    if (expectedWorld && !WORLD_ID_PATTERN.test(expectedWorld)) return setNote("Expected world ID must start with a letter and use only letters, digits, underscores, or hyphens (64 characters maximum).", true);
+    if (!expectedWorld) return setNote("Enter the exact world ID provided by your host before connecting.", true);
+    if (!WORLD_ID_PATTERN.test(expectedWorld)) return setNote("Expected world ID must start with a letter and use only letters, digits, underscores, or hyphens (64 characters maximum).", true);
     if (!token) return setNote("Your host access token is required.", true);
     let base;
     try { base = normalizeEndpoint(ui.hostUrl.value); }
@@ -258,7 +259,7 @@
     try {
       const health = await request(session, "/api/v1/health", { unauthenticated: true });
       if (health.ok !== true || typeof health.world_id !== "string") throw new Error("The endpoint is not a compatible REALM gateway.");
-      if (expectedWorld && health.world_id !== expectedWorld) {
+      if (health.world_id !== expectedWorld) {
         throw new Error("World mismatch: expected " + expectedWorld + ", host reports " + health.world_id + ". No access token was sent.");
       }
       const joined = await request(session, "/api/v1/join", { body: { player } });
