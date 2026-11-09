@@ -13,7 +13,6 @@ import hashlib
 import json
 import re
 import sqlite3
-from collections import defaultdict
 from contextlib import contextmanager, closing
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -294,19 +293,44 @@ class WorldClock:
             ).fetchall()
             processed = []
             roster_proofs = []
-            # Bound the actual harvested state as well as signed receipts. A
-            # trigger after acknowledgment can otherwise erase a pouch or
-            # gather history while leaving the roster attestation intact.
-            # Capture at transaction start, not when the first roster handler
-            # runs: an earlier unrelated clock receipt may fire installed MAIN
-            # triggers that mutate old history, forge a gather, or insert stock.
+            # Economy history is durable across *every* host UTC tick, not
+            # only batches selecting a fresh signed roster. A later audit-only
+            # or idle clock trigger must not rewrite already signed gathers,
+            # change stock/pouches or forge a new gather and still gain ACK.
+            # Preserve the complete historical event rows (not just kind=gather)
+            # so kind rewrites cannot evade postconditions. Ordinary *new* say
+            # events remain allowed; a new gather needs a selected signed
+            # roster grant or a separately governed legacy host action (see
+            # the bounded legacy exception below). Legacy clocks without
+            # economy tables remain usable.
             roster_in_batch = any(r["kind"] == "npc_roster_gather" for r in rows)
+            # These older opt-in handlers own different validated gameplay
+            # action/receipt contracts. Their legitimate gather/craft/build
+            # effects can change stock and pouches without a roster grant.
+            # Until their receipts gain a common typed delta-attestation
+            # interface, don't misclassify them as ungranted roster writes.
+            # This is an explicit source-level custody exception for batches
+            # selecting one of these kinds, NOT authorization from event
+            # payload text or proof that their effects are fully attested.
+            legacy_economy_in_batch = any(
+                r["kind"] in ("host_action", "npc_economic_gather",
+                              "trusted_game_action") for r in rows
+            )
+            economy_tables = {
+                r["name"] for r in db.execute(
+                    "SELECT name FROM main.sqlite_master WHERE type='table' "
+                    "AND name IN ('events','gathering_nodes','material_pouches')"
+                )
+            }
+            if roster_in_batch and economy_tables != {
+                    "events", "gathering_nodes", "material_pouches"}:
+                raise ValueError("Roster tick requires complete economy storage")
             event_ledger_before = (
                 {
                     r["id"]: tuple(r)
                     for r in db.execute("SELECT * FROM main.events")
                 }
-                if roster_in_batch
+                if "events" in economy_tables
                 else None
             )
             node_before = (
@@ -316,7 +340,7 @@ class WorldClock:
                         "SELECT room_id,material,remaining,batch_yield FROM main.gathering_nodes"
                     )
                 }
-                if roster_in_batch else None
+                if "gathering_nodes" in economy_tables else None
             )
             pouch_before = (
                 {
@@ -325,10 +349,28 @@ class WorldClock:
                         "SELECT actor,material,quantity FROM main.material_pouches"
                     )
                 }
-                if roster_in_batch else None
+                if "material_pouches" in economy_tables else None
             )
-            node_gathered = defaultdict(int)
-            pouch_gathered = defaultdict(int)
+            expected_nodes = dict(node_before) if node_before is not None else None
+            expected_pouches = dict(pouch_before) if pouch_before is not None else None
+
+            def node_state():
+                return {
+                    (r["room_id"], r["material"]): (r["remaining"], r["batch_yield"])
+                    for r in db.execute(
+                        "SELECT room_id,material,remaining,batch_yield "
+                        "FROM main.gathering_nodes"
+                    )
+                } if expected_nodes is not None else None
+
+            def pouch_state():
+                return {
+                    (r["actor"], r["material"]): r["quantity"]
+                    for r in db.execute(
+                        "SELECT actor,material,quantity FROM main.material_pouches"
+                    )
+                } if expected_pouches is not None else None
+
             gather_events = {}
             # Optional host-owned components may bind exact transaction-start
             # evidence before any selected callback mutates this world.
@@ -339,6 +381,10 @@ class WorldClock:
                 prepare(db, tuple(_event(row) for row in rows))
             for row in rows:
                 event = _event(row)
+                # A previous scheduler receipt trigger must not contaminate
+                # what a later valid handler adopts as its starting inventory.
+                if node_state() != expected_nodes or pouch_state() != expected_pouches:
+                    raise ValueError("Roster inventory drifted before next UTC action")
                 if event.kind == "npc_roster_gather":
                     prior_event_ids = {
                         r["id"] for r in db.execute("SELECT id FROM main.events")
@@ -361,8 +407,11 @@ class WorldClock:
                     for assignment in actions:
                         quantity = assignment.expected_units
                         site = assignment.site
-                        node_gathered[(site.room_id, site.material)] += quantity
-                        pouch_gathered[(assignment.actor, site.material)] += quantity
+                        key = (site.room_id, site.material)
+                        stock, batch_yield = expected_nodes[key]
+                        expected_nodes[key] = (stock - quantity, batch_yield)
+                        key = (assignment.actor, site.material)
+                        expected_pouches[key] = expected_pouches.get(key, 0) + quantity
                         matching = [
                             r for r in pending_gathers
                             if r["actor"] == assignment.actor
@@ -376,6 +425,24 @@ class WorldClock:
                         gathered = matching[0]
                         gather_events[gathered["id"]] = tuple(gathered)
                         pending_gathers.remove(gathered)
+                    if node_state() != expected_nodes or pouch_state() != expected_pouches:
+                        raise ValueError("Roster grant includes ungranted inventory effects")
+                elif event.kind in ("host_action", "npc_economic_gather",
+                                    "trusted_game_action"):
+                    # These legacy writers have their own host-side action
+                    # validators. Bind their observed post-handler inventory
+                    # before scheduler receipt DML can fire a hostile trigger.
+                    # Receipt presence is necessary, NOT proof of exact effect
+                    # semantics; typed per-action attestation remains pending.
+                    new_nodes = node_state()
+                    new_pouches = pouch_state()
+                    if ((new_nodes != expected_nodes or new_pouches != expected_pouches)
+                            and db.execute(
+                                "SELECT 1 FROM main.action_receipts WHERE action_id=?",
+                                (event.event_id,),
+                            ).fetchone() is None):
+                        raise ValueError("Legacy host economy change lacks action receipt")
+                    expected_nodes, expected_pouches = new_nodes, new_pouches
                 updated = db.execute(
                     "UPDATE main.clock_events SET processed_utc=? "
                     "WHERE event_id=? AND processed_utc IS NULL",
@@ -446,40 +513,33 @@ class WorldClock:
                         or main_event["kind"] != event.kind
                         or main_event["payload_json"] != _payload(event.payload)):
                     raise ValueError("Roster UTC completion changed before commit")
-            if node_before is not None:
-                # Full post-roster deltas prohibit extra, ungranted rows even
-                # when all originally signed actors and receipts remain valid.
-                # Ordinary say/move events are unaffected; additional gathers
-                # require a separate governed tick or equivalent attestation.
-                expected_nodes = dict(node_before)
-                for key, units in node_gathered.items():
-                    stock, batch_yield = expected_nodes[key]
-                    expected_nodes[key] = (stock - units, batch_yield)
-                actual_nodes = {
-                    (r["room_id"], r["material"]): (r["remaining"], r["batch_yield"])
-                    for r in db.execute(
-                        "SELECT room_id,material,remaining,batch_yield "
-                        "FROM main.gathering_nodes"
-                    )
-                }
-                if actual_nodes != expected_nodes:
-                    raise ValueError("Roster resource inventory changed outside signed plan")
-                expected_pouches = dict(pouch_before)
-                for key, units in pouch_gathered.items():
-                    expected_pouches[key] = expected_pouches.get(key, 0) + units
-                actual_pouches = {
-                    (r["actor"], r["material"]): r["quantity"]
-                    for r in db.execute(
-                        "SELECT actor,material,quantity FROM main.material_pouches"
-                    )
-                }
-                if actual_pouches != expected_pouches:
-                    raise ValueError("Roster pouch inventory changed outside signed plan")
-                # Execute only after every handler, clock receipt, and clock
-                # state write. Compare complete records, including occurred_at,
-                # and all original kinds (a join->gather or gather->say rewrite
-                # must not disappear from the checked set). Unrelated *new*
-                # say events remain permitted; all new gathers must be signed.
+            # Both full-ledger custody checks are read-only and run after all
+            # selected callbacks, scheduler receipts, watermark writes, and
+            # roster postconditions. Neither may observe a later tick write.
+            finalizer = getattr(handler, "verify_final_precommit", None)
+            if finalizer is not None:
+                if not callable(finalizer):
+                    raise TypeError("Host tick finalizer must be callable")
+                finalizer(db, tuple(processed))
+            ship_custody.before_commit(db)
+            # LAST read-only check: protects economy state even if an earlier
+            # finalizer is implemented incorrectly and performs late DML.
+            final_economy_tables = {
+                r["name"] for r in db.execute(
+                    "SELECT name FROM main.sqlite_master WHERE type='table' "
+                    "AND name IN ('events','gathering_nodes','material_pouches')"
+                )
+            }
+            if final_economy_tables != economy_tables:
+                raise ValueError("Host UTC batch changed economy storage schema")
+            if node_state() != expected_nodes:
+                raise ValueError("Roster resource inventory changed outside authorized host actions")
+            if pouch_state() != expected_pouches:
+                raise ValueError("Roster pouch inventory changed outside authorized host actions")
+            if event_ledger_before is not None:
+                # Every old event retains its exact columns, including former
+                # say/join rows. New non-gathers (including say/audit) are
+                # permitted; a new gather must match a signed selected grant.
                 final_event_rows = list(db.execute("SELECT * FROM main.events"))
                 final_ledger = {r["id"]: tuple(r) for r in final_event_rows}
                 if any(final_ledger.get(event_id) != before
@@ -491,15 +551,7 @@ class WorldClock:
                 if any(r["kind"] == "gather"
                        and r["id"] not in event_ledger_before
                        and r["id"] not in gather_events
+                       and not legacy_economy_in_batch
                        for r in final_event_rows):
                     raise ValueError("Roster gather history contains ungranted effects")
-            # Both full-ledger custody checks are read-only and run after all
-            # selected callbacks, scheduler receipts, watermark writes, and
-            # roster postconditions. Neither may observe a later tick write.
-            finalizer = getattr(handler, "verify_final_precommit", None)
-            if finalizer is not None:
-                if not callable(finalizer):
-                    raise TypeError("Host tick finalizer must be callable")
-                finalizer(db, tuple(processed))
-            ship_custody.before_commit(db)
             return processed
