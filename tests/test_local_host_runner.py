@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+from http.client import HTTPConnection, HTTPException
 import socket
 import sqlite3
 import sys
@@ -9,7 +10,7 @@ import tempfile
 import threading
 import time
 import unittest
-from contextlib import closing
+from contextlib import ExitStack, closing
 from datetime import datetime, timezone
 from pathlib import Path
 from urllib import request
@@ -160,6 +161,83 @@ class LocalHostRunnerTests(unittest.TestCase):
             self.assertEqual(("retry-once",) if _ == 0 else (), report.event_ids)
         self.assertIsNotNone(self.clock.lookup("retry-once").processed_at)
 
+    def test_existing_http_and_telnet_sessions_cannot_mutate_after_host_returns(self):
+        """Closing only listening ports leaves keep-alive handler threads alive."""
+        http, telnet = self.servers()
+        token = self.gateway.credentials.provision("Captain")
+        stop = threading.Event()
+        outcomes = []
+        errors = []
+
+        def foreground():
+            try:
+                outcomes.append(run_local_host(
+                    http, telnet, self.clock, {"unused": lambda db, event: None},
+                    pulses=100, interval_seconds=0.05, now=lambda: UTC,
+                    stop_event=stop,
+                ))
+            except BaseException as exc:
+                errors.append(exc)
+
+        thread = threading.Thread(target=foreground)
+        thread.start()
+        telnet_socket = None
+        conn = HTTPConnection("127.0.0.1", http.server_port, timeout=2)
+        try:
+            for _ in range(100):
+                try:
+                    self.http_json(http, "/api/v1/health")
+                    break
+                except OSError:
+                    time.sleep(0.01)
+            else:
+                self.fail("No running HTTP listener")
+            conn.request("POST", "/api/v1/join", json.dumps({"player": "Captain"}),
+                         {"Authorization": "Bearer " + token, "Content-Type": "application/json"})
+            joined = conn.getresponse()
+            self.assertEqual(200, joined.status)
+            joined.read()
+            self.assertIsNotNone(conn.sock, "HTTP persistent connection was not retained")
+
+            telnet_socket = socket.create_connection(("127.0.0.1", telnet.server_address[1]), timeout=2)
+            telnet_socket.settimeout(2)
+            self.read_until(telnet_socket, b"Token: ")
+            telnet_socket.sendall(b"local-test-only\n")
+            self.read_until(telnet_socket, b"Name: ")
+            telnet_socket.sendall(b"Navigator\n")
+            self.read_until(telnet_socket, b"REALM>")
+
+            stop.set()
+            thread.join(timeout=3)
+            self.assertFalse(thread.is_alive(), "Runner must quiesce sessions before returning")
+            self.assertFalse(errors, errors)
+            self.assertEqual("stopped", outcomes[0].reason)
+
+            try:
+                telnet_socket.sendall(b"say forbidden after host return\n")
+                telnet_socket.recv(4096)
+            except OSError:
+                pass  # Closed/revoked session is the expected transport behavior.
+            try:
+                conn.request("POST", "/api/v1/command",
+                             json.dumps({"player": "Captain", "command": "say forbidden http"}),
+                             {"Authorization": "Bearer " + token, "Content-Type": "application/json"})
+                response = conn.getresponse()
+                response.read()
+            except (OSError, HTTPException):
+                pass
+            with closing(sqlite3.connect(self.db_path)) as db:
+                durable = db.execute(
+                    "SELECT actor,payload_json FROM events WHERE kind='say' AND actor IN ('Captain','Navigator')"
+                ).fetchall()
+            self.assertEqual([], durable, "No accepted session may mutate after host shutdown")
+        finally:
+            stop.set()
+            thread.join(timeout=3)
+            conn.close()
+            if telnet_socket is not None:
+                telnet_socket.close()
+
     def test_wrong_world_rejected_before_dispatch(self):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
@@ -168,6 +246,22 @@ class LocalHostRunnerTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "same world"):
             run_local_host(http, telnet, self.clock, {"host_action": lambda db, e: None},
                            pulses=1, now=lambda: UTC)
+        self.assert_ports_released(http, telnet)
+
+    def assert_ports_released(self, http, telnet):
+        """A failed foreground admission must not leave hidden listeners."""
+        ports = (http.server_port, telnet.server_address[1])
+        for port in ports:
+            with self.assertRaises(OSError):
+                with closing(socket.create_connection(("127.0.0.1", port), timeout=0.25)):
+                    pass
+        # Confirm ordinary retry can immediately bind both exact old ports.
+        with ExitStack() as cleanup:
+            rebound_http = GatewayServer(http.gateway, ("http://127.0.0.1:8080",), ports[0])
+            cleanup.callback(rebound_http.server_close)
+            rebound_telnet = LocalTelnetServer(Engine(telnet.engine.db_path),
+                                              "fresh-test-token", ports[1])
+            cleanup.callback(rebound_telnet.server_close)
 
     def test_pre_stopped_host_closes_ports_without_processing(self):
         self.clock.schedule("still-due", due_at=UTC, kind="host_action", payload={})
@@ -194,9 +288,11 @@ class LocalHostRunnerTests(unittest.TestCase):
                     run_local_host(http, telnet, self.clock,
                                    {"host_action": lambda db, event: None},
                                    now=lambda: UTC, **opts)
+                self.assert_ports_released(http, telnet)
         http, telnet = self.servers()
         with self.assertRaises(ValueError):
             run_local_host(http, telnet, self.clock, {}, pulses=1, now=lambda: UTC)
+        self.assert_ports_released(http, telnet)
 
 
 if __name__ == "__main__":

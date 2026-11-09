@@ -7,6 +7,7 @@ and an explicit trusted kind-to-handler registry for one SQLite world.
 from __future__ import annotations
 
 import math
+import socket
 import threading
 import time
 from datetime import datetime, timezone
@@ -21,6 +22,61 @@ from .world_clock import WorldClock
 
 def _utc_now() -> datetime:
     return datetime.now(timezone.utc)
+
+
+class _AcceptedSessions:
+    """Per-run custody of accepted HTTP/Telnet sockets and handler threads.
+
+    ThreadingMixIn's daemon handler threads outlive server_close(), including
+    HTTP keep-alive and authenticated Telnet sessions. Track accepted sockets
+    before worker creation and release each only after its handler exits.
+    """
+
+    def __init__(self, server: GatewayServer | LocalTelnetServer):
+        self._condition = threading.Condition()
+        self._active: set[socket.socket] = set()
+        process_request = server.process_request
+        process_request_thread = server.process_request_thread
+
+        def tracked_request(request: socket.socket, client_address: tuple) -> None:
+            with self._condition:
+                self._active.add(request)
+            try:
+                process_request(request, client_address)
+            except BaseException:
+                with self._condition:
+                    self._active.discard(request)
+                    self._condition.notify_all()
+                raise
+
+        def tracked_worker(request: socket.socket, client_address: tuple) -> None:
+            try:
+                process_request_thread(request, client_address)
+            finally:
+                with self._condition:
+                    self._active.discard(request)
+                    self._condition.notify_all()
+
+        # Instance-scoped only. These prebound servers cannot be reused after
+        # the foreground call and are closed in its finally block.
+        server.process_request = tracked_request
+        server.process_request_thread = tracked_worker
+
+    def quiesce(self, *, timeout: float = 5.0) -> None:
+        with self._condition:
+            accepted = tuple(self._active)
+        for request in accepted:
+            try:
+                request.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+        deadline = time.monotonic() + timeout
+        with self._condition:
+            while self._active:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise RuntimeError("Accepted REALM client handler did not quiesce")
+                self._condition.wait(remaining)
 
 
 def run_local_host(
@@ -48,39 +104,48 @@ def run_local_host(
     underlying SQLite clock transaction protects event effects and receipts;
     the caller may retry with fresh servers against the same pending event.
     """
-    if not isinstance(http, GatewayServer) or not isinstance(telnet, LocalTelnetServer):
-        raise TypeError("Bound REALM HTTP and Telnet server instances are required")
-    if not isinstance(clock, WorldClock):
-        raise TypeError("A bound WorldClock instance is required")
-    if (http.server_address[0] != "127.0.0.1"
-            or telnet.server_address[0] != "127.0.0.1"):
-        raise ValueError("Both local listeners must bind 127.0.0.1")
-    paths = (
-        Path(http.gateway.engine.db_path).resolve(),
-        Path(telnet.engine.db_path).resolve(),
-        Path(clock.db_path).resolve(),
-    )
-    if paths[0] != paths[1] or paths[0] != paths[2]:
-        raise ValueError("HTTP, Telnet and clock must share the same world database")
-    if type(pulses) is not int or not 1 <= pulses <= 1000:
-        raise ValueError("pulses must be an integer in 1..1000")
-    if (type(interval_seconds) not in (int, float)
-            or not math.isfinite(interval_seconds)
-            or not 0.01 <= interval_seconds <= 3600):
-        raise ValueError("interval_seconds must be finite in 0.01..3600")
-    if type(batch_limit) is not int or not 1 <= batch_limit <= 1000:
-        raise ValueError("batch_limit must be an integer in 1..1000")
-    if pulses * batch_limit > 100_000:
-        raise ValueError("One foreground run may process at most 100000 events")
-    if not isinstance(handlers, Mapping) or not handlers or any(
-            not isinstance(kind, str) or not kind or not callable(handler)
-            for kind, handler in handlers.items()):
-        raise ValueError("A nonempty trusted event-kind handler registry is required")
-    if (not callable(now) or not callable(monotonic)
-            or type(acknowledge_forward_jump) is not bool):
-        raise ValueError("Host UTC, pacing and forward-jump controls must be valid")
-    if stop_event is not None and not isinstance(stop_event, type(threading.Event())):
-        raise TypeError("stop_event must be a threading.Event")
+    # The caller hands over two *already listening* sockets. Validation is
+    # therefore inside an ownership boundary: even a rejected start must close
+    # both ports, leaving no stray listener or unusable retry address.
+    try:
+        if not isinstance(http, GatewayServer) or not isinstance(telnet, LocalTelnetServer):
+            raise TypeError("Bound REALM HTTP and Telnet server instances are required")
+        if not isinstance(clock, WorldClock):
+            raise TypeError("A bound WorldClock instance is required")
+        if (http.server_address[0] != "127.0.0.1"
+                or telnet.server_address[0] != "127.0.0.1"):
+            raise ValueError("Both local listeners must bind 127.0.0.1")
+        paths = (
+            Path(http.gateway.engine.db_path).resolve(),
+            Path(telnet.engine.db_path).resolve(),
+            Path(clock.db_path).resolve(),
+        )
+        if paths[0] != paths[1] or paths[0] != paths[2]:
+            raise ValueError("HTTP, Telnet and clock must share the same world database")
+        if type(pulses) is not int or not 1 <= pulses <= 1000:
+            raise ValueError("pulses must be an integer in 1..1000")
+        if (type(interval_seconds) not in (int, float)
+                or not math.isfinite(interval_seconds)
+                or not 0.01 <= interval_seconds <= 3600):
+            raise ValueError("interval_seconds must be finite in 0.01..3600")
+        if type(batch_limit) is not int or not 1 <= batch_limit <= 1000:
+            raise ValueError("batch_limit must be an integer in 1..1000")
+        if pulses * batch_limit > 100_000:
+            raise ValueError("One foreground run may process at most 100000 events")
+        if not isinstance(handlers, Mapping) or not handlers or any(
+                not isinstance(kind, str) or not kind or not callable(handler)
+                for kind, handler in handlers.items()):
+            raise ValueError("A nonempty trusted event-kind handler registry is required")
+        if (not callable(now) or not callable(monotonic)
+                or type(acknowledge_forward_jump) is not bool):
+            raise ValueError("Host UTC, pacing and forward-jump controls must be valid")
+        if stop_event is not None and not isinstance(stop_event, type(threading.Event())):
+            raise TypeError("stop_event must be a threading.Event")
+    except BaseException:
+        for server in (http, telnet):
+            if isinstance(server, (GatewayServer, LocalTelnetServer)):
+                server.server_close()
+        raise
 
     stopping = threading.Event()
     failures: list[BaseException] = []
@@ -112,9 +177,11 @@ def run_local_host(
             stopping.set()
 
     threads: list[threading.Thread] = []
+    sessions: list[_AcceptedSessions] = []
     try:
         if interrupted():
             return PumpReport(0, (), "stopped")
+        sessions = [_AcceptedSessions(http), _AcceptedSessions(telnet)]
         for label, server in (("http", http), ("telnet", telnet)):
             thread = threading.Thread(target=serve_requests, args=(server,),
                                       name=f"REALM-local-{label}")
@@ -135,5 +202,7 @@ def run_local_host(
             thread.join(timeout=2)
         for server in (http, telnet):
             server.server_close()
+        for custody in sessions:
+            custody.quiesce()
         if any(thread.is_alive() for thread in threads):
             raise RuntimeError("Local listener did not stop within two seconds")

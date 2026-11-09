@@ -82,14 +82,18 @@ explicitly; this is not a deployment recipe.
 - The scheduler uses host UTC for event deadlines/receipts; monotonic seconds
   only pace pulses. UTC rewind/large-forward-jump protections still apply.
 - Stop via the supplied `threading.Event`, a bounded run's completion, or an
-  exception. The runner joins both request threads and closes both listeners.
+  exception. The runner joins both request-loop threads, closes both listening
+  sockets, interrupts existing HTTP keep-alive and Telnet sessions, and waits
+  for their handler workers to exit before returning. This prevents previously
+  accepted sessions from writing to the world after the host has stopped.
   A fresh invocation needs **freshly constructed** server instances.
 - An event handler's exception rolls back the whole scheduler batch, including
   receipts and in-database effects. A later foreground call can retry the
   pending event; it must not replay an already acknowledged event.
 - The host owns server construction, explicit `clock.enable()` and handler
-  admission. Validation errors before the function takes ownership of the
-  listeners remain the caller's cleanup responsibility.
+  admission. Passing the already-bound servers to `run_local_host` transfers
+  listener cleanup ownership immediately: even rejected preflight arguments
+  close both sockets so the host can construct fresh servers and retry.
 
 This demonstrates local foreground ticking, not a persistent simulation,
 multi-host consensus, remote/public security, model inference, ship-pressure
