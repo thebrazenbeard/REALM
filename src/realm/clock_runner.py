@@ -19,6 +19,48 @@ class UnknownEventKind(RuntimeError):
     """Scheduled event has no trusted host handler; receipt must stay pending."""
 
 
+class _TrustedRegistryDispatcher:
+    """Preserve whole-transaction hooks of explicitly registered host owners.
+
+    WorldClock invokes begin_host_tick before *any* selected callback and
+    verify_final_precommit after *all* receipts/effect checks. A plain nested
+    dispatch function hides these object attributes, making opted-in custodial
+    handlers (such as atmosphere) unusable or unable to attest their effects.
+    Nothing is discovered, instantiated, or enabled implicitly here.
+    """
+
+    def __init__(self, registry: dict[str, Callable]):
+        self._registry = registry
+        self._custodians: list[tuple[Callable, Callable]] = []
+        seen: set[int] = set()
+        for handler in registry.values():
+            identity = id(handler)
+            if identity in seen:
+                continue
+            seen.add(identity)
+            begin = getattr(handler, "begin_host_tick", None)
+            final = getattr(handler, "verify_final_precommit", None)
+            if begin is None and final is None:
+                continue
+            if not callable(begin) or not callable(final):
+                raise ValueError("Registered host custody handler requires both callable tick hooks")
+            self._custodians.append((begin, final))
+
+    def begin_host_tick(self, db, due_events: tuple[DueEvent, ...]) -> None:
+        for begin, _ in self._custodians:
+            begin(db, due_events)
+
+    def __call__(self, db, event: DueEvent) -> object:
+        handler = self._registry.get(event.kind)
+        if handler is None:
+            raise UnknownEventKind(f"Unregistered event kind {event.kind!r}")
+        return handler(db, event)
+
+    def verify_final_precommit(self, db, processed: tuple[DueEvent, ...]) -> None:
+        for _, final in self._custodians:
+            final(db, processed)
+
+
 @dataclass(frozen=True)
 class PumpReport:
     pulses: int
@@ -68,11 +110,7 @@ def run_foreground(
             or (stop is not None and not callable(stop))):
         raise ValueError("Clock, pacing and stop providers must be callable")
 
-    def dispatch(db, event: DueEvent) -> None:
-        handler = registry.get(event.kind)
-        if handler is None:
-            raise UnknownEventKind(f"Unregistered event kind {event.kind!r}")
-        handler(db, event)
+    dispatch = _TrustedRegistryDispatcher(registry)
     began = monotonic()
     if type(began) not in (int, float) or not math.isfinite(began):
         raise ValueError("Monotonic provider must return finite seconds")
