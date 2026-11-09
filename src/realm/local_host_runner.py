@@ -62,7 +62,7 @@ class _AcceptedSessions:
         server.process_request = tracked_request
         server.process_request_thread = tracked_worker
 
-    def quiesce(self, *, timeout: float = 5.0) -> None:
+    def quiesce(self) -> None:
         with self._condition:
             accepted = tuple(self._active)
         for request in accepted:
@@ -70,13 +70,15 @@ class _AcceptedSessions:
                 request.shutdown(socket.SHUT_RDWR)
             except OSError:
                 pass
-        deadline = time.monotonic() + timeout
         with self._condition:
             while self._active:
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    raise RuntimeError("Accepted REALM client handler did not quiesce")
-                self._condition.wait(remaining)
+                # An HTTP handler may already be inside trusted Python/SQLite
+                # code which cannot be safely cancelled by closing its socket.
+                # Returning with a timeout error would leave a live world
+                # writer that can commit AFTER the host claims to have stopped.
+                # This deliberately waits for truthful quiescence; hosts need
+                # process isolation for a hard shutdown deadline.
+                self._condition.wait()
 
 
 def run_local_host(

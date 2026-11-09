@@ -238,6 +238,97 @@ class LocalHostRunnerTests(unittest.TestCase):
             if telnet_socket is not None:
                 telnet_socket.close()
 
+    def test_noninterruptible_trusted_http_action_must_finish_before_host_returns(self):
+        """A failed shutdown timeout cannot leave a live durable writer behind."""
+        http, telnet = self.servers()
+        token = self.gateway.credentials.provision("Captain")
+        stop = threading.Event()
+        entered = threading.Event()
+        release = threading.Event()
+        finished = threading.Event()
+        outcomes = []
+        original_command = self.gateway.command
+
+        def deliberately_blocked_command(*args, **kwargs):
+            entered.set()
+            try:
+                if not release.wait(timeout=12):
+                    raise RuntimeError("Host test action unexpectedly held too long")
+                return original_command(*args, **kwargs)
+            finally:
+                finished.set()
+
+        self.gateway.command = deliberately_blocked_command
+
+        def foreground():
+            try:
+                outcomes.append(("returned", run_local_host(
+                    http, telnet, self.clock, {"unused": lambda db, event: None},
+                    pulses=100, interval_seconds=0.05, now=lambda: UTC,
+                    stop_event=stop,
+                )))
+            except BaseException as exc:
+                outcomes.append(("raised", exc))
+
+        host_thread = threading.Thread(target=foreground)
+        host_thread.start()
+        sender = None
+        conn = HTTPConnection("127.0.0.1", http.server_port, timeout=2)
+        try:
+            for _ in range(100):
+                try:
+                    self.http_json(http, "/api/v1/health")
+                    break
+                except OSError:
+                    time.sleep(0.01)
+            else:
+                self.fail("No HTTP listener")
+            headers = {"Authorization": "Bearer " + token,
+                       "Content-Type": "application/json"}
+            conn.request("POST", "/api/v1/join", json.dumps({"player": "Captain"}), headers)
+            response = conn.getresponse()
+            self.assertEqual(200, response.status)
+            response.read()
+
+            def send_while_shutdown():
+                try:
+                    conn.request("POST", "/api/v1/command",
+                                 json.dumps({"player": "Captain", "command": "say late host action"}),
+                                 headers)
+                    reply = conn.getresponse()
+                    reply.read()
+                except (OSError, HTTPException):
+                    pass  # Socket closure is expected during host shutdown.
+
+            sender = threading.Thread(target=send_while_shutdown)
+            sender.start()
+            self.assertTrue(entered.wait(timeout=2), "Trusted HTTP action never entered")
+            stop.set()
+            # The prior 5-second cleanup watchdog returned with a live writer.
+            # Here the host MUST still own the blocked handler after that limit.
+            host_thread.join(timeout=5.3)
+            self.assertTrue(host_thread.is_alive(), "Host returned while an accepted handler could still commit")
+            self.assertEqual([], outcomes)
+            release.set()
+            self.assertTrue(finished.wait(timeout=3))
+            host_thread.join(timeout=3)
+            self.assertFalse(host_thread.is_alive())
+            self.assertEqual(1, len(outcomes))
+            self.assertEqual("returned", outcomes[0][0], outcomes)
+            self.assertEqual("stopped", outcomes[0][1].reason)
+            with closing(sqlite3.connect(self.db_path)) as db:
+                rows = db.execute(
+                    "SELECT payload_json FROM events WHERE kind='say' AND actor='Captain'"
+                ).fetchall()
+            self.assertEqual([{"text": "late host action"}], [json.loads(row[0]) for row in rows])
+        finally:
+            release.set()
+            if sender is not None:
+                sender.join(timeout=3)
+            stop.set()
+            host_thread.join(timeout=3)
+            conn.close()
+
     def test_wrong_world_rejected_before_dispatch(self):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)

@@ -87,6 +87,12 @@ explicitly; this is not a deployment recipe.
   for their handler workers to exit before returning. This prevents previously
   accepted sessions from writing to the world after the host has stopped.
   A fresh invocation needs **freshly constructed** server instances.
+- The number of UTC pulses is bounded, but shutdown time is **not guaranteed
+  bounded** when a trusted handler is already running noninterruptible Python
+  or SQLite code. The runner waits for that handler to exit before reporting
+  stopped; an indefinitely hung handler can therefore block the foreground
+  process indefinitely. A hard kill/deadline requires separately authorized
+  isolated-process containment, which this module does not install.
 - An event handler's exception rolls back the whole scheduler batch, including
   receipts and in-database effects. A later foreground call can retry the
   pending event; it must not replay an already acknowledged event.
