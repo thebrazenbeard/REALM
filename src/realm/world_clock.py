@@ -304,18 +304,10 @@ class WorldClock:
             # the bounded legacy exception below). Legacy clocks without
             # economy tables remain usable.
             roster_in_batch = any(r["kind"] == "npc_roster_gather" for r in rows)
-            # These older opt-in handlers own different validated gameplay
-            # action/receipt contracts. Their legitimate gather/craft/build
-            # effects can change stock and pouches without a roster grant.
-            # Until their receipts gain a common typed delta-attestation
-            # interface, don't misclassify them as ungranted roster writes.
-            # This is an explicit source-level custody exception for batches
-            # selecting one of these kinds, NOT authorization from event
-            # payload text or proof that their effects are fully attested.
-            legacy_economy_in_batch = any(
-                r["kind"] in ("host_action", "npc_economic_gather",
-                              "trusted_game_action") for r in rows
-            )
+            # Selected legacy host-action kinds can have real gather/craft
+            # effects validated by their own adapter. The clock captures
+            # those effects immediately after each callback, while separate
+            # typed adapter proof must qualify the in-handler transition.
             economy_tables = {
                 r["name"] for r in db.execute(
                     "SELECT name FROM main.sqlite_master WHERE type='table' "
@@ -371,6 +363,18 @@ class WorldClock:
                     )
                 } if expected_pouches is not None else None
 
+            # New gathers are authorized only while the selected trusted
+            # handler runs. An installed trigger on the *later* scheduler
+            # receipt or UTC watermark must not add a second forged gather
+            # (including a negative-ID row) and inherit a legacy-kind bypass.
+            def gather_state():
+                return {
+                    r["id"]: tuple(r) for r in db.execute(
+                        "SELECT * FROM main.events WHERE kind='gather'"
+                    )
+                } if event_ledger_before is not None else None
+
+            expected_gathers = gather_state()
             gather_events = {}
             # Optional host-owned components may bind exact transaction-start
             # evidence before any selected callback mutates this world.
@@ -383,9 +387,11 @@ class WorldClock:
                 event = _event(row)
                 # A previous scheduler receipt trigger must not contaminate
                 # what a later valid handler adopts as its starting inventory.
-                if node_state() != expected_nodes or pouch_state() != expected_pouches:
+                if (node_state() != expected_nodes or pouch_state() != expected_pouches
+                        or gather_state() != expected_gathers):
                     raise ValueError("Roster inventory drifted before next UTC action")
-                if event.kind == "npc_roster_gather":
+                if event.kind in ("npc_roster_gather", "host_action",
+                                  "npc_economic_gather", "trusted_game_action"):
                     prior_event_ids = {
                         r["id"] for r in db.execute("SELECT id FROM main.events")
                     }
@@ -425,6 +431,7 @@ class WorldClock:
                         gathered = matching[0]
                         gather_events[gathered["id"]] = tuple(gathered)
                         pending_gathers.remove(gathered)
+                    expected_gathers.update(gather_events)
                     if node_state() != expected_nodes or pouch_state() != expected_pouches:
                         raise ValueError("Roster grant includes ungranted inventory effects")
                 elif event.kind in ("host_action", "npc_economic_gather",
@@ -443,6 +450,15 @@ class WorldClock:
                             ).fetchone() is None):
                         raise ValueError("Legacy host economy change lacks action receipt")
                     expected_nodes, expected_pouches = new_nodes, new_pouches
+                    # This is a post-handler *observation*, not a semantic
+                    # authorization of its in-handler economic effects. The
+                    # typed legacy action adapter owns that distinct proof.
+                    for gathered in db.execute("SELECT * FROM main.events WHERE kind='gather'"):
+                        if gathered["id"] not in prior_event_ids:
+                            gather_events[gathered["id"]] = tuple(gathered)
+                    expected_gathers.update(gather_events)
+                if gather_state() != expected_gathers:
+                    raise ValueError("Roster gather history changed within ungranted UTC action")
                 updated = db.execute(
                     "UPDATE main.clock_events SET processed_utc=? "
                     "WHERE event_id=? AND processed_utc IS NULL",
@@ -548,10 +564,11 @@ class WorldClock:
                 if any(final_ledger.get(event_id) != signed
                        for event_id, signed in gather_events.items()):
                     raise ValueError("Roster tick altered signed gather history")
+                if gather_state() != expected_gathers:
+                    raise ValueError("Roster gather history changed after host action")
                 if any(r["kind"] == "gather"
                        and r["id"] not in event_ledger_before
                        and r["id"] not in gather_events
-                       and not legacy_economy_in_batch
                        for r in final_event_rows):
                     raise ValueError("Roster gather history contains ungranted effects")
             return processed
