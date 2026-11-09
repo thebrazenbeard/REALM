@@ -1,0 +1,46 @@
+{
+  "schema": "realm.worldpack.v1",
+  "world_id": "cedarwatch-example",
+  "name": "Cedarwatch Village",
+  "start_room": "village_green",
+  "rooms": [
+    {
+      "id": "village_green",
+      "name": "Village Green",
+      "description": "A bell hangs over a quiet gathering place. Paths lead toward a small forge, a tavern, and the northern woods.",
+      "exits": {"east": "old_forge", "west": "tavern", "north": "woodland_path"}
+    },
+    {
+      "id": "old_forge",
+      "name": "Old Forge",
+      "description": "A banked charcoal hearth warms the stone floor. Simple iron tools rest beside the anvil.",
+      "exits": {"west": "village_green"}
+    },
+    {
+      "id": "tavern",
+      "name": "The Lantern Room",
+      "description": "Wooden tables and a broad fireplace offer shelter to travelers. The village green lies east.",
+      "exits": {"east": "village_green"}
+    },
+    {
+      "id": "woodland_path",
+      "name": "Woodland Path",
+      "description": "Old pines shelter a narrow footpath. Birdsong carries over the mossy stones.",
+      "exits": {"south": "village_green"}
+    }
+  ],
+  "items": [
+    {
+      "id": "oak_staff",
+      "name": "Oak walking staff",
+      "description": "A plain staff worn smooth by years of travel.",
+      "room": "tavern"
+    },
+    {
+      "id": "smith_hammer",
+      "name": "Blacksmith's hammer",
+      "description": "A practical iron hammer with an ash-wood handle.",
+      "room": "old_forge"
+    }
+  ]
+}
