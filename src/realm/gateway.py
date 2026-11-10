@@ -7,6 +7,7 @@ service, not an HTTPS endpoint, and not a replacement for Telnet/GMCP support.
 from __future__ import annotations
 
 import argparse
+import errno
 import json
 import math
 import re
@@ -806,8 +807,20 @@ class GatewayHandler(BaseHTTPRequestHandler):
 
     def _send(self, status: int, obj: dict) -> None:
         data = json.dumps(obj, ensure_ascii=False).encode("utf-8")
-        self._headers(status, len(data))
-        self.wfile.write(data)
+        try:
+            self._headers(status, len(data))
+            self.wfile.write(data)
+        except OSError as error:
+            # A POSIX host shutdown forcibly detaches accepted sockets to
+            # wake buffered keep-alive readers. A trusted action may already
+            # have committed before its response write sees EBADF. Suppress
+            # only that socket transport failure for the exact selected
+            # connection; application errors never pass through this seam.
+            revoked = getattr(self.server, "_realm_local_host_revoked", None)
+            if (error.errno != errno.EBADF or not callable(revoked)
+                    or not revoked(self.connection)):
+                raise
+            self.close_connection = True
 
     def _read_post_body(self, length: int) -> bytes:
         """Read bounded bytes against an absolute deadline, even if trickled."""

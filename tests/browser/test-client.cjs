@@ -46,7 +46,7 @@ function worldMap() {
   };
 }
 
-function instantiate({ missingMap = false, mapOnMove = false, rejectUnauthorized = false, fetchImpl = null, mapGate = null, roomGate = null, joinGate = null, nowMs = null, commandGate = null } = {}) {
+function instantiate({ missingMap = false, mapOnMove = false, rejectUnauthorized = false, fetchImpl = null, mapGate = null, roomGate = null, joinGate = null, nowMs = null, commandGate = null, cryptoImpl = null } = {}) {
   const elements = new Map();
   const get = (id) => {
     if (!elements.has(id)) elements.set(id, new Element());
@@ -92,7 +92,7 @@ function instantiate({ missingMap = false, mapOnMove = false, rejectUnauthorized
     document, window, URL, fetch, console,
     setInterval: (fn, delay) => { timers.push({ fn, delay }); return timers.length; },
     clearInterval: () => {},
-    crypto: require("node:crypto").webcrypto, AbortController,
+    crypto: cryptoImpl || require("node:crypto").webcrypto, AbortController,
     Date: nowMs ? class extends Date { static now() { return nowMs.value; } } : Date,
   }, { filename: "docs/app.js" });
   const event = { preventDefault() {} };
@@ -204,6 +204,121 @@ test("rapid duplicate command submits issue only one POST and one action ID", as
   await Promise.all([first, second]);
   assert.equal(client.get("send-button").disabled, false);
   assert.equal(client.get("command-input").value, "");
+});
+
+test("synchronous command input reentrancy cannot dispatch duplicate POSTs", async () => {
+  const client = instantiate();
+  client.get("host-url").value = "http://127.0.0.1:8765";
+  client.get("player-name").value = "Explorer";
+  client.get("access-token").value = "secret-token";
+  await client.connect();
+
+  const input = client.get("command-input");
+  let draft = "say One command";
+  let reentered = false;
+  Object.defineProperty(input, "value", {
+    configurable: true,
+    get() {
+      // A synchronously reentrant event is legal even if the browser has not
+      // yet disabled the button; the handler must acquire its latch first.
+      if (!reentered) { reentered = true; void client.send(); }
+      return draft;
+    },
+    set(value) { draft = value; },
+  });
+
+  await client.send();
+  const posts = client.requests.filter(({ url }) => url.endsWith("/api/v1/command"));
+  assert.equal(posts.length, 1, "one logical Send must produce only one action ID and POST");
+  assert.equal(new Set(posts.map(({ options }) => JSON.parse(options.body).action_id)).size, 1);
+});
+
+test("a synchronous command input failure releases the latch for an explicit retry", async () => {
+  const client = instantiate();
+  client.get("host-url").value = "http://127.0.0.1:8765";
+  client.get("player-name").value = "Explorer";
+  client.get("access-token").value = "synthetic-token";
+  await client.connect();
+
+  const input = client.get("command-input");
+  let draft = "say Recovered";
+  Object.defineProperty(input, "value", {
+    configurable: true,
+    get() { throw new Error("synthetic input getter failure"); },
+    set(value) { draft = value; },
+  });
+  await assert.rejects(client.send(), /synthetic input getter failure/);
+  assert.equal(client.requests.filter(({ url }) => url.endsWith("/api/v1/command")).length, 0);
+
+  Object.defineProperty(input, "value", {
+    configurable: true,
+    get() { return draft; },
+    set(value) { draft = value; },
+  });
+  await client.send();
+  assert.equal(client.requests.filter(({ url }) => url.endsWith("/api/v1/command")).length, 1,
+    "the next real Send must not be suppressed by a poisoned latch");
+  assert.equal(client.get("send-button").disabled, false);
+
+  client.disconnect();
+  client.get("access-token").value = "new-synthetic-token";
+  await client.connect();
+  input.value = "say New connection";
+  await client.send();
+  const posts = client.requests.filter(({ url }) => url.endsWith("/api/v1/command"));
+  assert.equal(posts.length, 2, "reconnection establishes a fresh command latch");
+  assert.equal(posts[1].options.headers.Authorization, "Bearer new-synthetic-token");
+});
+
+test("a synchronous control-disable failure cannot poison the command latch", async () => {
+  const client = instantiate();
+  client.get("host-url").value = "http://127.0.0.1:8765";
+  client.get("player-name").value = "Explorer";
+  client.get("access-token").value = "synthetic-token";
+  await client.connect();
+
+  const sendButton = client.get("send-button");
+  let disabled = false;
+  let fail = true;
+  Object.defineProperty(sendButton, "disabled", {
+    configurable: true,
+    get() { return disabled; },
+    set(value) {
+      if (value && fail) { fail = false; throw new Error("synthetic disabled setter failure"); }
+      disabled = value;
+    },
+  });
+  client.get("command-input").value = "say Control recovered";
+  await assert.rejects(client.send(), /synthetic disabled setter failure/);
+  assert.equal(client.requests.filter(({ url }) => url.endsWith("/api/v1/command")).length, 0);
+  assert.equal(disabled, false);
+
+  await client.send();
+  assert.equal(client.requests.filter(({ url }) => url.endsWith("/api/v1/command")).length, 1);
+});
+
+test("a synchronous action-ID failure releases latch without dispatching", async () => {
+  let fail = true;
+  const client = instantiate({ cryptoImpl: { randomUUID() {
+    if (fail) { fail = false; throw new Error("synthetic UUID failure"); }
+    return "synthetic-action-id";
+  } } });
+  client.get("host-url").value = "http://127.0.0.1:8765";
+  client.get("player-name").value = "Explorer";
+  client.get("access-token").value = "synthetic-token";
+  await client.connect();
+
+  client.get("command-input").value = "say UUID recovered";
+  await assert.rejects(client.send(), /synthetic UUID failure/);
+  assert.equal(client.requests.filter(({ url }) => url.endsWith("/api/v1/command")).length, 0);
+  let historyPrevented = false;
+  client.get("command-input").events.keydown({ key: "ArrowUp", preventDefault() { historyPrevented = true; } });
+  assert.equal(historyPrevented, false, "a command that never dispatched must not enter history");
+  assert.equal(client.get("command-input").disabled, false);
+  await client.send();
+  const posts = client.requests.filter(({ url }) => url.endsWith("/api/v1/command"));
+  assert.equal(posts.length, 1);
+  assert.equal(JSON.parse(posts[0].options.body).action_id, "synthetic-action-id");
 });
 
 test("an old pending command cannot block or change a reconnected session", async () => {

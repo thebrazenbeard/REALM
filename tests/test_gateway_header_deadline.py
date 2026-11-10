@@ -55,13 +55,14 @@ class GatewayHeaderDeadlineTests(unittest.TestCase):
         self.clients.append(client)
         return client
 
-    def _status(self):
+    def _status(self, *, send_request=True):
         with socket.create_connection(("127.0.0.1", self.port), timeout=2) as client:
             client.settimeout(2)
-            client.sendall(
-                b"GET /api/v1/health HTTP/1.1\r\nHost: 127.0.0.1\r\n"
-                b"Connection: close\r\n\r\n"
-            )
+            if send_request:
+                client.sendall(
+                    b"GET /api/v1/health HTTP/1.1\r\nHost: 127.0.0.1\r\n"
+                    b"Connection: close\r\n\r\n"
+                )
             first = client.recv(512).split(b"\r\n", 1)[0]
         self.assertTrue(first.startswith(b"HTTP/1.1 "), first)
         return int(first.split()[1])
@@ -70,12 +71,22 @@ class GatewayHeaderDeadlineTests(unittest.TestCase):
         deadline = time.monotonic() + seconds
         observed = []
         while time.monotonic() < deadline:
-            code = self._status()
+            # Capacity rejection occurs before request parsing. Sending a GET
+            # to a rejected socket leaves unread bytes when TCPServer closes
+            # it; Windows can reset that socket before the 503 is received.
+            # Probe the actual pre-header admission contract without a body.
+            code = self._status(send_request=(wanted != 503))
             observed.append(code)
             if code == wanted:
                 return
             time.sleep(0.02)
         self.fail(f"Expected HTTP {wanted}; observed {observed!r}")
+
+    def test_capacity_rejection_precedes_request_headers(self):
+        """A saturated accept loop must return a real 503 without a GET."""
+        self._connect()  # Occupy the only worker in its idle pre-header read.
+        self._eventual_status(503, seconds=0.18)
+        self.assertEqual(503, self._status(send_request=False))
 
     def test_slow_request_line_reclaims_worker_before_socket_idle_timeout(self):
         self.server.handle_error = lambda request, address: self.unhandled_errors.append(sys.exc_info()[1])
