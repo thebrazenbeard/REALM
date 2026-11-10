@@ -74,7 +74,9 @@ class Combat:
         """Host-only, one-time policy installation; never an HTTP/Telnet verb.
 
         Offline attacks are denied unless the HOST deliberately enables them.
-        This engine has no authoritative live-session/online-presence witness.
+        With that default, the host may instead explicitly inject the
+        authenticated local presence witness into bound HTTP/Telnet servers;
+        credentials and recent activity are checked in every combat writer.
         """
         if (type(max_hp) is not int or not 1 <= max_hp <= 1000
                 or type(damage) is not int or not 1 <= damage <= max_hp):
@@ -177,7 +179,17 @@ class Combat:
         if room in json.loads(policy["safe_rooms_json"]):
             raise ValueError("PvP combat is forbidden in this safe zone")
         if not policy["allow_offline_targets"]:
-            raise ValueError("Target presence cannot be verified; host policy denies offline attacks")
+            from .local_presence import LocalPresenceWitness, PresenceDenied
+            witness = getattr(engine, "_local_presence_witness", None)
+            if not isinstance(witness, LocalPresenceWitness):
+                raise ValueError("Recent authenticated presence required; no local host witness")
+            try:
+                # The Engine owns BEGIN IMMEDIATE. The witness verifies both
+                # currently valid identities, its exact world/DB/process,
+                # and bounded recent activity without taking Telnet join locks.
+                witness.require_pair_in_writer(db, actor, target["id"])
+            except PresenceDenied as exc:
+                raise ValueError("Recent authenticated presence required for both players") from exc
         amount = min(int(policy["damage"]), their_hp)
         remaining = their_hp - amount
         changed = db.execute(

@@ -1831,3 +1831,100 @@ test("live Python gateway: browser join, authored map, movement, and token rejec
     assert.match(wrongActor.get("connection-note").textContent, /403/);
   }
 });
+
+test("two scoped browser players opt into live PvP and receive a room-redacted global death herald", {
+  skip: (!fs.existsSync(gatewaySource) ||
+    !fs.existsSync(path.join(gatewayRoot, "src/realm/local_presence.py"))) &&
+    "Local PvP presence has not been integrated into this browser-only source tree",
+}, async (t) => {
+  const temp = fs.mkdtempSync(path.join(os.tmpdir(), "realm-browser-pvp-"));
+  const db = path.join(temp, "world.sqlite3");
+  const guard = path.join(temp, "scoped-guard.json");
+  const program = String.raw`
+import sys
+from realm.gateway import Gateway, GatewayServer
+from realm.combat import Combat
+from realm.local_presence import LocalPresenceWitness
+
+db, guard = sys.argv[1:3]
+gateway = Gateway(db, world_id="browser-pvp-test", scoped_credentials=True, scoped_guard_path=guard)
+Combat.configure(gateway.engine, max_hp=4, damage=4, safe_rooms=())
+token_a = gateway.scoped_credentials.provision("Explorer")
+token_b = gateway.scoped_credentials.provision("Other")
+# The test uses a deliberately short host idle bound to prove expiry without
+# sleeping through the production host's longer inactivity window.
+witness = LocalPresenceWitness(gateway.engine, "browser-pvp-test", idle_seconds=1)
+server = GatewayServer(gateway, ("http://127.0.0.1:8000",), port=0, presence_witness=witness)
+print("READY", server.server_port, token_a, token_b, flush=True)
+server.serve_forever(poll_interval=0.05)
+`;
+  const child = spawn(process.env.REALM_PYTHON || "python", ["-u", "-c", program, db, guard], {
+    cwd: gatewayRoot,
+    env: { ...process.env, PYTHONPATH: path.join(gatewayRoot, "src") },
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  t.after(async () => {
+    if (child.exitCode === null) child.kill();
+    if (child.exitCode === null) await new Promise((resolve) => child.once("exit", resolve));
+    fs.rmSync(temp, { recursive: true, force: true });
+  });
+  let stderr = "";
+  child.stderr.on("data", (data) => { stderr += data.toString(); });
+  const ready = await new Promise((resolve, reject) => {
+    const timeout = setTimeout(() => reject(new Error("PvP gateway startup timed out: " + stderr)), 9000);
+    child.once("exit", (code) => { clearTimeout(timeout); reject(new Error(`PvP gateway exited ${code}: ${stderr}`)); });
+    child.stdout.on("data", (data) => {
+      const match = data.toString().match(/READY (\d+) ([A-Za-z0-9_-]+) ([A-Za-z0-9_-]+)/);
+      if (match) { clearTimeout(timeout); resolve({ port: Number(match[1]), explorerToken: match[2], otherToken: match[3] }); }
+    });
+  });
+  const base = `http://127.0.0.1:${ready.port}`;
+  const liveFetch = (url, options) => globalThis.fetch(url, {
+    ...options, headers: { ...options.headers, Origin: "http://127.0.0.1:8000" },
+  });
+  const explorer = instantiate({ fetchImpl: liveFetch });
+  const other = instantiate({ fetchImpl: liveFetch });
+  for (const [client, name, token] of [
+    [explorer, "Explorer", ready.explorerToken], [other, "Other", ready.otherToken],
+  ]) {
+    client.get("host-url").value = base;
+    client.get("player-name").value = name;
+    client.get("access-token").value = token;
+    await client.connect();
+    assert.equal(client.get("world-name").textContent, "browser-pvp-test");
+    await client.timers[0].fn(); // Explicit scoped authenticated activity, not a fake online flag.
+    client.get("command-input").value = "pvp on";
+    await client.send();
+    assert.ok(client.get("feed").children.some((node) =>
+      node.children[1].children[1].textContent.includes("PvP is now ON")));
+  }
+  // A saved room and PvP opt-in do not prove online status. Let Other's
+  // authenticated activity expire, refresh Explorer only, and require the
+  // host to deny the hit without trusting a browser-supplied online flag.
+  await new Promise((resolve) => setTimeout(resolve, 1200));
+  await explorer.timers[0].fn();
+  explorer.get("command-input").value = "attack Other";
+  await explorer.send();
+  const deniedLines = explorer.get("feed").children.map((node) => node.children[1].children[1].textContent);
+  assert.ok(deniedLines.some((line) => /active-session witness required|presence.*(denied|required|expired)/i.test(line)),
+    "stale target activity must deny combat: " + deniedLines.join(" | "));
+  other.get("command-input").value = "pvp status";
+  await other.send();
+  assert.ok(other.get("feed").children.some((node) => node.children[1].children[1].textContent.includes("HP 4/4")),
+    "a stale-presence rejection must not apply combat damage");
+  await explorer.timers[0].fn();
+  explorer.get("command-input").value = "attack Other";
+  await explorer.send();
+  const attackerLines = explorer.get("feed").children.map((node) => node.children[1].children[1].textContent);
+  assert.ok(attackerLines.some((line) => /Other has fallen/.test(line)),
+    "attacker must observe a committed lethal hit, not merely a client animation: " + attackerLines.join(" | "));
+  await other.timers[0].fn();
+  const heralds = other.get("feed").children.filter((node) => /feed-pvp-death/.test(node.className));
+  assert.equal(heralds.length, 1, "other authenticated player must see exactly one public PK notice");
+  assert.equal(heralds[0].children[1].children[0].textContent, "REALM / DEATH HERALD");
+  assert.match(heralds[0].children[1].children[1].textContent, /Other has fallen before Explorer/);
+  assert.ok(!heralds[0].children[1].children[0].textContent.includes("atrium"),
+    "global PK notices must never reveal the fight room in their heading");
+  explorer.disconnect();
+  other.disconnect();
+});

@@ -13,6 +13,7 @@ from contextlib import closing
 from urllib.parse import parse_qs, urlsplit
 
 from .gateway import Gateway, GatewayHandler, GatewayServer
+from .local_presence import LocalPresenceWitness
 
 MAX_WAIT_MS = 5_000
 DEFAULT_WAIT_MS = 1_000
@@ -29,10 +30,13 @@ class FeedWaitServer(GatewayServer):
     def __init__(
         self, gateway: Gateway, allowed_origins: tuple[str, ...], port: int = 8768,
         *, max_waiters: int = 8,
+        presence_witness: LocalPresenceWitness | None = None,
     ):
         if type(max_waiters) is not int or not 1 <= max_waiters <= MAX_WAITERS:
             raise ValueError("max_waiters must be an integer from 1 to 32")
-        super().__init__(gateway, allowed_origins, port)
+        super().__init__(
+            gateway, allowed_origins, port, presence_witness=presence_witness,
+        )
         # Base GatewayServer binds and does not begin serving automatically.
         self.RequestHandlerClass = FeedWaitHandler
         self.feed_slots = threading.BoundedSemaphore(max_waiters)
@@ -183,6 +187,14 @@ class FeedWaitHandler(GatewayHandler):
                     self._send(400, {"ok": False, "error": str(exc)})
                     return
                 if result["events"] or time.monotonic() >= deadline:
+                    if self._principal() != principal:
+                        self._send(401, {"ok": False, "error": "Player token revoked or rotated"})
+                        return
+                    if channel_revision != self.server.gateway.channel_access_revision(principal):
+                        self._send(409, {"ok": False, "error": "Channel membership changed; retry"})
+                        return
+                    _, _, presented = self.headers.get("Authorization", "").partition(" ")
+                    self.server.refresh_scoped_presence(principal, presented, "feed:read")
                     if self._principal() != principal:
                         self._send(401, {"ok": False, "error": "Player token revoked or rotated"})
                         return

@@ -21,7 +21,9 @@ from pathlib import Path
 from typing import Callable
 
 from .auth import CredentialStore
-from .engine import Engine
+from .engine import Engine, _pristine_schema, _schema_snapshot
+from .local_presence import LocalPresenceWitness, PresenceDenied, PresenceLease, _WORLD
+from .presence_host_binding import bind_host_engine, unbind_host_engine
 from .router import CommandRouter
 
 
@@ -93,13 +95,22 @@ class LocalTelnetServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
     daemon_threads = True
 
     def __init__(self, engine: Engine, token: str | None, port: int = 7777,
-                 *, player_credentials: bool = False):
+                 *, player_credentials: bool = False,
+                 presence_witness: LocalPresenceWitness | None = None):
         if type(player_credentials) is not bool:
             raise ValueError("player_credentials must be a bool")
         if not player_credentials and (
                 not isinstance(token, str) or not token or len(token) > 256):
             raise ValueError("A nonempty server access token is required (max 256 characters)")
+        if presence_witness is not None:
+            if not isinstance(presence_witness, LocalPresenceWitness) or not player_credentials:
+                raise ValueError("Presence requires a real player-bound Telnet credential")
         self.engine = engine
+        self.presence_witness = presence_witness
+        self._presence_bound = False
+        self._presence_lock = threading.Lock()
+        self._presence_leases: set[PresenceLease] = set()
+        self._presence_closed = False
         self.player_credentials = player_credentials
         self.token = None if player_credentials else token
         self.credentials = CredentialStore(engine) if player_credentials else None
@@ -111,6 +122,13 @@ class LocalTelnetServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
         self._join_lock = threading.Lock()
         self._active_names: set[str] = set()
         super().__init__(("127.0.0.1", port), LocalTelnetHandler)
+        try:
+            if presence_witness is not None:
+                bind_host_engine(engine, presence_witness)
+                self._presence_bound = True
+        except BaseException:
+            super().server_close()
+            raise
 
     @property
     def router(self) -> CommandRouter:
@@ -157,6 +175,44 @@ class LocalTelnetServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
                 raise PermissionError("Player credential expired or revoked")
 
         return guard
+
+    def admit_bound_presence(self, name: str, token: str) -> PresenceLease | None:
+        witness = self.presence_witness
+        if witness is None:
+            return None
+        digest = CredentialStore._digest(token)
+        def resolver(db: sqlite3.Connection) -> str | None:
+            row = db.execute(
+                "SELECT player_name FROM main.player_credentials WHERE token_digest=?",
+                (digest,),
+            ).fetchone()
+            return str(row[0]) if row is not None else None
+        lease = witness.admit(
+            name, protocol="telnet-player-credential", resolve_principal=resolver,
+        )
+        with self._presence_lock:
+            if self._presence_closed:
+                lease.close()
+                raise PresenceDenied("Telnet host is closing")
+            self._presence_leases.add(lease)
+        return lease
+
+    def release_presence(self, lease: PresenceLease) -> None:
+        with self._presence_lock:
+            self._presence_leases.discard(lease)
+        lease.close()
+
+    def server_close(self) -> None:
+        with self._presence_lock:
+            self._presence_closed = True
+            leases = tuple(self._presence_leases)
+            self._presence_leases.clear()
+        for lease in leases:
+            lease.close()
+        if self._presence_bound:
+            unbind_host_engine(self.engine, self.presence_witness)
+            self._presence_bound = False
+        super().server_close()
 
     def channel_access_revision(self, player: str) -> int:
         """Read-only response-time proof for host-granted group content."""
@@ -228,7 +284,17 @@ class LocalTelnetHandler(socketserver.BaseRequestHandler):
             try:
                 chunk = self.request.recv(1024)
             except socket.timeout:
-                return None
+                lease = getattr(self, "_presence_lease", None)
+                if lease is None:
+                    return None
+                try:
+                    # A verified, still-owned server socket is sufficient to
+                    # renew Telnet presence without requiring users to type.
+                    # The lease independently rechecks the stored credential.
+                    lease.refresh()
+                except PresenceDenied:
+                    return None
+                continue
             if not chunk:
                 return None
             body, reply = self._filter.feed(chunk)
@@ -241,6 +307,7 @@ class LocalTelnetHandler(socketserver.BaseRequestHandler):
 
     def handle(self) -> None:
         self._claimed_name: str | None = None
+        self._presence_lease: PresenceLease | None = None
         try:
             self._run()
         except (ConnectionResetError, BrokenPipeError, TimeoutError, OSError):
@@ -251,6 +318,8 @@ class LocalTelnetHandler(socketserver.BaseRequestHandler):
             except OSError:
                 pass
         finally:
+            if self._presence_lease is not None:
+                self.server.release_presence(self._presence_lease)
             if self._claimed_name is not None:
                 self.server.release_name(self._claimed_name)
 
@@ -289,11 +358,28 @@ class LocalTelnetHandler(socketserver.BaseRequestHandler):
             self._send("That player name is already connected to this local server.\n")
             return
         self._claimed_name = name
+        if self.server.player_credentials and self.server.presence_witness is not None:
+            try:
+                self._presence_lease = self.server.admit_bound_presence(name, presented)
+            except PresenceDenied:
+                self._send("Access revoked or authenticated session witness unavailable.\n")
+                return
+            # The old 90-second socket idle timeout is not a credential-bound
+            # liveness heartbeat. A small server-owned recv timeout periodically
+            # checks the actual still-open socket and current credential.
+            interval = min(2.0, max(0.2, self.server.presence_witness.idle_seconds / 3))
+            self.request.settimeout(interval)
         self._send(f"\n{greeting}\nREALM> ")
         while True:
             command = self._line()
             if command is None:
                 return
+            if self._presence_lease is not None:
+                try:
+                    self._presence_lease.refresh()
+                except PresenceDenied:
+                    self._send("Access revoked.\n")
+                    return
             command = command.strip()
             if (self.server.player_credentials and
                     self.server.credentials.authenticate(presented) != name):
@@ -338,12 +424,49 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--port", type=int, default=7777)
     parser.add_argument("--player-credentials", action="store_true",
                         help="Require host-provisioned player tokens, with no client-chosen name")
+    parser.add_argument("--enable-local-presence", action="store_true",
+                        help="Host-enable credential-bound live-socket PvP presence (no shared token)")
     args = parser.parse_args(argv)
+    if args.enable_local_presence and not args.player_credentials:
+        parser.error("--enable-local-presence requires --player-credentials")
     token = None if args.player_credentials else (
         os.environ.get("REALM_TELNET_TOKEN") or secrets.token_urlsafe(24)
     )
+    world_id = None
+    if args.enable_local_presence:
+        # Engine() initializes an absent database and seeds rooms. A rejected
+        # presence-only CLI command must never create a phantom world merely
+        # while checking whether a trusted host bound its identity.
+        try:
+            with closing(sqlite3.connect(
+                    args.db.resolve().as_uri() + "?mode=ro", uri=True,
+            )) as db:
+                row = db.execute(
+                    "SELECT value FROM world_meta WHERE key='world_id'"
+                ).fetchone()
+                actual_schema = _schema_snapshot(db)
+        except sqlite3.Error:
+            row = None
+            actual_schema = {}
+        # A world_id marker and table *names* alone are trivially forgeable:
+        # Engine() would then initialize or mutate an incompatible database.
+        # Match the existing canonical core constraints/indices read-only,
+        # while allowing additional optional worldpack schema objects.
+        expected_core = _pristine_schema()
+        if (row is None or not isinstance(row[0], str)
+                or not _WORLD.fullmatch(row[0])
+                or any(actual_schema.get(name) != spec
+                       for name, spec in expected_core.items())):
+            parser.error("Local presence requires a world already bound by the trusted host")
+        world_id = row[0]
+    engine = Engine(args.db)
+    witness = (
+        LocalPresenceWitness(engine, world_id, idle_seconds=10)
+        if world_id is not None else None
+    )
     server = LocalTelnetServer(
-        Engine(args.db), token, args.port, player_credentials=args.player_credentials,
+        engine, token, args.port, player_credentials=args.player_credentials,
+        presence_witness=witness,
     )
     print(f"REALM local Telnet listening on 127.0.0.1:{server.server_address[1]}", flush=True)
     print("Experimental plaintext LOCAL transport. Do NOT port-forward or internet-expose.", flush=True)

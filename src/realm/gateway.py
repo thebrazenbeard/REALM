@@ -7,6 +7,7 @@ service, not an HTTPS endpoint, and not a replacement for Telnet/GMCP support.
 from __future__ import annotations
 
 import argparse
+from collections import OrderedDict
 import json
 import math
 import re
@@ -24,6 +25,8 @@ from urllib.parse import parse_qs, urlsplit
 from .auth import CredentialStore
 from .engine import Engine, _SEED_EXITS, _SEED_ITEMS, _SEED_ROOMS, _pristine_schema, _schema_snapshot
 from .geography import Geography, MapUnavailable, _check_id
+from .local_presence import LocalPresenceWitness, PresenceDenied, PresenceLease
+from .presence_host_binding import bind_host_engine, unbind_host_engine
 from .router import CommandRouter
 from .scoped_credentials import CredentialStateError, ScopedCredentialStore
 
@@ -703,10 +706,22 @@ class GatewayServer(ThreadingHTTPServer):
         socket_idle_timeout_seconds: float = DEFAULT_SOCKET_IDLE_TIMEOUT_SECONDS,
         body_deadline_seconds: float = DEFAULT_BODY_DEADLINE_SECONDS,
         header_deadline_seconds: float = DEFAULT_HEADER_DEADLINE_SECONDS,
+        presence_witness: LocalPresenceWitness | None = None,
     ):
         # No process-wide token or 0.0.0.0 bind option: gameplay uses
         # independent per-player credentials provisioned by the host.
         self.gateway = gateway
+        if presence_witness is not None:
+            if (not isinstance(presence_witness, LocalPresenceWitness)
+                    or gateway.scoped_credentials is None):
+                raise ValueError("Presence requires a host witness and scoped HTTP credentials")
+        self.presence_witness = presence_witness
+        self._presence_bound = False
+        self._presence_lock = threading.Lock()
+        # One current scoped credential fingerprint per canonical actor, not
+        # one new witness lease per 2.2-second browser polling request.
+        self._presence_sessions: OrderedDict[str, tuple[str, PresenceLease]] = OrderedDict()
+        self._presence_closed = False
         self.allowed_origins = frozenset(allowed_origins)
         self._request_limiter = _PrincipalRateLimiter(
             rate_limit_requests_per_minute, rate_limit_burst,
@@ -730,6 +745,84 @@ class GatewayServer(ThreadingHTTPServer):
         # cannot protect thread creation and incomplete POST bodies.
         self._worker_slots = threading.BoundedSemaphore(max_active_requests)
         super().__init__(("127.0.0.1", port), GatewayHandler)
+        try:
+            if presence_witness is not None:
+                bind_host_engine(gateway.engine, presence_witness)
+                self._presence_bound = True
+        except BaseException:
+            super().server_close()
+            raise
+
+    def refresh_scoped_presence(self, principal: str, token: str,
+                                capability: str) -> None:
+        """Host-only, bounded recency proof from a freshly authenticated request.
+
+        A browser's short GET has no durable socket identity. Retain at most
+        one credential-bound lease between requests for 10s (witness policy),
+        not a claim that the browser tab is continuously connected. Credential
+        revocation and the world binding are checked again inside Combat's
+        SQLite writer. Never admit legacy/shared-token identity claims.
+        """
+        witness = self.presence_witness
+        scoped = self.gateway.scoped_credentials
+        if (witness is None or scoped is None or
+                not ScopedCredentialStore._valid_token(token)):
+            return
+        key = ScopedCredentialStore._digest(token)
+        actor_key = principal.casefold()
+        def resolver(db: sqlite3.Connection) -> str | None:
+            return scoped.authenticate_in_writer(
+                db, token, required_capability=capability,
+            )
+        with self._presence_lock:
+            if self._presence_closed:
+                return
+            registered = self._presence_sessions.get(actor_key)
+            if registered is not None:
+                prior_key, active = registered
+                if prior_key == key:
+                    try:
+                        active.refresh()
+                    except PresenceDenied:
+                        active.close()
+                        self._presence_sessions.pop(actor_key, None)
+                    else:
+                        self._presence_sessions.move_to_end(actor_key)
+                        return
+                else:
+                    # Host rotation supersedes this actor's old fingerprint;
+                    # the previous lease cannot accumulate or regain access.
+                    active.close()
+                    self._presence_sessions.pop(actor_key, None)
+            # Keep headroom for player-bound Telnet sockets in a combined
+            # host. Evict the least recently refreshed HTTP lease before a
+            # new admission, never silently grow with every browser poll.
+            cap = max(1, min(witness.max_sessions - 8, 248))
+            while len(self._presence_sessions) >= cap:
+                _, (_, old) = self._presence_sessions.popitem(last=False)
+                old.close()
+            try:
+                lease = witness.admit(
+                    principal, protocol="http-scoped-request",
+                    resolve_principal=resolver,
+                )
+            except PresenceDenied:
+                # A full witness, expired or revoked credential should only
+                # disable PvP eligibility; ordinary feed remains available.
+                return
+            self._presence_sessions[actor_key] = (key, lease)
+
+    def server_close(self) -> None:
+        with self._presence_lock:
+            self._presence_closed = True
+            active = tuple(lease for _, lease in self._presence_sessions.values())
+            self._presence_sessions.clear()
+        for lease in active:
+            lease.close()
+        if self._presence_bound:
+            unbind_host_engine(self.gateway.engine, self.presence_witness)
+            self._presence_bound = False
+        super().server_close()
 
     def get_request(self) -> tuple[socket.socket, tuple]:
         request, client = super().get_request()
@@ -1077,6 +1170,19 @@ class GatewayHandler(BaseHTTPRequestHandler):
             if self._principal() != principal:
                 self._send(401, {"ok": False, "error": "Active scoped pilot required"})
                 return
+        if path == "/api/v1/feed":
+            _, _, presented = self.headers.get("Authorization", "").partition(" ")
+            self.server.refresh_scoped_presence(principal, presented, "feed:read")
+            # Presence registration itself can wait for a SQLite writer.
+            # Do not widen the interval in which a revoked bearer or changed
+            # crew membership can receive previously authorized feed bytes.
+            if self._principal() != principal:
+                self._send(401, {"ok": False, "error": "Player bearer revoked or rotated"})
+                return
+            if (channel_revision is not None and
+                    channel_revision != self.server.gateway.channel_access_revision(principal)):
+                self._send(409, {"ok": False, "error": "Channel membership changed; retry"})
+                return
         self._send(200, result)
 
     def do_POST(self) -> None:  # noqa: N802
@@ -1131,6 +1237,13 @@ class GatewayHandler(BaseHTTPRequestHandler):
                 if self._principal() != principal:
                     self._send(401, {"ok": False, "error": "Active scoped bearer required"})
                     return
+                if path == "/api/v1/command":
+                    _, _, presented = self.headers.get("Authorization", "").partition(" ")
+                    # Admission precedes the combat writer; the actual command
+                    # still revalidates the credential atomically in writer.
+                    self.server.refresh_scoped_presence(
+                        principal, presented, "command:write",
+                    )
             if self.server.gateway.scoped_credentials is not None:
                 # This token is untrusted until revalidated INSIDE the engine's
                 # or crafting's BEGIN IMMEDIATE gameplay transaction.
@@ -1193,6 +1306,10 @@ def main(argv: list[str] | None = None) -> int:
         "--scoped-credentials", action="store_true",
         help="Opt in to bounded world-scoped credentials instead of legacy bearers",
     )
+    parser.add_argument(
+        "--enable-local-presence", action="store_true",
+        help="Host-enable 10-second authenticated HTTP recent-activity proof for opt-in PvP",
+    )
     parser.add_argument("--demo-crafting", action="store_true", help="Install optional noncanonical gathering and recipe fixtures")
     parser.add_argument(
         "--allow-origin", action="append", default=[], metavar="ORIGIN",
@@ -1203,7 +1320,15 @@ def main(argv: list[str] | None = None) -> int:
     operator.add_argument("--provision-scoped-player", metavar="PLAYER", help="Host-issue a bounded player bearer, then exit")
     operator.add_argument("--rotate-player", metavar="PLAYER", help="Rotate a player token locally, then exit")
     operator.add_argument("--revoke-player", metavar="PLAYER", help="Revoke a player token locally, then exit")
+    operator.add_argument(
+        "--install-pvp-policy", action="store_true",
+        help="Host-only one-time default opt-in PvP policy; offline targeting stays forbidden",
+    )
     args = parser.parse_args(argv)
+    if args.enable_local_presence and not args.scoped_credentials:
+        parser.error("--enable-local-presence requires --scoped-credentials")
+    if args.install_pvp_policy and not args.scoped_credentials:
+        parser.error("--install-pvp-policy requires --scoped-credentials")
     if args.scoped_credentials and (args.provision_player or args.rotate_player or args.revoke_player):
         parser.error("legacy credential operator commands are unavailable in scoped mode")
     if args.provision_scoped_player and not args.scoped_credentials:
@@ -1226,10 +1351,22 @@ def main(argv: list[str] | None = None) -> int:
     if args.revoke_player:
         print("Revoked" if gateway.credentials.revoke(args.revoke_player) else "Not provisioned")
         return 0
+    if args.install_pvp_policy:
+        from .combat import Combat
+        Combat.configure(gateway.engine, allow_offline_targets=False)
+        print("Installed one-time opt-in PvP policy; offline attacks remain forbidden.")
+        return 0
     if args.demo_crafting:
         gateway.router.seed_demo_crafting()
     from .local_host_runner import _AcceptedSessions
-    server = GatewayServer(gateway, tuple(args.allow_origin), args.port)
+    witness = (
+        LocalPresenceWitness(gateway.engine, gateway.world_id, idle_seconds=10)
+        if args.enable_local_presence else None
+    )
+    server = GatewayServer(
+        gateway, tuple(args.allow_origin), args.port,
+        presence_witness=witness,
+    )
     # ThreadingHTTPServer daemon workers outlive server_close(), and an
     # authenticated keep-alive socket could otherwise write after the CLI
     # returns. Reuse the local host's accepted-socket custody for this ordinary

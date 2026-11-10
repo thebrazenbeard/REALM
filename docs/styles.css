@@ -107,6 +107,15 @@ button:disabled { cursor: not-allowed; opacity: .42; }
 .command-row input { padding-left: 32px; border-color: #3b5766; height: 46px; border-radius: 3px 0 0 3px; }.command-row .button { height: 46px; border-radius: 0 3px 3px 0; }
 .quick-actions { display: flex; flex-wrap: wrap; gap: 7px; margin-top: 11px; }.quick-actions button { color: #9eafb1; background: #172835; border: 1px solid #294553; border-radius: 3px; font-size: 11px; padding: 5px 10px; }
 .quick-actions button:hover:not(:disabled) { color: var(--aqua); border-color: var(--aqua); }
+.command-guide { margin-top: 13px; border-top: 1px solid var(--line-soft); padding-top: 11px; font-size: 11px; }
+.command-guide summary { color: var(--aqua); cursor: pointer; font-weight: 700; line-height: 1.6; }
+.command-guide summary:hover { color: var(--text); }
+.command-guide-body { margin-top: 10px; padding: 13px; background: #0d1823; border: 1px solid var(--line); border-radius: 3px; }
+.command-guide-body p { margin: 0 0 12px; color: var(--muted); line-height: 1.6; }
+.command-guide-body code { color: var(--gold); font: 600 11px/1.5 ui-monospace, SFMono-Regular, Consolas, monospace; }
+.command-guide-list { list-style: none; margin: 0; padding: 0; display: grid; gap: 9px; }
+.command-guide-list li { display: grid; grid-template-columns: minmax(150px, .7fr) minmax(0, 1.4fr); gap: 8px 12px; align-items: start; }
+.command-guide-list li > span { color: var(--text); line-height: 1.5; }
 .location { display: flex; flex-direction: column; }.location h2 { margin: -6px 0 22px; }.room-caption { color: var(--gold); }
 .room-description { margin: 12px 0; padding: 0; background: transparent; color: #b8cbc6; font: 13px/1.85 ui-monospace, SFMono-Regular, Consolas, monospace; white-space: pre-wrap; overflow-wrap: anywhere; word-break: normal; }
 .visibility-note { color: var(--dim); font-size: 11px; border-top: 1px solid var(--line-soft); padding-top: 15px; margin-top: auto; line-height: 1.7; }.visibility-note span { color: var(--gold); margin-right: 6px; }
@@ -115,6 +124,7 @@ button:disabled { cursor: not-allowed; opacity: .42; }
 /* Mobile gameplay comes before passive world metadata visually. The sidebar has
    no focusable controls; assistive-tech reading order remains DOM order. */
 @media (max-width: 760px) { .shell { padding: 0 17px; }.masthead { min-height: 77px; }.brand-copy strong { font-size: 21px; }.brand-version { display: none; }.header-status { font-size: 0; }.connection-dot { width: 10px; height: 10px; }.intro { min-height: auto; padding: 39px 0; }.intro-sigil { display: none; }.intro h1 { font-size: clamp(37px, 9vw, 54px); }.connection-card { padding: 19px 17px; }.connection-form { grid-template-columns: 1fr; }.connect-actions { grid-column: auto; }.connect-actions .button { flex: 1; }.console { display: flex; flex-direction: column; gap: 11px; }.panel { padding: 20px 17px; }.sidebar { min-height: 0; }.sidebar .muted { margin-bottom: 12px; }.sidebar-foot { margin-top: 15px; }.timeline { order: -1; min-height: 470px; }.feed { min-height: 240px; max-height: 370px; }.footer { padding: 28px 0; }.footer > span { width: 100%; } }
+@media (max-width: 760px) { .command-guide-list li { grid-template-columns: 1fr; gap: 2px; } }
 @media (prefers-reduced-motion: reduce) { *, *::before, *::after { scroll-behavior: auto !important; transition: none !important; } }
 
 /* Host-authorized map overlay. Each tile is inert text, never parsed HTML. */
