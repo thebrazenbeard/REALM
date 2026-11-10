@@ -80,6 +80,10 @@ def replay_resident_if_committed(
                 arg, verb = _DIRECTIONS[verb], "go"
             elif verb in _LONG_DIRECTIONS:
                 arg, verb = verb, "go"
+            if verb not in _READ_VERBS and verb != "say":
+                from .combat import Combat
+                # A cached host receipt cannot grant post-death world effects.
+                Combat.require_living_for_mutation(db, actor)
             if verb in _READ_VERBS:
                 return engine._perform(db, actor, player["room_id"], verb, arg)
             return prior["response"]
@@ -115,6 +119,9 @@ def commit_resident_command(
         if player is None:
             raise ValueError("Join this REALM before issuing resident commands")
         actor, room_id = player["id"], player["room_id"]
+        if not read_only and verb != "say":
+            from .combat import Combat
+            Combat.require_living_for_mutation(db, actor)
         principal = "@resident:" + actor
         prior = db.execute(
             "SELECT command,response FROM main.action_receipts WHERE actor=? AND action_id=?",

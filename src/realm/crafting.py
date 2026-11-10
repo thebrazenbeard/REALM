@@ -178,6 +178,9 @@ class Crafting:
             if player is None:
                 raise ValueError("Join this REALM before gathering or crafting")
             actor, room = player["id"], player["room_id"]
+            if not read_only:
+                from .combat import Combat
+                Combat.require_living_for_mutation(db, actor)
             receipt = None
             if action_id is not None:
                 receipt = db.execute(

@@ -855,6 +855,64 @@ test("feed throttling honors bounded Retry-After without disconnecting the sessi
   assert.ok(client.get("feed").children.some((item) => item.children[1].children[0].textContent === "Tessa / say"));
 });
 
+test("global PvP death notices render as distinct inert heralds without exposing a room", async () => {
+  const notice = "Hear the iron bell: Moss has fallen before Ember. <img src=x onerror=alert(1)>";
+  const responses = {
+    "/api/v1/health": { ok: true, world_id: "fantasy-world" },
+    "/api/v1/join": { ok: true, text: "Welcome", cursor: 0 },
+    "/api/v1/room": { ok: true, text: "The Atrium" },
+    "/api/v1/map": worldMap(),
+    "/api/v1/feed": { ok: true, cursor: 3, events: [
+      { id: 2, actor: "Ember", kind: "pvp_death", room: "global", text: notice,
+        payload_json: "secret fight details", private_room: "Hidden Crypt" },
+      { id: 3, actor: "World", kind: "say", room: "atrium", text: "The wind settles." },
+    ] },
+  };
+  const client = instantiate({ fetchImpl: async (url) => {
+    const route = new URL(url).pathname;
+    assert.ok(route in responses, "unexpected route " + route);
+    return { ok: true, status: 200, json: async () => responses[route] };
+  } });
+  client.get("host-url").value = "http://localhost:8765";
+  client.get("player-name").value = "Explorer";
+  client.get("access-token").value = "secret-token";
+  await client.connect();
+  await client.timers[0].fn();
+  const herald = client.get("feed").children.find((item) => item.children[1].children[1].textContent === notice);
+  assert.ok(herald, "the server's original message must be rendered as inert textContent");
+  assert.match(herald.className, /feed-pvp-death/, "PK notice requires a styleable dedicated category");
+  assert.match(herald.className, /feed-response/, "PK notice should be visibly distinct using existing gold treatment");
+  assert.equal(herald.children[1].children[0].textContent, "REALM / DEATH HERALD");
+  assert.equal(herald.children[0].textContent, "⚔");
+  assert.ok(!herald.children[1].children[0].textContent.includes("atrium"));
+  assert.ok(!client.get("feed").children.some((item) => item.children[1].children[1].textContent.includes("Hidden Crypt")));
+  assert.ok(client.get("feed").children.some((item) => item.children[1].children[0].textContent === "World / say · atrium"),
+    "normal room-local feed formatting must remain unchanged");
+});
+
+test("malformed PvP death event never echoes a private room identifier in its title", async () => {
+  const client = instantiate({ fetchImpl: async (url) => {
+    const route = new URL(url).pathname;
+    const payloads = {
+      "/api/v1/health": { ok: true, world_id: "fantasy-world" },
+      "/api/v1/join": { ok: true, text: "Welcome", cursor: 0 },
+      "/api/v1/room": { ok: true, text: "The Atrium" },
+      "/api/v1/map": worldMap(),
+      "/api/v1/feed": { ok: true, cursor: 2, events: [
+        { id: 2, actor: "Ember", kind: "pvp_death", room: "secret-corridor", text: "A duel ended." },
+      ] },
+    };
+    return { ok: true, status: 200, json: async () => payloads[route] };
+  } });
+  client.get("host-url").value = "http://localhost:8765";
+  client.get("player-name").value = "Explorer";
+  client.get("access-token").value = "secret-token";
+  await client.connect();
+  await client.timers[0].fn();
+  const titles = client.get("feed").children.map((item) => item.children[1].children[0].textContent);
+  assert.ok(!titles.some((title) => title.includes("secret-corridor")));
+});
+
 test("malformed and excessive retry intervals cannot suspend browser feed indefinitely", async () => {
   for (const [header, expectedDelay] of [["invalid", 4400], ["99999", 30000]]) {
     const clock = { value: 100000 };

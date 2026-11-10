@@ -234,7 +234,13 @@ class Engine:
             raise ValueError("Action IDs must be nonempty strings up to 128 characters")
         read_only = verb in {"look", "l", "examine", "x", "where", "location",
                              "inventory", "inv", "i", "who", "history", "listen",
-                             "help", "?", "quit", "exit"}
+                             "help", "?", "quit", "exit"} or (
+                                 verb == "pvp" and arg.casefold() in {"status", "news"})
+        if (verb == "attack" or (verb == "pvp" and arg.casefold() != "news")) and writer_guard is None:
+            # A shared-token terminal can claim another player's name. Combat
+            # consent and private HP status require player-bound authority.
+            # News is a public, host-authored, globally redacted message.
+            raise PermissionError("PvP requires a player-bound authenticated writer guard")
         if verb in {"quit", "exit"} and action_id is None:
             return "Goodbye. Your position is saved."
         with closing(self._connect()) as db, db:
@@ -246,6 +252,12 @@ class Engine:
             if player is None:
                 raise ValueError("Join this REALM before issuing commands")
             actor, room_id = player["id"], player["room_id"]
+            if (not read_only and verb != "say" and
+                    (verb != "pvp" or arg.casefold() == "on")):
+                from .combat import Combat
+                # Check BEFORE replay, so a receipt minted while alive cannot
+                # authorize a defeated actor's old mutation after death.
+                Combat.require_living_for_mutation(db, actor)
             receipt = None
             if action_id is not None:
                 receipt = db.execute(
@@ -260,7 +272,14 @@ class Engine:
                     # floor on each retry; only mutations replay old results.
                     if not read_only:
                         return receipt["response"]
-            response = self._perform(db, actor, room_id, verb, arg)
+            # Preserve the existing four-argument interpreter seam for trusted
+            # adapters and injected transaction/error probes. Only combat
+            # needs the action ID inside its durable PK event record.
+            if verb in {"pvp", "attack"}:
+                response = self._perform(db, actor, room_id, verb, arg,
+                                         action_id=action_id)
+            else:
+                response = self._perform(db, actor, room_id, verb, arg)
             # A read-only action ID binds command identity, not its current
             # contents. Keep a blank sentinel; never retain private observation
             # text or update that receipt during later read retries.
@@ -290,7 +309,21 @@ class Engine:
         return entry["id"]
 
     def _perform(self, db: sqlite3.Connection, actor: str, room_id: str, verb: str,
-                 arg: str, *, emissions: list[tuple[int, str]] | None = None) -> str:
+                 arg: str, *, emissions: list[tuple[int, str]] | None = None,
+                 action_id: str | None = None) -> str:
+            if verb in {"pvp", "attack"}:
+                from .combat import Combat
+                if verb == "attack" or arg.casefold() == "on":
+                    Combat.require_living_for_mutation(db, actor)
+                return Combat.perform(db, engine=self, actor=actor, room=room_id,
+                                      verb=verb, arg=arg, action_id=action_id)
+            if verb not in {"quit", "exit", "look", "l", "examine", "x", "where",
+                            "location", "inventory", "inv", "i", "who",
+                            "history", "listen", "help", "?", "say"}:
+                from .combat import Combat
+                # This is the connection-aware guard for trusted adapters
+                # invoking _perform directly rather than Engine.act.
+                Combat.require_living_for_mutation(db, actor)
             if verb in {"quit", "exit"}:
                 return "Goodbye. Your position is saved."
             if verb in {"look", "l"} and (not arg or arg.casefold() in {"around", "here", "room"}):
@@ -437,5 +470,5 @@ class Engine:
                         items.append(f"{event['actor']} gave {details['item']} to {details['to']}")
                 return "\n".join(items) if items else "No recorded activity here yet."
             if verb in {"help", "?"}:
-                return "Commands: look [item], examine <item> (x), go <north|south|east|west>, n/s/e/w, take <item>, drop <item>, give <item> to <player>, inventory, say <text>, listen, history [1-50], who, where, help, quit"
+                return "Commands: look [item], examine <item> (x), go <north|south|east|west>, n/s/e/w, take <item>, drop <item>, give <item> to <player>, inventory, say <text>, listen, history [1-50], who, where, help, quit. Optional host-enabled PvP: pvp status|news|on|off, attack <player>."
             return "Unknown command. Type 'help' for options."

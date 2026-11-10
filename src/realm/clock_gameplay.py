@@ -690,6 +690,10 @@ def perform_in_transaction(
         if player is None:
             raise ValueError("Join this REALM before issuing commands")
         actual_actor, room = player["id"], player["room_id"]
+        if verb != "say":
+            from .combat import Combat
+            # A scheduled replay or typed grant is not an automatic revival.
+            Combat.require_living_for_mutation(db, actual_actor)
         receipt_prefix = (_CLOCK_RECEIPT_ACTOR_PREFIX if receipt_origin == "clock"
                           else _ROSTER_RECEIPT_ACTOR_PREFIX)
         receipt_actor = receipt_prefix + actual_actor

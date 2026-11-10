@@ -71,7 +71,8 @@
   function appendFeed({ category = "system", label, message, icon = "◇" }) {
     const nearBottom = ui.feed.scrollTop + ui.feed.clientHeight >= ui.feed.scrollHeight - 54;
     const li = document.createElement("li");
-    li.className = "feed-item feed-" + (category === "error" ? "error" : category === "response" ? "response" : "system");
+    li.className = category === "herald" ? "feed-item feed-response feed-pvp-death"
+      : "feed-item feed-" + (category === "error" ? "error" : category === "response" ? "response" : "system");
     const symbol = document.createElement("span");
     symbol.className = "feed-icon";
     symbol.setAttribute("aria-hidden", "true");
@@ -256,6 +257,12 @@
     const who = typeof event.actor === "string" ? event.actor : "World";
     const kind = typeof event.kind === "string" ? event.kind : "event";
     const message = typeof event.text === "string" ? event.text : "An event occurred.";
+    // A host-authored global PK notice is not a room event. Even if a future
+    // host accidentally supplies a room field, never echo its location here.
+    // The host decides recipient authorization; this client only renders text.
+    if (kind === "pvp_death") {
+      return { category: "herald", label: "REALM / DEATH HERALD", message, icon: "⚔" };
+    }
     const room = typeof event.room === "string" ? " · " + event.room : "";
     return { category: "system", label: who + " / " + kind + room, message, icon: kind === "say" ? "✦" : "◇" };
   }

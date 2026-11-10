@@ -114,6 +114,8 @@ class AuthenticatedShipCommands:
         joined = db.execute("SELECT 1 FROM main.players WHERE id=?", (actor,)).fetchone()
         if joined is None:
             raise PermissionError("Ship pilot must first join this world")
+        from .combat import Combat
+        Combat.require_living_for_mutation(db, actor)
         if scoped:
             # Both tick state and departure are observed under the SAME writer.
             # Geography schedules integer UTC seconds; compare that exact event

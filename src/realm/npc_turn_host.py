@@ -239,6 +239,9 @@ class ResidentTurnHost:
             ).fetchone()
             if player is None or player["id"] != actor:
                 raise ValueError("Host resident identity is no longer joined as expected")
+            if not read_only and verb != "say":
+                from .combat import Combat
+                Combat.require_living_for_mutation(db, actor)
             prior = db.execute(
                 "SELECT command,response FROM main.action_receipts WHERE actor=? AND action_id=?",
                 (receipt_actor, action_id),

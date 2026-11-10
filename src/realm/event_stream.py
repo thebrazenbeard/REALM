@@ -158,14 +158,19 @@ class FeedWaitHandler(GatewayHandler):
                     return
                 try:
                     room, entry = self._room_entry(principal)
-                    result = self.server.gateway.feed(principal, max(after, entry - 1))
+                    # Gateway enforces the private room's arrival floor. A
+                    # global PK herald uses the first world-join floor and
+                    # survives subsequent moves, so never clamp its cursor
+                    # to the latest local arrival.
+                    result = self.server.gateway.feed(principal, after)
                     # A concurrent move could change current-room scope between
                     # two database reads; never deliver from a stale audience.
                     if self._room_entry(principal) != (room, entry):
                         continue
                     events = [
                         e for e in result["events"]
-                        if e["room"] == room and e["id"] >= entry
+                        if (e["room"] == room and e["id"] >= entry)
+                        or (e["room"] == "global" and e["kind"] == "pvp_death")
                     ]
                     result["events"] = events
                     result["cursor"] = events[-1]["id"] if events else after

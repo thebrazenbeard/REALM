@@ -495,11 +495,40 @@ class Gateway:
                 raise ValueError("No provable current-room arrival; feed denied")
             records = db.execute(
                 "SELECT id,occurred_at,actor,room_id,kind,payload_json FROM events "
-                "WHERE room_id=? AND id>? AND id>=? ORDER BY id LIMIT ?",
+                "WHERE room_id=? AND kind!='pvp_death' "
+                "AND id>? AND id>=? ORDER BY id LIMIT ?",
                 (subject["room_id"], after, entry["id"], MAX_FEED_EVENTS),
             ).fetchall()
+            visible = [(row["id"], row, None) for row in records]
+            # An opt-in PvP death is announced globally using ONLY its
+            # host-authored text. Never project the combat room or raw JSON.
+            installed = db.execute(
+                "SELECT 1 FROM main.sqlite_master "
+                "WHERE type='table' AND name='combat_announcements'"
+            ).fetchone() is not None
+            if installed:
+                # World entry, not latest room entry, bounds global news.
+                first_join = db.execute(
+                    "SELECT MIN(id) FROM events WHERE actor=? COLLATE NOCASE AND kind='join'",
+                    (subject["id"],),
+                ).fetchone()[0]
+                if first_join is not None:
+                    public = db.execute(
+                        "SELECT events.id,events.occurred_at,events.actor,a.message "
+                        "FROM combat_announcements AS a "
+                        "JOIN events ON events.id=a.event_id AND events.kind='pvp_death' "
+                        "WHERE events.id>? AND events.id>=? ORDER BY events.id LIMIT ?",
+                        (after, first_join, MAX_FEED_EVENTS),
+                    ).fetchall()
+                    visible.extend((row["id"], row, row["message"]) for row in public)
             events = []
-            for row in records:
+            for _, row, public_message in sorted(visible, key=lambda item: item[0])[:MAX_FEED_EVENTS]:
+                if public_message is not None:
+                    events.append({
+                        "id": row["id"], "kind": "pvp_death", "actor": row["actor"],
+                        "text": public_message, "room": "global", "at": row["occurred_at"],
+                    })
+                    continue
                 payload = json.loads(row["payload_json"])
                 kind = row["kind"]
                 if kind == "say":
