@@ -7,6 +7,7 @@ plain GatewayServer must enforce the same boundary for cursor=0 clients.
 from __future__ import annotations
 
 import json
+from contextlib import closing
 import sqlite3
 import sys
 import tempfile
@@ -115,7 +116,7 @@ class DefaultFeedHistoryPrivacyTests(unittest.TestCase):
         # A trusted local database edit destroys the newest return-arrival
         # evidence but leaves Bob's current room and earlier join intact.
         # It must not make the old join a valid floor for retroactive speech.
-        with sqlite3.connect(self.gateway.engine.db_path) as db:
+        with closing(sqlite3.connect(self.gateway.engine.db_path)) as db, db:
             deleted = db.execute(
                 "DELETE FROM events WHERE actor='Bob' AND kind='move' AND room_id='atrium'"
             ).rowcount

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from contextlib import closing
 import socket
 import sqlite3
 import sys
@@ -111,7 +112,7 @@ class TextHistoryPrivacyTests(unittest.TestCase):
         self.command("Bob", "north", "move-out")
         self.command("Alice", "say DURING_ABSENCE", "secret")
         self.command("Bob", "south", "move-in")
-        with sqlite3.connect(self.gateway.engine.db_path) as db:
+        with closing(sqlite3.connect(self.gateway.engine.db_path)) as db, db:
             deleted = db.execute(
                 "DELETE FROM events WHERE actor='Bob' AND kind='move' AND room_id='atrium'"
             ).rowcount
@@ -138,7 +139,7 @@ class TextHistoryPrivacyTests(unittest.TestCase):
         }, bearer="invalid-bearer")
         self.assertEqual(401, status)
         self.assertNotIn("PRIVATE_WORLD_ONE", json.dumps(text))
-        with sqlite3.connect(self.gateway.engine.db_path) as db:
+        with closing(sqlite3.connect(self.gateway.engine.db_path)) as db, db:
             db.execute("DELETE FROM events WHERE actor='Bob' AND kind='join'")
         status, text = self.command("Bob", "history 50", "unproved-join")
         self.assertEqual(400, status)

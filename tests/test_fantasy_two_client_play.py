@@ -205,7 +205,15 @@ class FantasyTwoClientPlayTests(unittest.TestCase):
                 self.assertIn("Village Green", browser["joined"][1]["text"])
                 self.assertIn("Village Green", terminal["entered"])
                 self.assertEqual(200, browser["said"][0])
-                self.assertEqual(browser["said"], browser["retried"])
+                # Action IDs deduplicate the WORLD MUTATION and response text.
+                # The HTTP cursor is the latest GLOBAL event ID at the time
+                # of each response; another client's simultaneous event can
+                # legitimately advance it between a call and its replay.
+                self.assertEqual(browser["said"][0], browser["retried"][0])
+                self.assertEqual(browser["said"][1]["text"], browser["retried"][1]["text"])
+                self.assertGreaterEqual(
+                    browser["retried"][1]["cursor"], browser["said"][1]["cursor"]
+                )
                 self.assertEqual(404, browser["map"][0])
                 self.assertEqual(401, browser["ship"][0])
                 self.assertIn("Woodland Path", browser["woods"][1]["text"])
@@ -217,8 +225,15 @@ class FantasyTwoClientPlayTests(unittest.TestCase):
                 self.assertIn("You drop Oak walking staff.", terminal["dropped"])
                 self.assertIn("Village Green", terminal["green"])
                 self.assertIn("Goodbye", terminal["goodbye"])
-                self.assertIn("Mira: Mira returned to the green", browser["feed"])
                 with closing(sqlite3.connect(path)) as db:
+                    speeches = db.execute(
+                        "SELECT payload_json FROM events WHERE actor='Rowan' AND kind='say'"
+                    ).fetchall()
+                    self.assertEqual(
+                        ["Rowan greets Mira"],
+                        [json.loads(row[0])["text"] for row in speeches],
+                        "A replayed action ID must not create a duplicate event",
+                    )
                     # The UTC bell is durable even if emitted before Rowan's
                     # most recent return to the green. Entry-bound privacy
                     # permits observation only when it follows that arrival.
@@ -229,6 +244,18 @@ class FantasyTwoClientPlayTests(unittest.TestCase):
                         "SELECT MAX(id) FROM events WHERE actor='Rowan' "
                         "AND room_id='village_green' AND kind IN ('join','move')"
                     ).fetchone()[0]
+                    return_id = db.execute(
+                        "SELECT MAX(id) FROM events WHERE actor='Mira' "
+                        "AND room_id='village_green' AND kind='say' "
+                        "AND payload_json=?",
+                        (json.dumps({"text": "Mira returned to the green"}, sort_keys=True),),
+                    ).fetchone()[0]
+                    self.assertIsNotNone(return_id, "Mira's return must be durable")
+                    self.assertEqual(
+                        return_id >= arrival_id,
+                        "Mira: Mira returned to the green" in browser["feed"],
+                        "Feed must not reveal events preceding Rowan's latest arrival",
+                    )
                     self.assertEqual(
                         bell_id >= arrival_id,
                         "Bellkeeper: Noon bell" in browser["feed"],

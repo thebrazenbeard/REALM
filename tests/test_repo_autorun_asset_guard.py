@@ -6,6 +6,7 @@ checking an untrusted checkout from a separate, trusted test file.
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import tempfile
@@ -19,6 +20,8 @@ _AUTO_APPROVAL = re.compile(
     r'"task\.allowAutomaticTasks"\s*:\s*(?:true\b|"on")', re.IGNORECASE,
 )
 _ESCAPED_JSON = re.compile(r'\\u[0-9a-f]{4}', re.IGNORECASE)
+_WORKSPACE_FOLDER_PATH = re.compile(r'"path"\s*:\s*"((?:\\.|[^"\\])*)"', re.IGNORECASE)
+_WORKSPACE_FOLDER_URI = re.compile(r'"uri"\s*:', re.IGNORECASE)
 _FONT_SUFFIXES = frozenset((".ttf", ".otf", ".woff", ".woff2"))
 
 
@@ -74,23 +77,72 @@ class RepositoryAutoRunAssetGuardTests(unittest.TestCase):
             raise ValueError("Static security scan root must be a REALM source checkout")
 
     def test_workspace_does_not_auto_run_repo_controlled_commands(self) -> None:
-        vscode = self.repo / ".vscode"
-        if not vscode.exists():
-            return
         offenders: list[str] = []
-        for config in sorted(vscode.glob("*.json")):
+        configs: list[Path] = []
+        # Multi-root *.code-workspace files can open nested repository folders,
+        # whose own .vscode/tasks.json may auto-run. Scan both representations
+        # throughout the checkout, including Windows case variants. pathlib's
+        # rglob does not follow directory symlinks; flag linked config folders.
+        for path in sorted(self.repo.rglob("*")):
+            if ".git" in (part.lower() for part in path.relative_to(self.repo).parts):
+                continue
+            if path.name.lower() == ".vscode":
+                if path.is_symlink():
+                    offenders.append(
+                        f"{path.relative_to(self.repo).as_posix()}: linked configuration directory"
+                    )
+                elif path.is_dir():
+                    configs.extend(sorted(
+                        child for child in path.iterdir()
+                        if child.name.lower().endswith(".json")
+                    ))
+            elif path.name.lower().endswith(".code-workspace"):
+                configs.append(path)
+        for config in configs:
+            label = config.relative_to(self.repo).as_posix()
             if config.is_symlink():
-                offenders.append(f"{config.name}: linked configuration")
+                offenders.append(f"{label}: linked configuration")
+                continue
+            if not config.is_file():
+                offenders.append(f"{label}: not a regular configuration file")
                 continue
             text = config.read_text(encoding="utf-8-sig", errors="replace")
             if _AUTORUN.search(text):
-                offenders.append(f"{config.name}: folderOpen task")
+                offenders.append(f"{label}: folderOpen task")
             if _AUTO_APPROVAL.search(text):
-                offenders.append(f"{config.name}: automatic tasks enabled")
+                offenders.append(f"{label}: automatic tasks enabled")
             # JSONC can encode executable keys or values as Unicode escapes;
             # a raw regex would miss them. Require manual review instead.
             if _ESCAPED_JSON.search(text):
-                offenders.append(f"{config.name}: escaped task configuration")
+                offenders.append(f"{label}: escaped task configuration")
+            if config.name.lower().endswith(".code-workspace"):
+                # A multi-root workspace can reference a sibling outside the
+                # inspected checkout or cross a symlink into unscanned tasks.
+                # Review those folders instead of following their paths.
+                if _WORKSPACE_FOLDER_URI.search(text):
+                    offenders.append(f"{label}: unreviewed workspace URI")
+                for match in _WORKSPACE_FOLDER_PATH.finditer(text):
+                    try:
+                        name = json.loads('"' + match.group(1) + '"')
+                    except json.JSONDecodeError:
+                        offenders.append(f"{label}: unparseable workspace folder")
+                        continue
+                    normalized = name.replace("\\", "/")
+                    parts = normalized.split("/")
+                    if (normalized.startswith("/") or re.match(r"^[A-Za-z]:", normalized)
+                            or ".." in parts or "${" in normalized):
+                        offenders.append(f"{label}: external workspace folder")
+                        continue
+                    # Relative multi-root paths are resolved from the
+                    # workspace file's directory, not the repository root.
+                    folder = config.parent
+                    for part in parts:
+                        if not part or part == ".":
+                            continue
+                        folder = folder / part
+                        if folder.is_symlink():
+                            offenders.append(f"{label}: linked workspace folder")
+                            break
         self.assertFalse(offenders, "Unreviewed workspace auto-execution: " + "; ".join(offenders))
 
     def test_font_assets_have_real_font_signatures(self) -> None:
@@ -143,6 +195,136 @@ class RepositoryAutoRunAssetGuardTests(unittest.TestCase):
                 self._check_another_tree(
                     root, "test_workspace_does_not_auto_run_repo_controlled_commands",
                 )
+
+    def test_root_code_workspace_folder_open_task_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            (root / "REALM.code-workspace").write_text(
+                '{"folders":[{"path":"."}],"tasks":{"version":"2.0.0",'
+                '"tasks":[{"label":"malicious","runOptions":{"runOn":"folderOpen"},'
+                '"command":"node fake-font.ttf"}]}}',
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(AssertionError, "folderOpen task"):
+                self._check_another_tree(
+                    root, "test_workspace_does_not_auto_run_repo_controlled_commands",
+                )
+
+    def test_nested_uppercase_workspace_automatic_tasks_are_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            nested = root / "examples"
+            nested.mkdir()
+            (nested / "REALM.CODE-WORKSPACE").write_text(
+                '{"settings":{"task.allowAutomaticTasks":true}}',
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(AssertionError, "automatic tasks enabled"):
+                self._check_another_tree(
+                    root, "test_workspace_does_not_auto_run_repo_controlled_commands",
+                )
+
+    def test_windows_case_variant_vscode_configuration_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            vscode = root / ".VSCODE"
+            vscode.mkdir()
+            (vscode / "TASKS.JSON").write_text(
+                '{"tasks":[{"runOptions":{"runOn":"folderOpen"}}]}',
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(AssertionError, "folderOpen task"):
+                self._check_another_tree(
+                    root, "test_workspace_does_not_auto_run_repo_controlled_commands",
+                )
+
+    def test_multi_root_workspace_nested_folder_open_task_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            vscode = root / "worlds" / "sample" / ".vscode"
+            vscode.mkdir(parents=True)
+            (root / "Sample.code-workspace").write_text(
+                '{"folders":[{"path":"worlds/sample"}]}', encoding="utf-8",
+            )
+            (vscode / "tasks.json").write_text(
+                '{"tasks":[{"runOptions":{"runOn":"folderOpen"},'
+                '"command":"node fake-font.ttf"}]}', encoding="utf-8",
+            )
+            with self.assertRaisesRegex(AssertionError, "folderOpen task"):
+                self._check_another_tree(
+                    root, "test_workspace_does_not_auto_run_repo_controlled_commands",
+                )
+
+    def test_nested_manual_vscode_task_remains_allowed(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            vscode = root / "worlds" / "sample" / ".vscode"
+            vscode.mkdir(parents=True)
+            (root / "Sample.code-workspace").write_text(
+                '{"folders":[{"path":"worlds/sample"}]}', encoding="utf-8",
+            )
+            (vscode / "tasks.json").write_text(
+                '{"tasks":[{"label":"manual","command":"echo safe"}]}',
+                encoding="utf-8",
+            )
+            self._check_another_tree(
+                root, "test_workspace_does_not_auto_run_repo_controlled_commands",
+            )
+
+    def test_multi_root_workspace_parent_path_requires_review(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            (root / "Sample.code-workspace").write_text(
+                '{"folders":[{"path":"../outside"}]}', encoding="utf-8",
+            )
+            with self.assertRaisesRegex(AssertionError, "external workspace folder"):
+                self._check_another_tree(
+                    root, "test_workspace_does_not_auto_run_repo_controlled_commands",
+                )
+
+    def test_multi_root_workspace_remote_uri_requires_review(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            (root / "Sample.code-workspace").write_text(
+                '{"folders":[{"uri":"vscode-remote://ssh-remote+host/tmp/external"}]}',
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(AssertionError, "unreviewed workspace URI"):
+                self._check_another_tree(
+                    root, "test_workspace_does_not_auto_run_repo_controlled_commands",
+                )
+
+    def test_multi_root_workspace_linked_folder_requires_review(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            outside = root / "outside"
+            outside.mkdir()
+            nested = root / "presets"
+            nested.mkdir()
+            link = nested / "linked"
+            try:
+                link.symlink_to(outside, target_is_directory=True)
+            except (OSError, NotImplementedError):
+                self.skipTest("directory symlink creation is unavailable")
+            (nested / "Sample.code-workspace").write_text(
+                '{"folders":[{"path":"linked"}]}', encoding="utf-8",
+            )
+            with self.assertRaisesRegex(AssertionError, "linked workspace folder"):
+                self._check_another_tree(
+                    root, "test_workspace_does_not_auto_run_repo_controlled_commands",
+                )
+
+    def test_benign_manual_code_workspace_remains_allowed(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            (root / "REALM.code-workspace").write_text(
+                '{"folders":[{"path":"."}],"tasks":{"version":"2.0.0",'
+                '"tasks":[{"label":"manual","command":"echo safe"}]}}',
+                encoding="utf-8",
+            )
+            self._check_another_tree(
+                root, "test_workspace_does_not_auto_run_repo_controlled_commands",
+            )
 
     def test_js_starting_with_true_is_not_a_font(self) -> None:
         with tempfile.TemporaryDirectory() as folder:

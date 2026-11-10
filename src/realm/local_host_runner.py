@@ -70,6 +70,16 @@ class _AcceptedSessions:
                 request.shutdown(socket.SHUT_RDWR)
             except OSError:
                 pass
+            # Windows may leave a socketserver worker blocked in a buffered
+            # read even after shutdown(). A Python socket.makefile() keeps an
+            # extra reference, so request.close() alone only decrements a
+            # count and does not necessarily close the underlying descriptor.
+            # Detach and close that descriptor to wake pending reads. Trusted
+            # handlers are still joined below before run_local_host returns.
+            try:
+                socket.close(request.detach())
+            except OSError:
+                pass
         with self._condition:
             while self._active:
                 # An HTTP handler may already be inside trusted Python/SQLite

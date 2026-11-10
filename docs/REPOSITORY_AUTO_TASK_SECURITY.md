@@ -30,10 +30,14 @@ PYTHONPATH=src python -m unittest discover -s tests -p 'test_repo_autorun_asset_
 `tests/test_repo_autorun_asset_guard.py` reads but never executes repository
 content. It rejects:
 
-- VS Code JSON configurations in `.vscode/` that contain a `folderOpen`
-  command-run setting or enable automatic task approval (`true` or `"on"`).
-  Linked JSON configs and Unicode-escaped JSON config values/keys also fail
-  closed pending manual review.
+- VS Code JSON configurations in root **or nested `.vscode/` directories**, and
+  repository-owned `*.code-workspace` files (including Windows case variants)
+  that contain a `folderOpen` command-run setting or enable automatic task
+  approval (`true` or `"on"`). Linked configuration files/directories and
+  Unicode-escaped JSON config values/keys fail closed pending manual review.
+  Multi-root workspace folder paths that escape the inspected checkout or
+  traverse a symlink, or `uri` references to remote/unknown folders, also
+  require manual review; the scan never follows them.
 - Font-named files under `public/fonts/` whose structure does not match a
   plausible TrueType/OpenType table directory and `head` table. WOFF and WOFF2
   assets fail closed pending an independent structural font parser and manual

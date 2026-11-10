@@ -148,8 +148,9 @@ class ChangeBudgetTests(unittest.TestCase):
         self.schedule()
 
         def install(db, event):
+            # SQLite trigger-body UPDATE targets must be unqualified.
             db.execute("""CREATE TEMP TRIGGER late AFTER UPDATE ON main.clock_events
-                BEGIN UPDATE main.world_meta SET value='poisoned' WHERE key='world_id';
+                BEGIN UPDATE world_meta SET value='poisoned' WHERE key='world_id';
                 END""")
 
         with self.assertRaisesRegex(ValueError, "ungranted world effects"):
