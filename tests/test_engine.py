@@ -1,6 +1,7 @@
 """Deterministic stdlib test suite; run via python -m unittest discover -s tests."""
 
 import tempfile
+import json
 import sqlite3
 from contextlib import closing
 from concurrent.futures import ThreadPoolExecutor
@@ -82,6 +83,79 @@ class RealmEngineTests(unittest.TestCase):
             results = list(pool.map(lambda name: Engine(self.db_path).act(name, "take token"), ["Patrick", "Vera"]))
         self.assertEqual(1, sum("You take" in result for result in results))
         self.assertEqual(1, sum("not here" in result for result in results))
+
+    def test_give_moves_one_owned_item_atomically_to_saved_room_peer(self):
+        self.engine.join("Ada")
+        self.engine.join("Bob")
+        self.assertIn("take Brass token", self.engine.act("Ada", "take token"))
+        first = self.engine.act("Ada", "give token to bOb", action_id="transfer-1")
+        self.assertEqual("You give Brass token to Bob.", first)
+        self.assertEqual("You carry: nothing", self.engine.act("Ada", "inventory"))
+        self.assertEqual("You carry: Brass token", Engine(self.db_path).act("Bob", "inventory"))
+        self.assertEqual(first, self.engine.act("Ada", "give token to bOb", action_id="transfer-1"))
+        with self.assertRaisesRegex(ValueError, "different command"):
+            self.engine.act("Ada", "give token to Ada", action_id="transfer-1")
+        with closing(sqlite3.connect(self.db_path)) as db:
+            transfer = db.execute(
+                "SELECT actor,room_id,payload_json FROM events WHERE kind='give'"
+            ).fetchall()
+        self.assertEqual(1, len(transfer))
+        self.assertEqual(("Ada", "atrium", {"item": "token", "to": "Bob"}),
+                         (transfer[0][0], transfer[0][1], json.loads(transfer[0][2])))
+        self.assertIn("Ada gave token to Bob", self.engine.act("Bob", "history 50"))
+
+    def test_give_rejects_self_missing_other_room_unowned_and_bad_syntax_without_events(self):
+        self.engine.join("Ada")
+        self.engine.join("Bob")
+        self.engine.join("Cara")
+        self.engine.act("Cara", "north")
+        self.engine.act("Ada", "take token")
+        cases = [
+            ("give", "Use 'give"),
+            ("give token", "Use 'give"),
+            ("give token to Ada", "yourself"),
+            ("give token to Missing", "Recipient is not in this room"),
+            ("give token to Cara", "Recipient is not in this room"),
+            ("give wrench to Bob", "not carrying"),
+        ]
+        for command, expected in cases:
+            with self.subTest(command=command):
+                self.assertIn(expected, self.engine.act("Ada", command))
+        self.assertIn("Brass token", self.engine.act("Ada", "inventory"))
+        self.assertEqual("You carry: nothing", self.engine.act("Bob", "inventory"))
+        with closing(sqlite3.connect(self.db_path)) as db:
+            self.assertEqual(0, db.execute("SELECT COUNT(*) FROM events WHERE kind='give'").fetchone()[0])
+
+    def test_give_ambiguous_name_rejects_and_item_id_disambiguates(self):
+        self.engine.join("Ada")
+        self.engine.join("Bob")
+        with closing(sqlite3.connect(self.db_path)) as db, db:
+            db.executemany("INSERT INTO items VALUES (?,?,?,?,?)", [
+                ("gem-1", "Moon gem", "first", None, "Ada"),
+                ("gem-2", "Moon gem", "second", None, "Ada"),
+            ])
+        self.assertIn("ambiguous", self.engine.act("Ada", "give Moon gem to Bob").lower())
+        self.assertIn("You give Moon gem to Bob", self.engine.act("Ada", "give gem-2 to Bob"))
+        with closing(sqlite3.connect(self.db_path)) as db:
+            rows = db.execute("SELECT id,held_by FROM items WHERE id LIKE 'gem-%' ORDER BY id").fetchall()
+        self.assertEqual([("gem-1", "Ada"), ("gem-2", "Bob")], rows)
+
+    def test_give_contending_recipients_cannot_receive_the_same_item(self):
+        for player in ("Ada", "Bob", "Cara"):
+            self.engine.join(player)
+        self.engine.act("Ada", "take token")
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            transfers = list(pool.map(
+                lambda target: Engine(self.db_path).act("Ada", f"give token to {target}"),
+                ("Bob", "Cara"),
+            ))
+        self.assertEqual(1, sum("You give" in value for value in transfers))
+        self.assertEqual(1, sum("not carrying" in value for value in transfers))
+        with closing(sqlite3.connect(self.db_path)) as db:
+            receiver = db.execute("SELECT held_by FROM items WHERE id='token'").fetchone()[0]
+            gifts = db.execute("SELECT COUNT(*) FROM events WHERE kind='give'").fetchone()[0]
+        self.assertIn(receiver, {"Bob", "Cara"})
+        self.assertEqual(1, gifts)
 
     def test_idempotent_retry_does_not_duplicate_event(self):
         self.engine.join("Patrick")

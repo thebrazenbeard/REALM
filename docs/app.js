@@ -127,7 +127,11 @@
         signal: options.signal || session.abortController.signal,
       });
     } catch {
-      throw new Error("The host could not be reached. Check its address, HTTPS, CORS origin, and network access.");
+      const error = new Error("The host could not be reached. Check its address, HTTPS, CORS origin, and network access.");
+      // Fetch rejected before an HTTP response existed (e.g. a reset socket).
+      // Keep this distinct from malformed JSON or a real 401/403 response.
+      error.transportFailure = true;
+      throw error;
     }
     let data;
     try { data = await response.json(); }
@@ -279,12 +283,16 @@
         session.throttled = true;
         return;
       }
-      if (error.status === 503 || error.status === 408) {
+      if (error.status === 503 || error.status === 408 || error.transportFailure === true) {
         // 503 admission failure and 408 request timeout are transient; the
-        // feed GET is safe to retry. Do not spin forever on a saturated host.
+        // feed GET is safe to retry. A pre-header transport reset needs the
+        // same bounded backoff, but is not proof the host is overloaded.
+        const transportFailure = error.transportFailure === true;
         session.overloadFailures++;
         if (session.overloadFailures >= 4) {
-          stopSession({ note: "The host was busy repeatedly; disconnected. Reconnect when it is available." });
+          stopSession({ note: transportFailure
+            ? "The host connection was interrupted repeatedly; disconnected. Check its address, HTTPS, CORS, and network access."
+            : "The host was busy repeatedly; disconnected. Reconnect when it is available." });
           return;
         }
         const backoff = Math.min(MAX_RATE_RETRY_MS, POLL_DELAY_MS * (2 ** session.overloadFailures));
@@ -292,8 +300,10 @@
           error.status === 503 ? (error.retryAfterMs || 0) : 0);
         session.failures = 0;
         if (!session.overloaded) appendFeed({
-          category: "system", label: "HOST / BUSY",
-          message: "The host is temporarily unavailable. Feed updates will resume after a bounded delay.",
+          category: "system", label: transportFailure ? "HOST / CONNECTION" : "HOST / BUSY",
+          message: transportFailure
+            ? "The host connection was interrupted before a response. Feed updates will resume after a bounded delay."
+            : "The host is temporarily unavailable. Feed updates will resume after a bounded delay.",
           icon: "◇",
         });
         session.overloaded = true;
@@ -483,6 +493,9 @@
   ui.disconnect.addEventListener("click", () => stopSession({ note: "Disconnected locally. The world remains on your host." }));
   quickActions.forEach((button) => button.addEventListener("click", () => {
     if (!current) return;
+    // A suggested command is a new draft, not a continuation of ↑/↓ recall.
+    current.historyIndex = null;
+    current.commandDraft = "";
     ui.commandInput.value = button.dataset.command;
     ui.commandInput.focus();
   }));

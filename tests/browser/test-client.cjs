@@ -46,7 +46,7 @@ function worldMap() {
   };
 }
 
-function instantiate({ missingMap = false, mapOnMove = false, rejectUnauthorized = false, fetchImpl = null, mapGate = null, roomGate = null, joinGate = null, healthGate = null, commandGate = null, cryptoImpl = require("node:crypto").webcrypto, nowMs = null } = {}) {
+function instantiate({ missingMap = false, mapOnMove = false, rejectUnauthorized = false, fetchImpl = null, mapGate = null, roomGate = null, joinGate = null, healthGate = null, commandGate = null, quickActionCommands = [], cryptoImpl = require("node:crypto").webcrypto, nowMs = null } = {}) {
   const elements = new Map();
   const get = (id) => {
     if (!elements.has(id)) elements.set(id, new Element());
@@ -57,7 +57,11 @@ function instantiate({ missingMap = false, mapOnMove = false, rejectUnauthorized
   let mapAvailable = !missingMap;
   const document = {
     getElementById: get,
-    querySelectorAll: () => [],
+    querySelectorAll: (selector) => selector === "[data-command]" ? quickActionCommands.map((command) => {
+      const button = get("quick-" + command);
+      button.dataset.command = command;
+      return button;
+    }) : [],
     createElement: () => new Element(),
     createDocumentFragment: () => new Element(),
   };
@@ -174,6 +178,29 @@ test("command history keeps only 50 entries and restarts recall after typing", a
   input.events.keydown({ key: "ArrowDown", preventDefault() {} });
   assert.equal(input.value, "edited draft");
   client.disconnect();
+});
+
+test("suggested command replaces stale history navigation instead of being overwritten", async () => {
+  const client = instantiate({ quickActionCommands: ["inventory"] });
+  client.get("host-url").value = "http://127.0.0.1:8765";
+  client.get("player-name").value = "Explorer";
+  client.get("access-token").value = "synthetic-token";
+  await client.connect();
+  for (const command of ["look", "who"]) {
+    client.get("command-input").value = command;
+    await client.send();
+  }
+  const input = client.get("command-input");
+  input.value = "unfinished draft";
+  input.events.input({});
+  input.events.keydown({ key: "ArrowUp", preventDefault() {} });
+  assert.equal(input.value, "who");
+  client.get("quick-inventory").events.click();
+  assert.equal(input.value, "inventory");
+  input.events.keydown({ key: "ArrowDown", preventDefault() {} });
+  assert.equal(input.value, "inventory", "old draft must not replace the chosen suggestion");
+  input.events.keydown({ key: "ArrowUp", preventDefault() {} });
+  assert.equal(input.value, "who", "new recall should start from most recent history entry");
 });
 
 test("rapid duplicate command submits issue only one POST and one action ID", async () => {
@@ -820,6 +847,96 @@ test("repeated host overload fails closed after a bounded number of poll retries
   assert.equal(feedCalls, 4, "the temporary-backoff window must be bounded");
   assert.equal(client.get("world-name").textContent, "Unconnected");
   assert.match(client.get("connection-note").textContent, /busy repeatedly/i);
+});
+
+test("a reset feed socket uses bounded transport backoff and recovers without losing the session", async () => {
+  const clock = { value: 100000 };
+  let feedCalls = 0;
+  const client = instantiate({ nowMs: clock, fetchImpl: async (url) => {
+    const route = new URL(url).pathname;
+    if (route === "/api/v1/feed") {
+      feedCalls++;
+      if (feedCalls <= 3) throw new TypeError("simulated WinError 10053 connection reset before headers");
+      return { ok: true, status: 200,
+        json: async () => ({ cursor: 1, events: [{ id: 1, actor: "Companion", kind: "say", text: "Still here" }] }) };
+    }
+    const data = route === "/api/v1/health" ? { ok: true, world_id: "reset-world" }
+      : route === "/api/v1/join" ? { text: "Welcome", cursor: 0 }
+        : route === "/api/v1/room" ? { text: "The Gate" } : worldMap();
+    return { ok: true, status: 200, json: async () => data };
+  } });
+  client.get("host-url").value = "http://127.0.0.1:8765";
+  client.get("player-name").value = "Explorer";
+  client.get("access-token").value = "synthetic-token";
+  await client.connect();
+  for (const delay of [4400, 8800, 17600]) {
+    await client.timers[0].fn();
+    assert.equal(client.get("connection-status").textContent, "Connected — receiving host state");
+    assert.ok(client.get("feed").children.some((item) =>
+      item.children[1].children[0].textContent === "HOST / CONNECTION"));
+    await client.timers[0].fn();
+    assert.equal(feedCalls, [4400, 8800, 17600].indexOf(delay) + 1, "retry must wait for bounded backoff");
+    clock.value += delay;
+  }
+  await client.timers[0].fn();
+  assert.equal(feedCalls, 4);
+  assert.equal(client.get("connection-status").textContent, "Connected — receiving host state");
+  assert.ok(client.get("feed").children.some((item) => item.children[1].children[0].textContent === "Companion / say"));
+});
+
+test("repeated transport resets fail closed after four bounded feed attempts", async () => {
+  const clock = { value: 100000 };
+  let feedCalls = 0;
+  const client = instantiate({ nowMs: clock, fetchImpl: async (url) => {
+    const route = new URL(url).pathname;
+    if (route === "/api/v1/feed") {
+      feedCalls++;
+      throw new TypeError("simulated reset before headers");
+    }
+    const data = route === "/api/v1/health" ? { ok: true, world_id: "reset-world" }
+      : route === "/api/v1/join" ? { text: "Welcome", cursor: 0 }
+        : route === "/api/v1/room" ? { text: "The Gate" } : worldMap();
+    return { ok: true, status: 200, json: async () => data };
+  } });
+  client.get("host-url").value = "http://127.0.0.1:8765";
+  client.get("player-name").value = "Explorer";
+  client.get("access-token").value = "synthetic-token";
+  await client.connect();
+  for (let i = 0; i < 4; i++) {
+    await client.timers[0].fn();
+    clock.value += 31000;
+  }
+  assert.equal(feedCalls, 4);
+  assert.equal(client.get("connection-status").textContent, "Offline — no world connected");
+  assert.match(client.get("connection-note").textContent, /connection was interrupted repeatedly/i);
+  assert.equal(client.get("access-token").value, "");
+});
+
+test("malformed JSON and forbidden feed responses still fail closed without transport backoff", async () => {
+  for (const caseName of ["malformed-json", "forbidden"]) {
+    let feedCalls = 0;
+    const client = instantiate({ fetchImpl: async (url) => {
+      const route = new URL(url).pathname;
+      if (route === "/api/v1/feed") {
+        feedCalls++;
+        return caseName === "forbidden"
+          ? { ok: false, status: 403, json: async () => ({ error: "Forbidden" }) }
+          : { ok: true, status: 200, json: async () => { throw new SyntaxError("not JSON"); } };
+      }
+      const data = route === "/api/v1/health" ? { ok: true, world_id: "reject-world" }
+        : route === "/api/v1/join" ? { text: "Welcome", cursor: 0 }
+          : route === "/api/v1/room" ? { text: "The Gate" } : worldMap();
+      return { ok: true, status: 200, json: async () => data };
+    } });
+    client.get("host-url").value = "http://127.0.0.1:8765";
+    client.get("player-name").value = "Explorer";
+    client.get("access-token").value = "synthetic-token";
+    await client.connect();
+    for (let i = 0; i < 3; i++) await client.timers[0].fn();
+    assert.equal(feedCalls, 3, caseName + " must not be disguised as transport backoff");
+    assert.equal(client.get("connection-status").textContent, "Offline — no world connected");
+    assert.match(client.get("connection-note").textContent, /polling failed repeatedly/i);
+  }
 });
 
 test("HTTP 503/408 commands retain the same action ID for explicit manual retry", async () => {

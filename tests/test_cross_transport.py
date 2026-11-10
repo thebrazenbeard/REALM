@@ -128,6 +128,19 @@ class CrossTransportTests(unittest.TestCase):
         self.assertIn("That item is not here.", denied["text"])
         self.assertIn("Brass token", self.telnet_command(telnet, "inventory"))
 
+    def test_telnet_to_http_give_shares_persisted_inventory_and_room_event(self):
+        browser = self.api("/api/v1/join", {"player": "Browser"})
+        terminal = self.telnet_login("Terminal")
+        self.assertIn("You take Brass token.", self.telnet_command(terminal, "take token"))
+        self.assertIn("You give Brass token to Browser.",
+                      self.telnet_command(terminal, "give token to Browser"))
+        bag = self.api("/api/v1/command", {"player": "Browser", "command": "inventory"})
+        self.assertEqual("You carry: Brass token", bag["text"])
+        self.assertIn("You carry: nothing", self.telnet_command(terminal, "inventory"))
+        query = parse.urlencode({"player": "Browser", "after": browser["cursor"]})
+        feed = self.api(f"/api/v1/feed?{query}")
+        self.assertEqual(1, sum(event["kind"] == "give" for event in feed["events"]))
+
 
 if __name__ == "__main__":
     unittest.main()

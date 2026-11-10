@@ -514,6 +514,9 @@ class Gateway:
                     content = f"{row['actor']} took {payload.get('item','an item')}."
                 elif kind == "drop":
                     content = f"{row['actor']} dropped {payload.get('item','an item')}."
+                elif kind == "give":
+                    content = (f"{row['actor']} gave {payload.get('item','an item')} "
+                               f"to {payload.get('to','someone')}.")
                 elif kind == "gather":
                     content = f"{row['actor']} gathered {payload.get('material','resources')} x{payload.get('amount',0)}."
                 elif kind in {"craft", "build"}:
@@ -1085,15 +1088,35 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     if args.demo_crafting:
         gateway.router.seed_demo_crafting()
+    from .local_host_runner import _AcceptedSessions
     server = GatewayServer(gateway, tuple(args.allow_origin), args.port)
-    print(f"REALM gateway listening on http://127.0.0.1:{server.server_port}", flush=True)
-    print("Private-host player credentials required. Not an internet-facing game server.", flush=True)
+    # ThreadingHTTPServer daemon workers outlive server_close(), and an
+    # authenticated keep-alive socket could otherwise write after the CLI
+    # returns. Reuse the local host's accepted-socket custody for this ordinary
+    # gateway entrypoint, without enabling a clock or Telnet listener.
     try:
-        server.serve_forever(poll_interval=0.2)
-    except KeyboardInterrupt:
-        pass
+        custody = _AcceptedSessions(server)
+    except BaseException:
+        # Server construction already bound its listener; if worker custody
+        # cannot initialize, no request may be admitted by an orphan socket.
+        # Keep the setup exception primary even if listener cleanup fails.
+        try:
+            server.server_close()
+        except BaseException:
+            pass
+        raise
+    try:
+        print(f"REALM gateway listening on http://127.0.0.1:{server.server_port}", flush=True)
+        print("Private-host player credentials required. Not an internet-facing game server.", flush=True)
+        try:
+            server.serve_forever(poll_interval=0.2)
+        except KeyboardInterrupt:
+            pass
     finally:
-        server.server_close()
+        try:
+            server.server_close()
+        finally:
+            custody.quiesce()
     return 0
 
 

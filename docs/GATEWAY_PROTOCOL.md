@@ -183,8 +183,19 @@ events per request, and advances its cursor only for returned events.
 The join response supplies a starting cursor to avoid displaying a room's
 entire previous history as new activity.
 
+The `give <item> to <player>` gameplay command transfers one item held by the
+authenticated sender to a different player whose **saved room position** is
+the sender's current room. This is transactional with its `give` event in the
+room history and polling feed. Item IDs work directly; duplicate item display
+names require an unambiguous ID. The recipient must already have joined this
+world, but need **not** have an active HTTP or Telnet connection: the persisted
+room position is not an online-presence signal. Neither this command nor the
+scene occupants list claims that a player is currently connected. Items
+cannot be given to oneself, to an unknown or different-room player, or by a
+sender who does not possess them.
+
 Keyed gameplay commands retain mutation idempotency: replaying the same
-`action_id` cannot take, gather, craft, or say twice. Read-only commands,
+`action_id` cannot take, give, gather, craft, or say twice. Read-only commands,
 including `look`, `examine`, `inventory`, `who`, `history`, `resources`,
 `recipes`, `structures`, and bare `gather`, are evaluated against current
 authorized state on each retry. An old observation receipt cannot grant

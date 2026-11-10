@@ -357,6 +357,46 @@ class Engine:
                 self._event(db, actor, room_id, "drop", {"item": item["id"]},
                             emissions=emissions)
                 return f"You drop {item['name']}."
+            if verb == "give":
+                # Saved room positions establish a local transfer audience,
+                # not a claim that the recipient is connected right now.
+                target = re.fullmatch(r"(.+)\s+to\s+(\S+)", arg, flags=re.IGNORECASE)
+                if target is None or not _PLAYER_RE.fullmatch(target.group(2)):
+                    return "Use 'give <item> to <player>'."
+                item_name, recipient_name = target.groups()
+                if recipient_name.casefold() == actor.casefold():
+                    return "You cannot give an item to yourself."
+                recipient = db.execute(
+                    "SELECT id FROM players WHERE id=? COLLATE NOCASE AND room_id=?",
+                    (recipient_name, room_id),
+                ).fetchone()
+                if recipient is None:
+                    return "Recipient is not in this room."
+                # Explicit stable item IDs disambiguate duplicate display names.
+                item = db.execute(
+                    "SELECT id,name FROM items WHERE held_by=? AND id=? COLLATE NOCASE",
+                    (actor, item_name),
+                ).fetchone()
+                if item is None:
+                    matches = db.execute(
+                        "SELECT id,name FROM items WHERE held_by=? AND name=? COLLATE NOCASE "
+                        "ORDER BY id LIMIT 2",
+                        (actor, item_name),
+                    ).fetchall()
+                    if len(matches) > 1:
+                        return "Item name is ambiguous; use the item ID."
+                    item = matches[0] if matches else None
+                if item is None:
+                    return "You are not carrying that item."
+                changed = db.execute(
+                    "UPDATE items SET held_by=? WHERE id=? AND held_by=? AND room_id IS NULL",
+                    (recipient["id"], item["id"], actor),
+                )
+                if changed.rowcount != 1:
+                    return "You are not carrying that item."
+                self._event(db, actor, room_id, "give", {"item": item["id"], "to": recipient["id"]},
+                            emissions=emissions)
+                return f"You give {item['name']} to {recipient['id']}."
             if verb == "who":
                 people = db.execute("SELECT id FROM players ORDER BY id COLLATE NOCASE").fetchall()
                 return "Players who have joined this world: " + ", ".join(p[0] for p in people)
@@ -393,7 +433,9 @@ class Engine:
                     elif event["kind"] in {"take", "drop"}:
                         past = "took" if event["kind"] == "take" else "dropped"
                         items.append(f"{event['actor']} {past} {details['item']}")
+                    elif event["kind"] == "give":
+                        items.append(f"{event['actor']} gave {details['item']} to {details['to']}")
                 return "\n".join(items) if items else "No recorded activity here yet."
             if verb in {"help", "?"}:
-                return "Commands: look [item], examine <item> (x), go <north|south|east|west>, n/s/e/w, take <item>, drop <item>, inventory, say <text>, listen, history [1-50], who, where, help, quit"
+                return "Commands: look [item], examine <item> (x), go <north|south|east|west>, n/s/e/w, take <item>, drop <item>, give <item> to <player>, inventory, say <text>, listen, history [1-50], who, where, help, quit"
             return "Unknown command. Type 'help' for options."

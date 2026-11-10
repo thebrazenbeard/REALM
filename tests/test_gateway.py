@@ -175,6 +175,49 @@ class GatewayTests(unittest.TestCase):
         ]
         self.assertEqual(1, len(matching))
 
+    def test_give_is_authenticated_atomic_and_auditable_over_http(self):
+        _, joined = self.send("/api/v1/join", {"player": "Patrick"})
+        self.send("/api/v1/join", {"player": "Vera"})
+        self.send("/api/v1/command", {"player": "Patrick", "command": "take token"})
+        action = {"player": "Patrick", "command": "give token to Vera", "action_id": "give-once"}
+        status, moved = self.send("/api/v1/command", action)
+        self.assertEqual(200, status)
+        self.assertEqual("You give Brass token to Vera.", moved["text"])
+        self.assertEqual((200, moved), self.send("/api/v1/command", action))
+        _, receiver = self.send("/api/v1/command", {"player": "Vera", "command": "inventory"})
+        self.assertEqual("You carry: Brass token", receiver["text"])
+        _, sender = self.send("/api/v1/command", {"player": "Patrick", "command": "inventory"})
+        self.assertEqual("You carry: nothing", sender["text"])
+        query = parse.urlencode({"player": "Patrick", "after": joined["cursor"]})
+        _, events = self.send(f"/api/v1/feed?{query}")
+        gifts = [event for event in events["events"] if event["kind"] == "give"]
+        self.assertEqual(1, len(gifts))
+        self.assertEqual("Patrick gave token to Vera.", gifts[0]["text"])
+        status, denied = self.send("/api/v1/command", {"player": "Patrick", "command": "give token to Vera"},
+                                   token_player="Vera")
+        self.assertEqual(403, status)
+        self.assertFalse(denied["ok"])
+
+    def test_give_does_not_expose_other_room_feed_or_recipient_presence(self):
+        self.send("/api/v1/join", {"player": "Patrick"})
+        self.send("/api/v1/join", {"player": "Vera"})
+        self.send("/api/v1/command", {"player": "Patrick", "command": "take token"})
+        self.send("/api/v1/command", {"player": "Vera", "command": "north"})
+        status, blocked = self.send("/api/v1/command", {
+            "player": "Patrick", "command": "give token to Vera"
+        })
+        self.assertEqual(200, status)
+        self.assertEqual("Recipient is not in this room.", blocked["text"])
+        self.send("/api/v1/command", {"player": "Vera", "command": "south"})
+        _, delivered = self.send("/api/v1/command", {"player": "Patrick", "command": "give token to Vera"})
+        self.assertIn("You give", delivered["text"])
+        # The API knows the latest saved room; it never asserts a live session.
+        _, scene = self.send("/api/v1/scene?player=Patrick")
+        self.assertEqual("saved_position_only", scene["presence_semantics"])
+        self.send("/api/v1/command", {"player": "Vera", "command": "north"})
+        _, feed = self.send("/api/v1/feed?player=Vera&after=0")
+        self.assertFalse(any(event["kind"] == "give" for event in feed["events"]))
+
     def test_feed_player_scope_and_invalid_inputs(self):
         self.send("/api/v1/join", {"player": "Patrick"})
         self.send("/api/v1/join", {"player": "Vera"})
