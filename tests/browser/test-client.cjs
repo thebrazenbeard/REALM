@@ -484,6 +484,215 @@ test("malformed and excessive retry intervals cannot suspend browser feed indefi
   }
 });
 
+test("HTTP 503 and 408 feed failures back off without immediately losing the world", async () => {
+  const clock = { value: 100000 };
+  let feedCalls = 0;
+  const client = instantiate({ nowMs: clock, fetchImpl: async (url) => {
+    const route = new URL(url).pathname;
+    if (route === "/api/v1/feed") {
+      feedCalls++;
+      if (feedCalls === 1) {
+        return { ok: false, status: 503, headers: { get: () => null },
+          json: async () => { throw new SyntaxError("upstream sent an empty overload body"); } };
+      }
+      if (feedCalls === 2) {
+        return { ok: false, status: 408, json: async () => ({ error: "Request timed out" }) };
+      }
+      return { ok: true, status: 200,
+        json: async () => ({ cursor: 7, events: [{ id: 7, actor: "Crewmate", kind: "say", text: "Back online" }] }) };
+    }
+    const data = route === "/api/v1/health" ? { ok: true, world_id: "busy-world" }
+      : route === "/api/v1/join" ? { text: "Welcome", cursor: 0 }
+        : route === "/api/v1/room" ? { text: "The Deck" } : worldMap();
+    return { ok: true, status: 200, json: async () => data };
+  } });
+  client.get("host-url").value = "http://127.0.0.1:8765";
+  client.get("player-name").value = "Explorer";
+  client.get("access-token").value = "secret-token";
+  await client.connect();
+  await client.timers[0].fn();
+  assert.equal(feedCalls, 1);
+  assert.equal(client.get("connection-status").textContent, "Connected — receiving host state");
+  assert.ok(client.get("feed").children.some((item) =>
+    /HOST \/ BUSY/.test(item.children[1].children[0].textContent)));
+  clock.value += 4399;
+  await client.timers[0].fn();
+  assert.equal(feedCalls, 1, "a busy host must not be hammered on every polling interval");
+  clock.value++;
+  await client.timers[0].fn();
+  assert.equal(feedCalls, 2);
+  clock.value += 8800;
+  await client.timers[0].fn();
+  assert.equal(feedCalls, 3);
+  assert.equal(client.get("connection-status").textContent, "Connected — receiving host state");
+  assert.ok(client.get("feed").children.some((item) =>
+    item.children[1].children[0].textContent === "Crewmate / say"));
+});
+
+test("repeated host overload fails closed after a bounded number of poll retries", async () => {
+  const clock = { value: 1000 };
+  let feedCalls = 0;
+  const client = instantiate({ nowMs: clock, fetchImpl: async (url) => {
+    const route = new URL(url).pathname;
+    if (route === "/api/v1/feed") {
+      feedCalls++;
+      return { ok: false, status: 503, json: async () => ({ error: "Server busy" }) };
+    }
+    const data = route === "/api/v1/health" ? { ok: true, world_id: "busy-world" }
+      : route === "/api/v1/join" ? { text: "Welcome", cursor: 0 }
+        : route === "/api/v1/room" ? { text: "The Deck" } : worldMap();
+    return { ok: true, status: 200, json: async () => data };
+  } });
+  client.get("host-url").value = "http://127.0.0.1:8765";
+  client.get("player-name").value = "Explorer";
+  client.get("access-token").value = "secret-token";
+  await client.connect();
+  for (let i = 0; i < 4; i++) {
+    await client.timers[0].fn();
+    clock.value += 31000;
+  }
+  assert.equal(feedCalls, 4, "the temporary-backoff window must be bounded");
+  assert.equal(client.get("world-name").textContent, "Unconnected");
+  assert.match(client.get("connection-note").textContent, /busy repeatedly/i);
+});
+
+test("HTTP 503/408 commands retain the same action ID for explicit manual retry", async () => {
+  const actionIds = [];
+  const client = instantiate({ fetchImpl: async (url, options) => {
+    const route = new URL(url).pathname;
+    if (route === "/api/v1/command") {
+      const command = JSON.parse(options.body);
+      actionIds.push(command.action_id);
+      if (actionIds.length === 1) return { ok: false, status: 503,
+        json: async () => ({ error: "Server busy" }) };
+      if (actionIds.length === 2) return { ok: false, status: 408,
+        json: async () => ({ error: "Body timed out" }) };
+      return { ok: true, status: 200, json: async () => ({ text: "Action accepted" }) };
+    }
+    const data = route === "/api/v1/health" ? { ok: true, world_id: "busy-world" }
+      : route === "/api/v1/join" ? { text: "Welcome", cursor: 0 }
+        : route === "/api/v1/room" ? { text: "The Deck" }
+          : route === "/api/v1/feed" ? { cursor: 0, events: [] } : worldMap();
+    return { ok: true, status: 200, json: async () => data };
+  } });
+  client.get("host-url").value = "http://127.0.0.1:8765";
+  client.get("player-name").value = "Explorer";
+  client.get("access-token").value = "secret-token";
+  await client.connect();
+  client.get("command-input").value = "say Hold position";
+  await client.send();
+  assert.equal(client.get("command-input").value, "say Hold position");
+  assert.equal(actionIds.length, 1, "never automatically replay a possibly committed command");
+  await client.send();
+  assert.equal(client.get("command-input").value, "say Hold position");
+  assert.equal(actionIds.length, 2);
+  await client.send();
+  assert.equal(client.get("command-input").value, "");
+  assert.equal(actionIds.length, 3);
+  assert.equal(actionIds[0], actionIds[1]);
+  assert.equal(actionIds[1], actionIds[2]);
+  assert.ok(client.get("feed").children.some((item) =>
+    /HOST \/ RETRY/.test(item.children[1].children[0].textContent)));
+});
+
+test("editing a failed command creates a distinct action ID", async () => {
+  const sent = [];
+  const client = instantiate({ fetchImpl: async (url, options) => {
+    const route = new URL(url).pathname;
+    if (route === "/api/v1/command") {
+      const body = JSON.parse(options.body);
+      sent.push(body);
+      if (sent.length === 1) return { ok: false, status: 503,
+        json: async () => ({ error: "Busy" }) };
+      return { ok: true, status: 200, json: async () => ({ text: "Accepted" }) };
+    }
+    const data = route === "/api/v1/health" ? { ok: true, world_id: "edit-world" }
+      : route === "/api/v1/join" ? { text: "Welcome", cursor: 0 }
+        : route === "/api/v1/room" ? { text: "The Deck" }
+          : route === "/api/v1/feed" ? { cursor: 0, events: [] } : worldMap();
+    return { ok: true, status: 200, json: async () => data };
+  } });
+  client.get("host-url").value = "http://127.0.0.1:8765";
+  client.get("player-name").value = "Explorer";
+  client.get("access-token").value = "secret-token";
+  await client.connect();
+  client.get("command-input").value = "say First";
+  await client.send();
+  client.get("command-input").value = "say Revised";
+  await client.send();
+  assert.equal(sent.length, 2);
+  assert.notEqual(sent[0].action_id, sent[1].action_id);
+  assert.equal(sent[1].command, "say Revised");
+});
+
+test("duplicate Send event while a command is in flight never submits twice", async () => {
+  let releaseCommand, reachedCommand;
+  const entered = new Promise((resolve) => { reachedCommand = resolve; });
+  const pending = new Promise((resolve) => { releaseCommand = resolve; });
+  let sent = 0;
+  const client = instantiate({ fetchImpl: async (url) => {
+    const route = new URL(url).pathname;
+    if (route === "/api/v1/command") {
+      sent++;
+      reachedCommand();
+      await pending;
+      return { ok: true, status: 200, json: async () => ({ text: "Executed once" }) };
+    }
+    const data = route === "/api/v1/health" ? { ok: true, world_id: "busy-world" }
+      : route === "/api/v1/join" ? { text: "Welcome", cursor: 0 }
+        : route === "/api/v1/room" ? { text: "The Deck" }
+          : route === "/api/v1/feed" ? { cursor: 0, events: [] } : worldMap();
+    return { ok: true, status: 200, json: async () => data };
+  } });
+  client.get("host-url").value = "http://127.0.0.1:8765";
+  client.get("player-name").value = "Explorer";
+  client.get("access-token").value = "secret-token";
+  await client.connect();
+  client.get("command-input").value = "say Hold";
+  const first = client.send();
+  await entered;
+  await client.send();
+  assert.equal(sent, 1);
+  releaseCommand();
+  await first;
+  assert.equal(client.get("command-input").value, "");
+});
+
+test("a late 503 command response cannot alter a freshly rejoined session", async () => {
+  let releaseOld, reachedOld;
+  const waiting = new Promise((resolve) => { reachedOld = resolve; });
+  const held = new Promise((resolve) => { releaseOld = resolve; });
+  let commands = 0;
+  const client = instantiate({ fetchImpl: async (url) => {
+    const route = new URL(url).pathname;
+    if (route === "/api/v1/command") {
+      if (++commands === 1) { reachedOld(); await held; }
+      return { ok: false, status: 503, json: async () => ({ error: "Server busy" }) };
+    }
+    const data = route === "/api/v1/health" ? { ok: true, world_id: "rejoined-world" }
+      : route === "/api/v1/join" ? { text: "Welcome", cursor: 0 }
+        : route === "/api/v1/room" ? { text: "The Deck" }
+          : route === "/api/v1/feed" ? { cursor: 0, events: [] } : worldMap();
+    return { ok: true, status: 200, json: async () => data };
+  } });
+  client.get("host-url").value = "http://127.0.0.1:8765";
+  client.get("player-name").value = "Explorer";
+  client.get("access-token").value = "old-token";
+  await client.connect();
+  client.get("command-input").value = "north";
+  const oldSend = client.send();
+  await waiting;
+  client.disconnect();
+  client.get("access-token").value = "new-token";
+  await client.connect();
+  releaseOld();
+  await oldSend;
+  assert.equal(client.get("world-name").textContent, "rejoined-world");
+  assert.equal(client.get("command-input").value, "");
+  assert.deepEqual(client.get("feed").children.map((item) =>
+    item.children[1].children[0].textContent), ["HOST / JOIN"]);
+});
+
 const gatewayRoot = process.env.REALM_LIVE_GATEWAY_ROOT || path.join(__dirname, "../..");
 const gatewaySource = path.join(gatewayRoot, "src/realm/gateway.py");
 

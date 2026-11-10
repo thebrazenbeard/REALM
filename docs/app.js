@@ -129,12 +129,17 @@
     }
     let data;
     try { data = await response.json(); }
-    catch { throw new Error("The host returned a response that was not JSON."); }
+    catch {
+      // An overloaded proxy can emit an empty/non-JSON 503. Preserve the
+      // HTTP status so the client can back off without severing a session.
+      if (response.ok) throw new Error("The host returned a response that was not JSON.");
+      data = {};
+    }
     if (!response.ok) {
-      const detail = typeof data.error === "string" ? data.error : "Request rejected by the host";
+      const detail = typeof data?.error === "string" ? data.error : "Request rejected by the host";
       const error = new Error(detail + " (HTTP " + response.status + ")");
       error.status = response.status;
-      if (response.status === 429) {
+      if (response.status === 429 || response.status === 503) {
         // Only bounded numeric Retry-After seconds affect host-feed polling.
         const header = response.headers?.get?.("Retry-After");
         const seconds = typeof header === "string" && /^\d{1,5}$/.test(header.trim())
@@ -253,17 +258,43 @@
       session.cursor = Math.max(session.cursor, parseCursor(data.cursor, session.cursor));
       session.failures = 0;
       session.throttled = false;
+      session.overloaded = false;
+      session.overloadFailures = 0;
       session.pollPauseUntil = 0;
       if (Date.now() - session.mapUpdated > 12000) await refreshMap(session);
     } catch (error) {
       if (current !== session) return;
       if (error.status === 429) {
+        session.overloadFailures = 0;
+        session.overloaded = false;
         session.pollPauseUntil = Date.now() + error.retryAfterMs;
         session.failures = 0;
         if (!session.throttled) appendFeed({ category: "system", label: "HOST / RATE LIMIT", message: "The host is busy. Feed updates will resume after its retry interval.", icon: "◇" });
         session.throttled = true;
         return;
       }
+      if (error.status === 503 || error.status === 408) {
+        // 503 admission failure and 408 request timeout are transient; the
+        // feed GET is safe to retry. Do not spin forever on a saturated host.
+        session.overloadFailures++;
+        if (session.overloadFailures >= 4) {
+          stopSession({ note: "The host was busy repeatedly; disconnected. Reconnect when it is available." });
+          return;
+        }
+        const backoff = Math.min(MAX_RATE_RETRY_MS, POLL_DELAY_MS * (2 ** session.overloadFailures));
+        session.pollPauseUntil = Date.now() + Math.max(backoff,
+          error.status === 503 ? (error.retryAfterMs || 0) : 0);
+        session.failures = 0;
+        if (!session.overloaded) appendFeed({
+          category: "system", label: "HOST / BUSY",
+          message: "The host is temporarily unavailable. Feed updates will resume after a bounded delay.",
+          icon: "◇",
+        });
+        session.overloaded = true;
+        return;
+      }
+      session.overloadFailures = 0;
+      session.overloaded = false;
       session.failures++;
       if (session.failures === 1) appendFeed({ category: "error", label: "CONNECTION INTERRUPTED", message: error.message, icon: "!" });
       if (session.failures >= 3) {
@@ -290,7 +321,8 @@
     ui.connect.textContent = "Connecting…";
     setNote("Contacting the host…");
     const session = { base, token, player, abortController: new AbortController(), cursor: 0, polling: false, failures: 0,
-      throttled: false, pollPauseUntil: 0, roomRevision: 0,
+      throttled: false, overloaded: false, overloadFailures: 0, pollPauseUntil: 0, roomRevision: 0,
+      commandPending: false, pendingCommandRetry: null,
       mapUnsupported: false, mapPolling: false, mapRefreshPending: false, mapUpdated: 0, timer: null };
     connecting = session;
     // The cancellable in-memory session now owns the sole token copy.
@@ -343,16 +375,21 @@
     event.preventDefault();
     const session = current;
     if (!session) return;
+    if (session.commandPending) return;
     const command = ui.commandInput.value.trim();
     if (!command) return;
     ui.send.disabled = true;
     ui.commandInput.disabled = true;
-    const actionId = typeof crypto !== "undefined" && typeof crypto.randomUUID === "function"
-      ? crypto.randomUUID()
-      : "web-" + Date.now() + "-" + (++requestSerial);
+    session.commandPending = true;
+    const prior = session.pendingCommandRetry;
+    const actionId = prior && prior.command === command ? prior.actionId
+      : (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function"
+        ? crypto.randomUUID()
+        : "web-" + Date.now() + "-" + (++requestSerial));
     try {
       const answer = await request(session, "/api/v1/command", { body: { player: session.player, command, action_id: actionId } });
       if (current !== session) return;
+      session.pendingCommandRetry = null;
       appendFeed({ category: "response", label: session.player + " / " + command, message: answer.text || "(No response)", icon: "›" });
       ui.commandInput.value = "";
       if (/^(quit|exit)$/i.test(command)) {
@@ -368,8 +405,23 @@
       if (current !== session) return;
       await refreshMap(session, { afterCommand: true });
     } catch (error) {
-      if (current === session) appendFeed({ category: "error", label: "COMMAND REJECTED", message: error.message, icon: "!" });
+      if (current === session) {
+        if (error.status === 503 || error.status === 408 || error.status == null) {
+          // Never auto-replay a mutating POST after an ambiguous response.
+          // A manual retry with unchanged text reuses its durable action ID.
+          session.pendingCommandRetry = { command, actionId };
+          appendFeed({
+            category: "system", label: "HOST / RETRY",
+            message: "The command response was interrupted. If you retry the same command manually, its action ID will be reused.",
+            icon: "◇",
+          });
+        } else {
+          session.pendingCommandRetry = null;
+          appendFeed({ category: "error", label: "COMMAND REJECTED", message: error.message, icon: "!" });
+        }
+      }
     } finally {
+      session.commandPending = false;
       if (current === session) {
         ui.send.disabled = false;
         ui.commandInput.disabled = false;

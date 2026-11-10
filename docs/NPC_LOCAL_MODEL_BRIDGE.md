@@ -31,6 +31,14 @@ Duplicate JSON fields, actor/receipt injection, malformed commands, and
 model-authored authority claims are rejected. The host-side
 `ResidentController` and `Engine` validate and commit every proposed action.
 
+The response body is consumed incrementally against a monotonic deadline
+starting at the outbound request. This closes the previous slow-trickle body
+gap where a model endpoint could keep sending a byte at a time without
+ever triggering its socket inactivity timeout. Header parsing and request
+connection still use the socket timeout, not a separately proven absolute
+headers deadline; this is not a public-network HTTP client or model
+CPU/GPU cancellation mechanism.
+
 The caller must construct an independently authorized scene: the bridge does
 **not** know which rooms, messages, history, secret items, or other players
 are visible to the NPC. It does not prevent a trusted caller from placing
@@ -39,4 +47,6 @@ CPU/GPU work before the resulting proposal is rejected.
 
 Evidence: `tests/test_npc_local_model.py` exercises a real loopback HTTP
 fixture, SQLite, strict JSON rejection, authorization, and response limits.
+The slow-response regression uses a real socket fixture in
+`tests/test_npc_local_response_deadline.py`.
 It is **fixture evidence**, not a real GGUF/model inference benchmark.

@@ -15,6 +15,7 @@ from typing import Sequence
 
 from .engine import Engine
 from .npc_local_model import LocalChatProposer
+from .npc_scene import ResidentScene, ResidentSceneBuilder
 from .residents import ResidentController
 
 
@@ -29,6 +30,14 @@ class ResidentTurn:
 
     controller: ResidentController
     host_view: str
+    action_id: str
+
+
+@dataclass(frozen=True)
+class ScopedResidentTurn:
+    """Host-selected actor and receipt; view is built by REALM, not supplied."""
+
+    controller: ResidentController
     action_id: str
 
 
@@ -97,10 +106,50 @@ class ResidentTurnHost:
         return prepared
 
     def run_tick(self, turns: Sequence[ResidentTurn]) -> tuple[ResidentTurnResult, ...]:
-        """Make bounded proposals and commit through Engine in input order."""
-        prepared = self._preflight(turns)
+        """Legacy host-supplied view path; caller owns scene privacy policy."""
+        return self._run_prepared(self._preflight(turns))
+
+    def run_scoped_tick(
+        self, turns: Sequence[ScopedResidentTurn], *, speech_events: int = 8,
+    ) -> tuple[ResidentTurnResult, ...]:
+        """Build every model view from authoritative same-world room state.
+
+        This is the opt-in privacy-scoped path. The host supplies only a
+        resident controller and stable receipt ID, not an arbitrary prompt.
+        Revalidation occurs within Engine.act's BEGIN IMMEDIATE transaction.
+        """
+        if not isinstance(turns, (tuple, list)) or not 1 <= len(turns) <= self.max_turns:
+            raise ValueError("Resident tick batch must contain 1–max_turns entries")
+        candidates: list[ResidentTurn] = []
+        for turn in turns:
+            if not isinstance(turn, ScopedResidentTurn):
+                raise TypeError("Scoped tick entries must be ScopedResidentTurn values")
+            candidates.append(ResidentTurn(turn.controller, "host-scoped scene", turn.action_id))
+        prepared = self._preflight(candidates)
+        builder = ResidentSceneBuilder(self.engine, speech_events=speech_events)
+        # Resolve all host scenes before starting any inference or gameplay
+        # mutation; a bad later actor cannot partially commit earlier turns.
+        scenes = tuple(builder.build(turn.controller) for turn, _ in prepared)
+        return self._run_prepared(prepared, scenes=scenes, builder=builder)
+
+    def _run_prepared(
+        self, prepared: list[tuple[ResidentTurn, str]], *,
+        scenes: tuple[ResidentScene, ...] | None = None,
+        builder: ResidentSceneBuilder | None = None,
+    ) -> tuple[ResidentTurnResult, ...]:
+        """Apply receipts and proposals; optional scene guard is writer-owned."""
         results: list[ResidentTurnResult] = []
-        for turn, actor in prepared:
+        for index, (turn, actor) in enumerate(prepared):
+            scene = scenes[index] if scenes is not None else None
+            if scene is not None:
+                if builder is None:
+                    raise RuntimeError("Scoped scene requires its host-owned builder")
+                builder.assert_current(scene)
+                host_view = scene.view
+                writer_guard = lambda db, scene=scene: builder.assert_current_in_connection(scene, db)
+            else:
+                host_view = turn.host_view
+                writer_guard = None
             with closing(self.engine._connect()) as db:
                 stored = db.execute(
                     "SELECT command FROM action_receipts WHERE actor=? COLLATE NOCASE AND action_id=?",
@@ -111,11 +160,15 @@ class ResidentTurnHost:
                 # previously accepted command merely because receipt exists.
                 proposal = {"command": stored[0]}
                 turn.controller.validate(proposal)
-                response = turn.controller.commit(proposal, action_id=turn.action_id)
+                response = turn.controller.commit(
+                    proposal, action_id=turn.action_id, writer_guard=writer_guard,
+                )
                 replayed = True
             else:
-                proposal = self.proposer.propose(turn.host_view)
-                response = turn.controller.commit(proposal, action_id=turn.action_id)
+                proposal = self.proposer.propose(host_view)
+                response = turn.controller.commit(
+                    proposal, action_id=turn.action_id, writer_guard=writer_guard,
+                )
                 replayed = False
             results.append(ResidentTurnResult(
                 actor=actor, action_id=turn.action_id,
