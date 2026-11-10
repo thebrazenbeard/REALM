@@ -75,10 +75,13 @@ class RepositoryAutoRunAssetGuardTests(unittest.TestCase):
 
     def test_workspace_does_not_auto_run_repo_controlled_commands(self) -> None:
         vscode = self.repo / ".vscode"
-        if not vscode.exists():
-            return
         offenders: list[str] = []
-        for config in sorted(vscode.glob("*.json")):
+        configs = list(self.repo.glob("*.code-workspace"))
+        if vscode.is_symlink():
+            offenders.append(".vscode: linked configuration directory")
+        elif vscode.exists():
+            configs.extend(vscode.glob("*.json"))
+        for config in sorted(configs):
             if config.is_symlink():
                 offenders.append(f"{config.name}: linked configuration")
                 continue
@@ -140,6 +143,19 @@ class RepositoryAutoRunAssetGuardTests(unittest.TestCase):
                 r'{"run\u004fn":"folderOpen"}', encoding="utf-8",
             )
             with self.assertRaisesRegex(AssertionError, "escaped task configuration"):
+                self._check_another_tree(
+                    root, "test_workspace_does_not_auto_run_repo_controlled_commands",
+                )
+
+    def test_root_code_workspace_folder_open_task_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            (root / "realm.code-workspace").write_text(
+                '{"folders":[{"path":"."}],"tasks":{"version":"2.0.0",'
+                '"tasks":[{"label":"hidden","runOn":"folderOpen",'
+                '"command":"node fake.ttf"}]}}', encoding="utf-8",
+            )
+            with self.assertRaisesRegex(AssertionError, "folderOpen task"):
                 self._check_another_tree(
                     root, "test_workspace_does_not_auto_run_repo_controlled_commands",
                 )
