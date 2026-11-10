@@ -46,7 +46,7 @@ function worldMap() {
   };
 }
 
-function instantiate({ missingMap = false, mapOnMove = false, rejectUnauthorized = false, fetchImpl = null, mapGate = null, roomGate = null, joinGate = null } = {}) {
+function instantiate({ missingMap = false, mapOnMove = false, rejectUnauthorized = false, fetchImpl = null, mapGate = null, roomGate = null, joinGate = null, commandGate = null } = {}) {
   const elements = new Map();
   const get = (id) => {
     if (!elements.has(id)) elements.set(id, new Element());
@@ -75,6 +75,7 @@ function instantiate({ missingMap = false, mapOnMove = false, rejectUnauthorized
     if (route === "/api/v1/map" && mapGate) await mapGate();
     if (route === "/api/v1/room" && roomGate) await roomGate();
     if (route === "/api/v1/join" && joinGate) await joinGate();
+    if (route === "/api/v1/command" && commandGate) await commandGate();
     if (rejectUnauthorized && route === "/api/v1/join") {
       return { ok: false, status: 401, json: async () => ({ error: "Player token mismatch" }) };
     }
@@ -113,6 +114,130 @@ test("successful join requests authorized map, clears DOM token, and renders hos
   client.disconnect();
   assert.equal(client.get("map-status").textContent, "MAP UNAVAILABLE");
   assert.equal(client.get("world-name").textContent, "Unconnected");
+});
+
+test("command history recalls prior commands, restores draft, and clears on disconnect", async () => {
+  const client = instantiate();
+  client.get("host-url").value = "http://127.0.0.1:8765";
+  client.get("player-name").value = "Explorer";
+  client.get("access-token").value = "secret-token";
+  await client.connect();
+
+  for (const command of ["look", "who"]) {
+    client.get("command-input").value = command;
+    await client.send();
+  }
+
+  const input = client.get("command-input");
+  function press(key) {
+    let prevented = false;
+    input.events.keydown({ key, preventDefault() { prevented = true; } });
+    return prevented;
+  }
+  input.value = "unfinished message";
+  assert.equal(press("ArrowUp"), true);
+  assert.equal(input.value, "who");
+  assert.equal(press("ArrowUp"), true);
+  assert.equal(input.value, "look");
+  assert.equal(press("ArrowUp"), true, "oldest command stays selected");
+  assert.equal(input.value, "look");
+  assert.equal(press("ArrowDown"), true);
+  assert.equal(input.value, "who");
+  assert.equal(press("ArrowDown"), true);
+  assert.equal(input.value, "unfinished message");
+  assert.equal(press("ArrowDown"), false, "ordinary key behavior when not browsing history");
+
+  client.disconnect();
+  client.get("access-token").value = "new-token";
+  await client.connect();
+  input.value = "fresh session";
+  assert.equal(press("ArrowUp"), false, "old command history must not survive reconnect");
+  assert.equal(input.value, "fresh session");
+});
+
+test("command recall retains only 50 entries and editing begins a fresh history search", async () => {
+  const client = instantiate();
+  client.get("host-url").value = "http://127.0.0.1:8765";
+  client.get("player-name").value = "Explorer";
+  client.get("access-token").value = "secret-token";
+  await client.connect();
+  const input = client.get("command-input");
+  for (let i = 0; i < 53; i++) {
+    input.value = "look-" + i;
+    await client.send();
+  }
+  for (let i = 0; i < 55; i++) {
+    input.events.keydown({ key: "ArrowUp", preventDefault() {} });
+  }
+  assert.equal(input.value, "look-3", "older commands must be evicted from the in-memory ring");
+  input.value = "edited draft";
+  input.events.input({});
+  input.events.keydown({ key: "ArrowUp", preventDefault() {} });
+  assert.equal(input.value, "look-52", "editing resets recall to the latest command");
+  input.events.keydown({ key: "ArrowDown", preventDefault() {} });
+  assert.equal(input.value, "edited draft", "new draft is preserved after editing");
+  client.disconnect();
+});
+
+test("rapid duplicate command submits issue only one POST and one action ID", async () => {
+  let reachedCommand, releaseCommand;
+  const enteredCommand = new Promise((resolve) => { reachedCommand = resolve; });
+  const heldCommand = new Promise((resolve) => { releaseCommand = resolve; });
+  const client = instantiate({ commandGate: () => { reachedCommand(); return heldCommand; } });
+  client.get("host-url").value = "http://127.0.0.1:8765";
+  client.get("player-name").value = "Explorer";
+  client.get("access-token").value = "secret-token";
+  await client.connect();
+
+  client.get("command-input").value = "say This should happen only once";
+  const first = client.send();
+  await enteredCommand;
+  assert.equal(client.get("send-button").disabled, true);
+  const second = client.send(); // Synthetic double-submit bypassing the disabled DOM.
+  await Promise.resolve();
+  const posts = client.requests.filter(({ url }) => url.endsWith("/api/v1/command"));
+  assert.equal(posts.length, 1, "disabled controls alone do not guard the async handler");
+  assert.equal(typeof JSON.parse(posts[0].options.body).action_id, "string");
+
+  releaseCommand();
+  await Promise.all([first, second]);
+  assert.equal(client.get("send-button").disabled, false);
+  assert.equal(client.get("command-input").value, "");
+});
+
+test("an old pending command cannot block or change a reconnected session", async () => {
+  let releaseOldCommand, reachedOldCommand;
+  const enteredOldCommand = new Promise((resolve) => { reachedOldCommand = resolve; });
+  const heldOldCommand = new Promise((resolve) => { releaseOldCommand = resolve; });
+  let commandCount = 0;
+  const client = instantiate({ commandGate: () => {
+    commandCount++;
+    if (commandCount === 1) { reachedOldCommand(); return heldOldCommand; }
+  } });
+  client.get("host-url").value = "http://127.0.0.1:8765";
+  client.get("player-name").value = "Explorer";
+  client.get("access-token").value = "old-token";
+  await client.connect();
+
+  client.get("command-input").value = "say Old command";
+  const oldCommand = client.send();
+  await enteredOldCommand;
+  client.disconnect();
+  client.get("access-token").value = "new-token";
+  await client.connect();
+  client.get("command-input").value = "look";
+  await client.send();
+  assert.equal(commandCount, 2, "new session must not inherit an old pending guard");
+  assert.equal(client.get("send-button").disabled, false);
+
+  releaseOldCommand();
+  await oldCommand;
+  assert.equal(client.get("connection-status").textContent, "Connected — receiving host state");
+  assert.equal(client.get("command-input").disabled, false);
+  assert.equal(client.get("send-button").disabled, false);
+  const transcript = client.get("feed").children.map((item) => item.children[1].children[0].textContent);
+  assert.ok(transcript.some((label) => label.includes("Explorer / look")));
+  assert.ok(!transcript.some((label) => label.includes("Old command")), "old completion cannot contaminate the new feed");
 });
 
 test("a host without map support stays connected to its usable MUD", async () => {

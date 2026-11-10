@@ -87,6 +87,7 @@ For browser requests, Origin must exactly match one explicitly configured
 | `POST /api/v1/join` | `{"player":"Patrick"}` | `{"ok":true,"text":"Welcome ...","cursor":1}` |
 | `POST /api/v1/command` | `{"player":"Patrick","command":"look","action_id":"optional-unique-id"}` | `{"ok":true,"text":"...","cursor":1}` |
 | `GET /api/v1/room?player=Patrick` | query | `{"ok":true,"text":"...","cursor":1}` |
+| `GET /api/v1/scene?player=Patrick` | query | Authenticated saved-room facts: `room`, `exits`, `items`, `occupants`, `presence_semantics`, `truncated`, `cursor` |
 | `GET /api/v1/feed?player=Patrick&after=1` | query | `{"ok":true,"events":[...],"cursor":2}` |
 | `GET /api/v1/map?player=Patrick` | query; optional authored geography | `{"ok":true,"space":{...},"origin":{...},"width":3,"height":2,"tiles":[...],"markers":[...],"player":{...},"legend":[...]}` |
 
@@ -99,6 +100,23 @@ viewport-relative `x,y,glyph,terrain,passable`; `markers` contain
 `id,name,kind,x,y`; `origin` contains the absolute tile offset. The response
 is bounded to 32×32 cells, and the `player` marker may be `null` when absent
 from the viewport. The hosting browser must render content as inert text.
+
+The optional `scene` endpoint resolves the authenticated player's saved
+room and returns a **single consistent SQLite snapshot** of its id, name and
+description; exit directions; item ids/names; and other actors whose
+**last saved position** is in that room. It does not report who is currently
+online. Each exits/items/occupants collection is capped at 50 entries; per-field
+`truncated` flags indicate an incomplete collection. The route denies unjoined
+actors and cross-player name assertions exactly like `/room`.
+
+An entry in `occupants` is an Engine actor saved in the room. The table does
+not distinguish humans from host-provisioned resident actors or demonstrate
+that anyone is connected, available to talk to, or an active NPC. REALM's
+current core has no authoritative NPC classification or capability registry.
+The `scene` endpoint therefore supplies no `npcs`, `talk`, or action fields. A
+browser must not manufacture those affordances from room prose, an old proposed
+crew roster, or uncommitted model output. Future interaction controls require
+server-validated, scoped capabilities in a separately reviewed contract.
 
 `Geography(db_path)` can define a world hierarchy (universe/system/planet/
 region/settlement/room) alongside the base Engine's SQLite tables, and

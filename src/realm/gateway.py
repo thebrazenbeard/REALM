@@ -23,6 +23,7 @@ from .router import CommandRouter
 
 MAX_BODY_BYTES = 4096
 MAX_FEED_EVENTS = 100
+MAX_SCENE_ENTRIES = 50
 _WORLD_ID = re.compile(r"^[A-Za-z][A-Za-z0-9_-]{0,63}$")
 
 
@@ -131,6 +132,63 @@ class Gateway:
             raise ValueError("Player must be a string")
         return {"ok": True, "text": self.engine.act(player, "look"), "cursor": self.cursor()}
 
+    def scene(self, player: str) -> dict:
+        """Bounded, current-room facts for an optional structured MUD UI.
+
+        The authenticated player's persisted position is the only authority
+        for what room to inspect. Other actor records prove saved positions,
+        not current connections or whether an occupant is human/AI. The engine
+        has no authoritative NPC type or interaction-capability contract, so
+        it deliberately advertises neither NPCs nor suggested actions.
+        """
+        if not isinstance(player, str):
+            raise ValueError("Player must be a string")
+        with closing(self._read()) as db:
+            # Pin one snapshot so a concurrent move cannot mix two rooms'
+            # exits, occupants and items in one client payload.
+            db.execute("BEGIN")
+            subject = db.execute(
+                "SELECT id,room_id FROM players WHERE id=?", (player,)
+            ).fetchone()
+            if subject is None:
+                raise ValueError("Join this REALM before reading the scene")
+            room_id = subject["room_id"]
+            room = db.execute(
+                "SELECT id,name,description FROM rooms WHERE id=?", (room_id,)
+            ).fetchone()
+            if room is None:
+                raise ValueError("The saved room does not exist")
+            exits = db.execute(
+                "SELECT direction FROM exits WHERE room_id=? ORDER BY direction LIMIT ?",
+                (room_id, MAX_SCENE_ENTRIES + 1),
+            ).fetchall()
+            items = db.execute(
+                "SELECT id,name FROM items WHERE room_id=? ORDER BY id LIMIT ?",
+                (room_id, MAX_SCENE_ENTRIES + 1),
+            ).fetchall()
+            occupants = db.execute(
+                "SELECT id FROM players WHERE room_id=? AND id<>? COLLATE NOCASE "
+                "ORDER BY id COLLATE NOCASE LIMIT ?",
+                (room_id, subject["id"], MAX_SCENE_ENTRIES + 1),
+            ).fetchall()
+            cursor = int(db.execute(
+                "SELECT COALESCE(MAX(id),0) FROM events"
+            ).fetchone()[0])
+            return {
+                "ok": True,
+                "room": {key: room[key] for key in ("id", "name", "description")},
+                "exits": [r["direction"] for r in exits[:MAX_SCENE_ENTRIES]],
+                "items": [{"id": r["id"], "name": r["name"]} for r in items[:MAX_SCENE_ENTRIES]],
+                "occupants": [{"name": r["id"]} for r in occupants[:MAX_SCENE_ENTRIES]],
+                "presence_semantics": "saved_position_only",
+                "truncated": {
+                    "exits": len(exits) > MAX_SCENE_ENTRIES,
+                    "items": len(items) > MAX_SCENE_ENTRIES,
+                    "occupants": len(occupants) > MAX_SCENE_ENTRIES,
+                },
+                "cursor": cursor,
+            }
+
     def map(self, player: str) -> dict:
         """Map for the joined character's persisted room, if one is authored.
 
@@ -155,16 +213,33 @@ class Gateway:
             raise ValueError("Invalid player or cursor")
         db = self._read()
         try:
+            # Pin the saved position and its entry-event floor to one snapshot.
+            # Otherwise a concurrent move could make a mixed-room feed.
+            db.execute("BEGIN")
             subject = db.execute("SELECT id,room_id FROM players WHERE id=?", (player,)).fetchone()
             if subject is None:
                 raise ValueError("Join this REALM before reading the feed")
-            # Only events occurring in the player's CURRENT room are returned.
+            # A caller-controlled `after=0` must not bypass the player's most
+            # recent entry into this room. Joining an existing player does not
+            # create another entry event, because saved position is not proof
+            # of an active connection.
+            entry_id = db.execute(
+                "SELECT MAX(id) FROM events WHERE actor=? AND room_id=? "
+                "AND kind IN ('join','move')",
+                (subject["id"], subject["room_id"]),
+            ).fetchone()[0]
+            if entry_id is None:
+                # Legacy/imported position without an authoritative arrival:
+                # fail closed rather than reveal historical room speech.
+                return {"ok": True, "events": [], "cursor": after}
+            # Only events occurring in the player's CURRENT room since their
+            # most recent recorded arrival are returned, with entry inclusive.
             # Host-trusted player name: the HTTP handler authenticates the
             # principal before reaching this method.
             records = db.execute(
                 "SELECT id,occurred_at,actor,room_id,kind,payload_json FROM events "
-                "WHERE room_id=? AND id>? ORDER BY id LIMIT ?",
-                (subject["room_id"], after, MAX_FEED_EVENTS),
+                "WHERE room_id=? AND id>=? AND id>? ORDER BY id LIMIT ?",
+                (subject["room_id"], entry_id, after, MAX_FEED_EVENTS),
             ).fetchall()
             events = []
             for row in records:
@@ -308,6 +383,10 @@ class GatewayHandler(BaseHTTPRequestHandler):
                 if not self._player_matches(params.get("player", [None])[0], principal):
                     return
                 result = self.server.gateway.room(principal)
+            elif path == "/api/v1/scene":
+                if not self._player_matches(params.get("player", [None])[0], principal):
+                    return
+                result = self.server.gateway.scene(principal)
             elif path == "/api/v1/map":
                 if not self._player_matches(params.get("player", [None])[0], principal):
                     return

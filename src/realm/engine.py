@@ -14,6 +14,10 @@ from pathlib import Path
 
 _DIRECTIONS = {"n": "north", "s": "south", "e": "east", "w": "west", "u": "up", "d": "down"}
 _LONG_DIRECTIONS = frozenset(_DIRECTIONS.values())
+_READ_ONLY_VERBS = frozenset({
+    "look", "l", "examine", "x", "where", "location", "inventory", "inv", "i",
+    "who", "history", "listen", "help", "?", "quit", "exit",
+})
 _PLAYER_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_-]{0,23}$")
 _SEED_ROOMS = (
     ("atrium", "The Atrium", "An empty chamber waits for explorers. An unobtrusive sign reads: DEMO WORLD — NOT CANON."),
@@ -207,9 +211,12 @@ class Engine:
         elif verb in _LONG_DIRECTIONS:
             arg = verb
             verb = "go"
+        read_only = verb in _READ_ONLY_VERBS
         if action_id is not None and (not isinstance(action_id, str) or not 1 <= len(action_id) <= 128):
             raise ValueError("Action IDs must be nonempty strings up to 128 characters")
-        if verb in {"quit", "exit"}:
+        # Plain terminal quit needs no joined player; an explicitly keyed quit
+        # must still honor the global action-ID mismatch contract.
+        if verb in {"quit", "exit"} and action_id is None:
             return "Goodbye. Your position is saved."
         with closing(self._connect()) as db, db:
             # Serialize competing actions such as two players taking one object.
@@ -226,18 +233,41 @@ class Engine:
                 if receipt is not None:
                     if receipt["command"] != command:
                         raise ValueError("Action ID already used for a different command")
-                    return receipt["response"]
+                    # An action key binds a read request to its command, but
+                    # its *result* is state-dependent. Never replay an old
+                    # inventory, observation, presence, or history snapshot.
+                    if not read_only:
+                        return receipt["response"]
             response = self._perform(db, actor, room_id, verb, arg)
-            if action_id is not None:
+            if action_id is not None and receipt is None:
                 db.execute(
                     "INSERT INTO action_receipts (actor,action_id,command,response) VALUES (?,?,?,?)",
-                    (actor, action_id, command, response),
+                    (actor, action_id, command, "" if read_only else response),
                 )
             return response
 
     def _perform(self, db: sqlite3.Connection, actor: str, room_id: str, verb: str, arg: str) -> str:
-            if verb in {"look", "l"}:
+            if verb in {"quit", "exit"}:
+                return "Goodbye. Your position is saved."
+            if verb in {"look", "l"} and (not arg or arg.casefold() in {"around", "here", "room"}):
                 return self._look(db, room_id, actor)
+            if verb in {"look", "l", "examine", "x"}:
+                # Item descriptions are already part of the worldpack schema,
+                # but only the room listing was previously available to players.
+                # Never disclose the contents of another player's inventory.
+                target = arg[3:] if arg.casefold().startswith("at ") else arg
+                if not target:
+                    return "Examine what?"
+                item = db.execute(
+                    "SELECT name,description FROM items "
+                    "WHERE (room_id=? OR held_by=?) "
+                    "AND (id=? COLLATE NOCASE OR name=? COLLATE NOCASE) "
+                    "ORDER BY CASE WHEN room_id=? THEN 0 ELSE 1 END, id LIMIT 1",
+                    (room_id, actor, target, target, room_id),
+                ).fetchone()
+                if item is None:
+                    return "You cannot examine that here."
+                return f"{item['name']}\n{item['description']}"
             if verb in {"where", "location"}:
                 return f"You are in {db.execute('SELECT name FROM rooms WHERE id=?', (room_id,)).fetchone()[0]}."
             if verb == "go":
@@ -298,9 +328,21 @@ class Engine:
                 if arg and (not arg.isdigit() or not 1 <= int(arg) <= 50):
                     return "Use 'history' or 'history N' (1–50)."
                 limit = int(arg) if arg else 10
+                # The room's append-only ledger is not public hindsight: a
+                # player can only replay events since their latest arrival.
+                # Re-entering a room starts a new observation window, which
+                # prevents retroactive access to speech while they were away.
+                arrival = db.execute(
+                    "SELECT id FROM events WHERE actor=? COLLATE NOCASE AND room_id=? "
+                    "AND kind IN ('join','move') ORDER BY id DESC LIMIT 1",
+                    (actor, room_id),
+                ).fetchone()
+                if arrival is None:
+                    return "No recorded activity here yet."
                 events = db.execute(
-                    "SELECT actor,kind,payload_json FROM events WHERE room_id=? ORDER BY id DESC LIMIT ?",
-                    (room_id, limit),
+                    "SELECT actor,kind,payload_json FROM events "
+                    "WHERE room_id=? AND id>=? ORDER BY id DESC LIMIT ?",
+                    (room_id, arrival["id"], limit),
                 ).fetchall()
                 items = []
                 for event in reversed(events):
@@ -318,5 +360,5 @@ class Engine:
                         items.append(f"{event['actor']} {past} {details['item']}")
                 return "\n".join(items) if items else "No recorded activity here yet."
             if verb in {"help", "?"}:
-                return "Commands: look, go <north|south|east|west>, n/s/e/w, take <item>, drop <item>, inventory, say <text>, listen, history [1-50], who, where, help, quit"
+                return "Commands: look [item], examine <item> (x), go <north|south|east|west>, n/s/e/w, take <item>, drop <item>, inventory, say <text>, listen, history [1-50], who, where, help, quit"
             return "Unknown command. Type 'help' for options."
