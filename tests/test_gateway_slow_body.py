@@ -9,6 +9,7 @@ import threading
 import time
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
@@ -52,40 +53,99 @@ class GatewaySlowBodyTests(unittest.TestCase):
         self.clients.append(client)
         return client
 
-    def _status(self) -> int:
+    def _status(self, *, allow_reset: bool = False) -> int | None:
         with socket.create_connection(("127.0.0.1", self.port), timeout=2) as client:
             client.settimeout(2)
-            client.sendall(b"GET /api/v1/health HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n")
             response = bytearray()
-            while True:
-                part = client.recv(1024)
-                if not part:
-                    break
-                response.extend(part)
+            try:
+                client.sendall(
+                    b"GET /api/v1/health HTTP/1.1\r\nHost: 127.0.0.1\r\n"
+                    b"Connection: close\r\n\r\n"
+                )
+                while True:
+                    part = client.recv(1024)
+                    if not part:
+                        break
+                    response.extend(part)
+            except (ConnectionAbortedError, ConnectionResetError, BrokenPipeError):
+                # On Windows, closing an overloaded socket with unread GET
+                # bytes may reset it before a best-effort 503 is delivered.
+                if not allow_reset:
+                    raise
+            if not response and allow_reset:
+                return None
             first = bytes(response).split(b"\r\n", 1)[0]
         self.assertTrue(first.startswith(b"HTTP/1.1 "), first)
         return int(first.split()[1])
 
+    def _assert_busy_preheader_503(self):
+        """An empty request has no unread GET bytes to cause a Windows reset."""
+        with socket.create_connection(("127.0.0.1", self.port), timeout=2) as client:
+            client.settimeout(2)
+            try:
+                response = client.recv(512)
+            except (ConnectionAbortedError, ConnectionResetError) as error:
+                self.fail(f"A busy preheader probe reset without HTTP 503: {error}")
+        self.assertTrue(
+            response.startswith(b"HTTP/1.1 503 "),
+            f"A busy gateway must attempt a real 503, not silently close clients: {response!r}",
+        )
+
     def test_hung_post_bodies_are_bounded_and_reclaimed(self):
-        a, b = self._slow(), self._slow()
-        deadline = time.monotonic() + 1.0
-        while time.monotonic() < deadline:
-            if self._status() == 503:
-                break
-            time.sleep(0.015)
-        else:
-            self.fail("Two slow POST bodies failed to exhaust a two-worker cap")
-        self.assertEqual(503, self._status())
+        # Leave ample scheduling margin for Windows while still enforcing a
+        # finite body/idle deadline and bounded worker admission.
+        self.server.socket_idle_timeout_seconds = 1.0
+        self.server.body_deadline_seconds = 1.0
+        entered = 0
+        entered_lock = threading.Lock()
+        original_worker = self.server.process_request_thread
+
+        def track_worker(request, address):
+            nonlocal entered
+            with entered_lock:
+                entered += 1
+            return original_worker(request, address)
+
+        self.server.process_request_thread = track_worker
+        try:
+            a, b = self._slow(), self._slow()
+            deadline = time.monotonic() + 0.4
+            while time.monotonic() < deadline:
+                with entered_lock:
+                    if entered == 2:
+                        break
+                time.sleep(0.005)
+            with entered_lock:
+                self.assertEqual(2, entered, "Both held POST bodies must occupy workers")
+            self._assert_busy_preheader_503()
+            # Overloaded normal GET may deliver 503 or reset on Windows;
+            # neither may dispatch a third worker or return successful HTTP.
+            self.assertIn(self._status(allow_reset=True), (503, None))
+            with entered_lock:
+                self.assertEqual(2, entered, "Rejected GETs must not allocate workers")
+        finally:
+            self.server.process_request_thread = original_worker
         # The incomplete bodies have a hard deadline; after expiry, workers
         # should be reclaimed and an independent request admitted again.
-        time.sleep(0.6)
+        time.sleep(1.15)
         self.assertEqual(200, self._status())
         for client in (a, b):
             try:
                 data = client.recv(512)
-            except (ConnectionResetError, BrokenPipeError):
+            except (ConnectionAbortedError, ConnectionResetError, BrokenPipeError):
                 data = b""
             self.assertTrue(data == b"" or b"408 Request Timeout" in data, data)
+
+    def test_busy_preheader_probe_rejects_silent_close_only_implementation(self):
+        self.assertTrue(self.server._worker_slots.acquire(blocking=False))
+        self.assertTrue(self.server._worker_slots.acquire(blocking=False))
+        try:
+            with patch.object(self.server, "verify_request", return_value=False):
+                with self.assertRaises(AssertionError):
+                    self._assert_busy_preheader_503()
+        finally:
+            self.server._worker_slots.release()
+            self.server._worker_slots.release()
 
     def test_slow_trickle_cannot_extend_body_deadline(self):
         client = self._slow()
