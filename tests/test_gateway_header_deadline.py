@@ -10,6 +10,7 @@ import threading
 import time
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
@@ -226,6 +227,71 @@ class GatewayHeaderDeadlineTests(unittest.TestCase):
             b"Connection: close\r\n\r\n"
         )
         self.assertEqual(b"HTTP/1.1 200 OK", client.recv(512).split(b"\r\n", 1)[0])
+
+    def test_cancelled_prior_header_timer_cannot_expire_next_keepalive_request(self):
+        """Model Timer.cancel's in-flight callback race with one real handler."""
+        armed = []
+
+        class PausedTimer:
+            def __init__(self, interval, function, args=None, kwargs=None):
+                self.function = function
+                self.args = args or ()
+                self.kwargs = kwargs or {}
+                self.cancelled = False
+
+            def start(self):
+                armed.append(self)
+
+            def cancel(self):
+                self.cancelled = True
+
+            def deliver_after_cancel(self):
+                # Once Timer.run has passed its cancellation check, cancel()
+                # cannot retract an already-entering callback.
+                self.function(*self.args, **self.kwargs)
+
+        def read_response(client):
+            data = bytearray()
+            while b"\r\n\r\n" not in data:
+                block = client.recv(2048)
+                if not block:
+                    return b""
+                data.extend(block)
+            head, _, body = bytes(data).partition(b"\r\n\r\n")
+            length = int(next(
+                line.split(b":", 1)[1].strip()
+                for line in head.split(b"\r\n")
+                if line.lower().startswith(b"content-length:")
+            ))
+            while len(body) < length:
+                block = client.recv(2048)
+                if not block:
+                    return b""
+                body += block
+            return head.split(b"\r\n", 1)[0]
+
+        with patch("realm.gateway.threading.Timer", PausedTimer):
+            client = self._connect()
+            client.sendall(
+                b"GET /api/v1/health HTTP/1.1\r\nHost: 127.0.0.1\r\n"
+                b"Connection: keep-alive\r\n\r\n"
+            )
+            self.assertEqual(b"HTTP/1.1 200 OK", read_response(client))
+            self.assertEqual(1, len(armed))
+            self.assertTrue(armed[0].cancelled)
+
+            # A deliberately incomplete second request leaves its parser live.
+            client.sendall(b"GET /api/v1/health HTTP/1.1\r\nHost: 127.0.0.1\r\nX-Wait: ")
+            deadline = time.monotonic() + 0.5
+            while len(armed) < 2 and time.monotonic() < deadline:
+                time.sleep(0.005)
+            self.assertEqual(2, len(armed), "Second header guard was not armed")
+            armed[0].deliver_after_cancel()
+            client.sendall(b"done\r\nConnection: close\r\n\r\n")
+            self.assertEqual(
+                b"HTTP/1.1 200 OK", read_response(client),
+                "A cancelled older guard must not terminate newer keep-alive headers",
+            )
 
     def test_header_deadline_validation_is_bounded(self):
         for invalid in (0, -1.0, True, float("nan"), float("inf"), 121):

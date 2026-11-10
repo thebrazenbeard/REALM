@@ -677,7 +677,7 @@ class GatewayHandler(BaseHTTPRequestHandler):
     server: GatewayServer
     protocol_version = "HTTP/1.1"
 
-    def _expire_incomplete_headers(self) -> None:
+    def _expire_incomplete_headers(self, guard_token: object) -> None:
         """Interrupt a slow-trickled request before it consumes a worker forever.
 
         BaseHTTPRequestHandler's buffered readline() uses an inactivity socket
@@ -686,8 +686,11 @@ class GatewayHandler(BaseHTTPRequestHandler):
         is needed while stdlib owns that parser. The worker semaphore already
         bounds the number of simultaneous watchdog threads.
         """
+        # Timer.cancel() does not wait for an already-running callback. A
+        # previous keep-alive request must not expire the next request's
+        # freshly armed guard on this same handler instance.
         with self._header_guard_lock:
-            if not self._header_guard_pending:
+            if guard_token is not self._header_guard_token or not self._header_guard_pending:
                 return
             self._header_guard_pending = False
             self._header_guard_timed_out = True
@@ -715,11 +718,16 @@ class GatewayHandler(BaseHTTPRequestHandler):
             self.close_connection = True
             return
 
-        self._header_guard_lock = threading.Lock()
-        self._header_guard_pending = True
-        self._header_guard_timed_out = False
+        if not hasattr(self, "_header_guard_lock"):
+            self._header_guard_lock = threading.Lock()
+        with self._header_guard_lock:
+            self._header_guard_pending = True
+            self._header_guard_timed_out = False
+            self._header_guard_token = object()
+            guard_token = self._header_guard_token
         self._header_guard_timer = threading.Timer(
             self.server.header_deadline_seconds, self._expire_incomplete_headers,
+            args=(guard_token,),
         )
         self._header_guard_timer.daemon = True
         self._header_guard_timer.start()
