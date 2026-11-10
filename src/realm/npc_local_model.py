@@ -10,12 +10,15 @@ from __future__ import annotations
 import http.client
 import json
 import math
+import sqlite3
 import time
 from contextlib import closing
 from dataclasses import dataclass
+from typing import Callable
 from urllib.parse import urlsplit
 
 from .residents import ResidentController, ResidentProposal
+from .resident_receipts import HOST_ACTION_ID_RE
 
 
 _MAX_VIEW_CHARS = 6000
@@ -25,6 +28,15 @@ _SYSTEM_CONTRACT = (
     'Do not include markdown, actor, world, action receipt, or unsupported '
     'claims of completed gameplay. The host decides all authority and effects.'
 )
+
+
+def _validate_host_view(host_view: str) -> None:
+    if (
+        not isinstance(host_view, str)
+        or not 1 <= len(host_view) <= _MAX_VIEW_CHARS
+        or not all(char.isprintable() or char in "\n\r\t" for char in host_view)
+    ):
+        raise ValueError("Host view must be 1–6000 printable characters")
 
 
 def _unique_json_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
@@ -89,12 +101,7 @@ class LocalChatProposer:
         self.config = config
 
     def propose(self, host_view: str) -> dict[str, str]:
-        if (
-            not isinstance(host_view, str)
-            or not 1 <= len(host_view) <= _MAX_VIEW_CHARS
-            or not all(char.isprintable() or char in "\n\r\t" for char in host_view)
-        ):
-            raise ValueError("Host view must be 1–6000 printable characters")
+        _validate_host_view(host_view)
         endpoint = urlsplit(self.config.endpoint)
         request_bytes = json.dumps({
             "model": self.config.model,
@@ -154,10 +161,19 @@ class LocalChatProposer:
             raise ValueError("Local model did not emit strict JSON command") from exc
         return {"command": parsed.command}
 
-    def commit(self, controller: ResidentController, host_view: str, *, action_id: str) -> str:
-        """PROPOSE then host VALIDATE and Engine COMMIT; not autonomous."""
+    def commit(
+        self, controller: ResidentController, host_view: str, *, action_id: str,
+        writer_guard: Callable[[sqlite3.Connection], None] | None = None,
+    ) -> str:
+        """Replay committed host actions without a second model inference."""
         if not isinstance(controller, ResidentController):
             raise TypeError("Host must supply a resident controller")
-        if not isinstance(action_id, str) or not 1 <= len(action_id) <= 128:
-            raise ValueError("Host action ID must be nonempty text up to 128 characters")
-        return controller.commit(self.propose(host_view), action_id=action_id)
+        if not isinstance(action_id, str) or HOST_ACTION_ID_RE.fullmatch(action_id) is None:
+            raise ValueError("Host action ID must contain 1–128 safe ASCII characters")
+        _validate_host_view(host_view)
+        prior = controller._replay_if_committed(action_id, writer_guard)
+        if prior is not None:
+            return prior
+        return controller.commit(
+            self.propose(host_view), action_id=action_id, writer_guard=writer_guard,
+        )

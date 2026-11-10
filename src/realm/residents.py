@@ -13,7 +13,9 @@ from dataclasses import dataclass
 from typing import Callable, Mapping
 
 from .engine import Engine
-from .resident_receipts import HOST_ACTION_ID_RE, commit_resident_command
+from .resident_receipts import (
+    HOST_ACTION_ID_RE, commit_resident_command, replay_resident_if_committed,
+)
 
 
 _ENGINE_VERBS = frozenset({
@@ -94,4 +96,17 @@ class ResidentController:
         accepted = self.validate(proposal)
         return commit_resident_command(
             self._engine, self._resident, accepted.command, action_id, writer_guard,
+        )
+
+    def _replay_if_committed(
+        self, action_id: str,
+        writer_guard: Callable[[sqlite3.Connection], None] | None = None,
+    ) -> str | None:
+        """Private safe retry probe for a trusted model bridge, not new authority."""
+        if not isinstance(action_id, str) or HOST_ACTION_ID_RE.fullmatch(action_id) is None:
+            raise ValueError("Host action ID must contain 1–128 safe ASCII characters")
+        if writer_guard is not None and not callable(writer_guard):
+            raise TypeError("Resident writer_guard must be callable")
+        return replay_resident_if_committed(
+            self._engine, self._resident, action_id, self.validate, writer_guard,
         )

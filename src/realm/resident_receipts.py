@@ -10,7 +10,7 @@ from __future__ import annotations
 import re
 import sqlite3
 from contextlib import closing
-from typing import Callable
+from typing import Callable, Mapping
 
 from .engine import Engine, _DIRECTIONS, _LONG_DIRECTIONS
 
@@ -22,6 +22,69 @@ _READ_VERBS = frozenset({
 # Same grammar as ResidentTurnHost's stable action IDs. No Unicode or spaces:
 # both host adapters must agree on which receipt identities are usable.
 HOST_ACTION_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}\Z", re.ASCII)
+
+
+def replay_resident_if_committed(
+    engine: Engine, resident: str, action_id: str,
+    validate: Callable[[Mapping[str, object]], object],
+    writer_guard: Callable[[sqlite3.Connection], None] | None,
+) -> str | None:
+    """Safely answer a prior host action without asking a model again.
+
+    Check actor membership, current policy, and the optional writer authority
+    in one BEGIN IMMEDIATE transaction. An absent receipt returns None only
+    after denying ambiguous legacy/player claims. A subsequent first commit
+    still makes its own definitive receipt check after model inference.
+    """
+    # This is a pre-inference/replay *probe*, never a write commit. A host
+    # writer_guard may contain DML even though its intended role is checking
+    # authorization. Always roll back its transaction, including on cache
+    # hits, misses, or exceptions, so a failed model request cannot leave
+    # unreceipted effects in the world ledger.
+    with closing(engine._connect()) as db:
+        db.execute("BEGIN IMMEDIATE")
+        try:
+            # BEGIN IMMEDIATE first ensures a stable admission snapshot. Turn
+            # this connection read-only *after* acquiring its writer lock so
+            # a mistaken guard UPDATE cannot influence a transient look or
+            # escape on an otherwise successful retry.
+            db.execute("PRAGMA query_only=ON")
+            if writer_guard is not None:
+                writer_guard(db)
+            player = db.execute(
+                "SELECT id,room_id FROM main.players WHERE id=? COLLATE NOCASE", (resident,)
+            ).fetchone()
+            if player is None:
+                raise ValueError("Join this REALM before issuing resident commands")
+            actor = player["id"]
+            prior = db.execute(
+                "SELECT command,response FROM main.action_receipts WHERE actor=? AND action_id=?",
+                ("@resident:" + actor, action_id),
+            ).fetchone()
+            if prior is None:
+                if db.execute(
+                    "SELECT 1 FROM main.action_receipts WHERE actor=? AND action_id=?",
+                    (actor, action_id),
+                ).fetchone() is not None:
+                    raise ValueError(
+                        "unverified legacy/player receipt blocks resident action; "
+                        "owner must review provenance and issue a governed new action ID"
+                    )
+                return None
+            # No model may change a committed receipt on retry. The *current*
+            # host policy must nevertheless authorize that exact stored command.
+            validate({"command": prior["command"]})
+            verb, _, arg = prior["command"].partition(" ")
+            verb, arg = verb.casefold(), arg.strip()
+            if verb in _DIRECTIONS:
+                arg, verb = _DIRECTIONS[verb], "go"
+            elif verb in _LONG_DIRECTIONS:
+                arg, verb = verb, "go"
+            if verb in _READ_VERBS:
+                return engine._perform(db, actor, player["room_id"], verb, arg)
+            return prior["response"]
+        finally:
+            db.rollback()
 
 
 def commit_resident_command(

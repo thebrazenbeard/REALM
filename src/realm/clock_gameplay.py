@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 import sqlite3
 from collections import Counter
+from dataclasses import dataclass
 from pathlib import Path
 
 from .crafting import Crafting, _MAX_BATCHES, _name
@@ -84,6 +85,84 @@ def _gather_evidence(db: sqlite3.Connection) -> dict[str, dict]:
         "other_world": _other_world_state(db),
         "allocators": _allocator_rows(db),
     }
+
+
+@dataclass(frozen=True)
+class _TypedEconomyProof:
+    """Transient, selected-callback result of the typed economy verifier.
+
+    A receipt alone is not proof that the callback changed the *right* stock,
+    material, beneficiary or output. Compare the full economic state at the
+    adapter's verified boundary with the enclosing WorldClock boundaries.
+    This is not a sandbox for privileged Python with the raw SQLite handle.
+    """
+
+    event_id: str
+    actor: str
+    command: str
+    before: tuple
+    after: tuple
+
+
+def _clock_economy_state(db: sqlite3.Connection) -> tuple | None:
+    """Immutable full-world economy snapshot, ignoring unrelated speech.
+
+    Synthetic worlds without all Crafting tables retain their old non-economy
+    clock use. Economic DML there cannot produce a typed proof and fails closed.
+    Economic event history includes gather, craft and build; ordinary say/audit
+    rows are deliberately outside this strict in-handler typed proof boundary.
+    """
+    tables = (
+        ("gathering_nodes", "room_id,material"),
+        ("material_pouches", "actor,material"),
+        ("crafted_goods", "actor,good"),
+        ("built_structures", "id"),
+        ("craft_recipes", "id"),
+    )
+    present = {
+        row[0] for row in db.execute(
+            "SELECT name FROM main.sqlite_master WHERE type='table' "
+            "AND name IN ('gathering_nodes','material_pouches','crafted_goods',"
+            "'built_structures','craft_recipes','events')"
+        )
+    }
+    if present != {name for name, _ in tables} | {"events"}:
+        return None
+    state = tuple(
+        (name, tuple(tuple(row) for row in db.execute(
+            f"SELECT * FROM main.{name} ORDER BY {sort_keys}"
+        )))
+        for name, sort_keys in tables
+    )
+    events = tuple(tuple(row) for row in db.execute(
+        "SELECT * FROM main.events WHERE kind IN ('gather','craft','build') ORDER BY id"
+    ))
+    return state + (("economic_events", events),)
+
+
+def _clock_economy_projection(verified: dict) -> tuple:
+    """Project existing verifier evidence onto the clock's immutable domain.
+
+    Gather/craft/build already read these exact rows before and after their
+    typed grant. Reuse those snapshots; a fresh SQL scan here would repeat
+    every economy and historic economic-event read twice per selected action.
+    """
+    tables = (
+        ("gathering_nodes", "nodes"),
+        ("material_pouches", "pouches"),
+        ("crafted_goods", "goods"),
+        ("built_structures", "structures"),
+        ("craft_recipes", "recipes"),
+    )
+    state = tuple(
+        (name, tuple(sorted(verified[alias].values())))
+        for name, alias in tables
+    )
+    economic_events = tuple(sorted(
+        row for row in verified["events"].values()
+        if row[4] in ("gather", "craft", "build")
+    ))
+    return state + (("economic_events", economic_events),)
 
 
 def _say_evidence(db: sqlite3.Connection) -> dict[str, object]:
@@ -358,6 +437,7 @@ def _verify_make_effect(db: sqlite3.Connection, before: dict, domain: dict,
             raise ValueError("Craft/build changed ungranted ID allocation")
     if domain["receipts"] != before["receipts"] or after["receipts"] != expected["receipts"]:
         raise ValueError("Craft/build receipt effects diverged")
+    return after
 
 
 def _verify_gather_effect(db: sqlite3.Connection, before: dict[str, dict],
@@ -454,6 +534,7 @@ def _verify_gather_effect(db: sqlite3.Connection, before: dict[str, dict],
     for name in ("nodes", "pouches", "goods", "structures", "recipes", "receipts"):
         if after[name] != expected[name]:
             raise ValueError("Gather economic/receipt effect diverged")
+    return after
 
 
 def _verify_say_effect(db: sqlite3.Connection, before: dict[str, dict],
@@ -588,6 +669,15 @@ def perform_in_transaction(
     if verb in _CRAFT_ACTIONS and crafting is None:
         raise ValueError("Crafting is not registered for this world")
 
+    sink = getattr(db, "_realm_clock_typed_economy_proofs", None)
+    proof_active = (receipt_origin == "clock" and verb in _CRAFT_ACTIONS
+                    and sink is not None)
+    if proof_active and getattr(db, "_realm_clock_selected_event", None) != action_id:
+        raise ValueError("Typed economy proof event differs from selected UTC action")
+    proof_before = None
+    proof_after = None
+    proof_actor = None
+
     # Even a trigger with RAISE(FAIL) can leave earlier side effects of its
     # failed statement. Protect this entire action when the trusted host catches
     # a callback error and commits a different event in the same outer tick.
@@ -639,6 +729,10 @@ def perform_in_transaction(
             gather_before = _gather_evidence(db) if verb == "gather" else None
             make_before = (_gather_evidence(db)
                            if verb in ("craft", "build") else None)
+            if proof_active:
+                proof_before = _clock_economy_projection(
+                    gather_before if gather_before is not None else make_before)
+                proof_actor = actual_actor
             say_before = _say_evidence(db) if verb == "say" else None
             transfer_before = (_transfer_evidence(db)
                                if verb in ("go", "take", "drop") else None)
@@ -668,15 +762,16 @@ def perform_in_transaction(
                 "INSERT INTO main.action_receipts(actor,action_id,command,response) VALUES(?,?,?,?)",
                 (receipt_actor, action_id, command, response),
             )
+            verified_economy_after = None
             if gather_before is not None:
-                _verify_gather_effect(db, gather_before, gather_domain,
+                verified_economy_after = _verify_gather_effect(db, gather_before, gather_domain,
                                       actor=actual_actor,
                                       receipt_actor=receipt_actor,
                                       room=room, arg=arg, action_id=action_id,
                                       command=command, response=response,
                                       emissions=emissions)
             if make_before is not None:
-                _verify_make_effect(db, make_before, make_domain,
+                verified_economy_after = _verify_make_effect(db, make_before, make_domain,
                                     actor=actual_actor,
                                     receipt_actor=receipt_actor,
                                     room=room, verb=verb,
@@ -697,9 +792,14 @@ def perform_in_transaction(
                                         receipt_actor=receipt_actor,
                                         action_id=action_id, command=command,
                                         response=response, emissions=emissions)
+            if proof_before is not None:
+                proof_after = _clock_economy_projection(verified_economy_after)
     except BaseException:
         db.execute("ROLLBACK TO SAVEPOINT realm_clock_gameplay")
         db.execute("RELEASE SAVEPOINT realm_clock_gameplay")
         raise
     db.execute("RELEASE SAVEPOINT realm_clock_gameplay")
+    if proof_before is not None:
+        sink.append(_TypedEconomyProof(
+            action_id, proof_actor, command, proof_before, proof_after))
     return response

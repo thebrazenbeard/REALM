@@ -31,6 +31,20 @@ Duplicate JSON fields, actor/receipt injection, malformed commands, and
 model-authored authority claims are rejected. The host-side
 `ResidentController` and `Engine` validate and commit every proposed action.
 
+`LocalChatProposer.commit` checks the host-owned action receipt before model
+inference. A committed retry revalidates the current controller's command
+policy and optional transaction `writer_guard`; mutations return their
+original idempotent response, while read-only actions observe current world
+state. Neither path asks the model again. An ambiguous historical actor-keyed
+receipt (which could belong to a player) fails closed before inference. A
+new action racing with another writer remains protected by the definitive
+receipt check inside its commit transaction. Host-view validation still
+applies to every retry. The preliminary probe always rolls back its SQLite
+transaction and sets that connection `query_only` after acquiring its lock.
+A guard attempting DML in preflight fails closed instead of making a ghost
+observation from uncommitted state; only the later definitive command
+transaction can commit gameplay effects.
+
 The response body is consumed incrementally against a monotonic deadline
 starting at the outbound request. This closes the previous slow-trickle body
 gap where a model endpoint could keep sending a byte at a time without

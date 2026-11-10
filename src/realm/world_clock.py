@@ -21,6 +21,7 @@ from pathlib import Path
 from typing import Callable
 
 from .clock_gameplay import (_CLOCK_RECEIPT_ACTOR_PREFIX,
+                             _clock_economy_state,
                              _ROSTER_RECEIPT_ACTOR_PREFIX)
 from .ship_history_custody import ShipHistoryCustody
 
@@ -687,10 +688,23 @@ class WorldClock:
                 if event.kind in ("host_action", "npc_economic_gather",
                                   "trusted_game_action"):
                     receipt_before = action_receipts_for(event.event_id)
+                    economy_before_handler = _clock_economy_state(db)
+                    # Only the selected handler owns this connection-local
+                    # ephemeral proof sink. No schema state or callback return
+                    # convention is changed; an NPC wrapper may return None.
+                    db._realm_clock_selected_event = event.event_id
+                    db._realm_clock_typed_economy_proofs = []
                 handler_changes = db.total_changes
                 handler_schema = _schema_versions(db)
-                with _guard_clock_callback_transaction(db):
-                    outcome = handler(db, event)
+                try:
+                    with _guard_clock_callback_transaction(db):
+                        outcome = handler(db, event)
+                finally:
+                    if event.kind in ("host_action", "npc_economic_gather",
+                                      "trusted_game_action"):
+                        typed_economy_proofs = tuple(db._realm_clock_typed_economy_proofs)
+                        del db._realm_clock_typed_economy_proofs
+                        del db._realm_clock_selected_event
                 ship_custody.after_handler(db, event)
                 # The trusted callback owns its authorized state transition.
                 # Freeze the full main-world nonclock result at this boundary,
@@ -753,10 +767,17 @@ class WorldClock:
                     # semantics; typed per-action attestation remains pending.
                     new_nodes = node_state()
                     new_pouches = pouch_state()
+                    economy_after_handler = _clock_economy_state(db)
                     new_gathers = [
                         r for r in db.execute("SELECT * FROM main.events WHERE kind='gather'")
                         if r["id"] not in prior_event_ids
                     ]
+                    changed_economy = (
+                        economy_before_handler != economy_after_handler
+                        or new_nodes != expected_nodes
+                        or new_pouches != expected_pouches
+                        or bool(new_gathers)
+                    )
                     if (new_nodes != expected_nodes or new_pouches != expected_pouches
                             or new_gathers):
                         receipt_after = action_receipts_for(event.event_id)
@@ -814,6 +835,40 @@ class WorldClock:
                     expected_gathers.update(gather_events)
                 if gather_state() != expected_gathers:
                     raise ValueError("Roster gather history changed within ungranted UTC action")
+                # Preserve the existing roster-history alarm before validating
+                # the *new* typed legacy proof. A host action that deletes a
+                # previously signed gather must report the historical-custody
+                # violation, not obscure it as a missing typed callback proof.
+                if (event.kind in ("host_action", "npc_economic_gather",
+                                   "trusted_game_action") and changed_economy):
+                    if (economy_before_handler is None
+                            or economy_after_handler is None
+                            or len(typed_economy_proofs) != 1):
+                        raise ValueError("Legacy economic change lacks typed economy proof")
+                    proof = typed_economy_proofs[0]
+                    if (proof.event_id != event.event_id
+                            or proof.before != economy_before_handler
+                            or proof.after != economy_after_handler):
+                        raise ValueError("Legacy economic attestation differs from selected callback")
+                    if "actor" in event.payload:
+                        actor = event.payload["actor"]
+                        canonical = (db.execute(
+                            "SELECT id FROM main.players WHERE id=? COLLATE NOCASE",
+                            (actor,),
+                        ).fetchone() if type(actor) is str else None)
+                        if canonical is None or canonical["id"] != proof.actor:
+                            raise ValueError("Legacy economic attestation actor mismatches event")
+                    if ("command" in event.payload
+                            and (type(event.payload["command"]) is not str
+                                 or event.payload["command"].strip() != proof.command)):
+                        raise ValueError("Legacy economic attestation command mismatches event")
+                    receipt = db.execute(
+                        "SELECT command FROM main.action_receipts "
+                        "WHERE actor=? AND action_id=?",
+                        (_CLOCK_RECEIPT_ACTOR_PREFIX + proof.actor, event.event_id),
+                    ).fetchone()
+                    if receipt is None or receipt["command"] != proof.command:
+                        raise ValueError("Legacy economic attestation lacks bound host receipt")
                 receipt_changes = db.total_changes
                 receipt_schema = _schema_versions(db)
                 updated = db.execute(

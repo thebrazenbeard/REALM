@@ -7,7 +7,7 @@
   --line-soft: rgba(125, 165, 185, .16);
   --text: #e7e8de;
   --muted: #95a8ad;
-  --dim: #667f8b;
+  --dim: #8099a5;
   --aqua: #7bdfd0;
   --gold: #e4b877;
   --danger: #e69c94;
@@ -57,7 +57,7 @@ h1 em { color: var(--aqua); font-weight: 400; }
 .connection-form label { display: flex; flex-direction: column; gap: 7px; color: var(--muted); font-size: 11px; font-weight: 650; text-transform: uppercase; letter-spacing: .08em; }
 .connection-form .hint { color: var(--dim); font-weight: 400; letter-spacing: 0; text-transform: none; }
 input { min-width: 0; width: 100%; background: #0d1823; border: 1px solid #365062; color: var(--text); border-radius: 3px; height: 42px; padding: 0 12px; font-size: 13px; transition: border-color .15s, background .15s; }
-input::placeholder { color: #657e89; }
+input::placeholder { color: var(--dim); }
 input:focus { outline: none; border-color: var(--aqua); background: #10202c; }
 input:disabled { opacity: .62; cursor: not-allowed; }
 .connect-actions { display: flex; gap: 8px; }
@@ -100,7 +100,9 @@ button:disabled { cursor: not-allowed; opacity: .42; }
 .visibility-note { color: var(--dim); font-size: 11px; border-top: 1px solid var(--line-soft); padding-top: 15px; margin-top: auto; line-height: 1.7; }.visibility-note span { color: var(--gold); margin-right: 6px; }
 .footer { color: var(--dim); font-size: 11px; display: flex; justify-content: space-between; gap: 16px; flex-wrap: wrap; padding: 31px 0 38px; }.footer-separator { color: var(--gold); margin: 0 6px; }
 @media (max-width: 1190px) { .connection-form { grid-template-columns: 1.3fr 1fr 1fr; } .connect-actions { grid-column: 1/-1; }.console { grid-template-columns: minmax(170px, 1fr) minmax(300px, 2fr); }.location { grid-column: 1/-1; min-height: 220px; }.intro-sigil { margin-right: 8px; } }
-@media (max-width: 760px) { .shell { padding: 0 17px; }.masthead { min-height: 77px; }.brand-copy strong { font-size: 21px; }.brand-version { display: none; }.header-status { font-size: 0; }.connection-dot { width: 10px; height: 10px; }.intro { min-height: auto; padding: 39px 0; }.intro-sigil { display: none; }.intro h1 { font-size: clamp(37px, 9vw, 54px); }.connection-card { padding: 19px 17px; }.connection-form { grid-template-columns: 1fr; }.connect-actions { grid-column: auto; }.connect-actions .button { flex: 1; }.console { display: flex; flex-direction: column; gap: 11px; }.panel { padding: 20px 17px; }.sidebar { min-height: 0; }.sidebar .muted { margin-bottom: 12px; }.sidebar-foot { margin-top: 15px; }.timeline { min-height: 470px; }.feed { min-height: 240px; max-height: 370px; }.footer { padding: 28px 0; }.footer > span { width: 100%; } }
+/* Mobile gameplay comes before passive world metadata visually. The sidebar has
+   no focusable controls; assistive-tech reading order remains DOM order. */
+@media (max-width: 760px) { .shell { padding: 0 17px; }.masthead { min-height: 77px; }.brand-copy strong { font-size: 21px; }.brand-version { display: none; }.header-status { font-size: 0; }.connection-dot { width: 10px; height: 10px; }.intro { min-height: auto; padding: 39px 0; }.intro-sigil { display: none; }.intro h1 { font-size: clamp(37px, 9vw, 54px); }.connection-card { padding: 19px 17px; }.connection-form { grid-template-columns: 1fr; }.connect-actions { grid-column: auto; }.connect-actions .button { flex: 1; }.console { display: flex; flex-direction: column; gap: 11px; }.panel { padding: 20px 17px; }.sidebar { min-height: 0; }.sidebar .muted { margin-bottom: 12px; }.sidebar-foot { margin-top: 15px; }.timeline { order: -1; min-height: 470px; }.feed { min-height: 240px; max-height: 370px; }.footer { padding: 28px 0; }.footer > span { width: 100%; } }
 @media (prefers-reduced-motion: reduce) { *, *::before, *::after { scroll-behavior: auto !important; transition: none !important; } }
 
 /* Host-authorized map overlay. Each tile is inert text, never parsed HTML. */
