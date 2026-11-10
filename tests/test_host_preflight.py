@@ -85,6 +85,47 @@ class LocalHostPreflightTests(unittest.TestCase):
         self.assertIn("db_wal_unverified", {finding.code for finding in report.findings})
         self.assertNotIn("world_unbound", {finding.code for finding in report.findings})
 
+    def test_rollback_journal_sidecar_requires_review_without_mutation(self):
+        """An immutable read cannot certify a DB needing rollback recovery."""
+        Engine(self.db)
+        journal = Path(str(self.db) + "-journal")
+        journal.write_bytes(b"synthetic unresolved rollback journal")
+        before = [(path.name, path.read_bytes(), path.stat().st_mtime_ns)
+                  for path in sorted(self.root.iterdir())]
+
+        report = preflight_local_host(self.db)
+
+        self.assertFalse(report.ready)
+        self.assertIn("db_journal_unverified", {finding.code for finding in report.findings})
+        self.assertNotIn("world_unbound", {finding.code for finding in report.findings})
+        self.assertEqual(before, [(path.name, path.read_bytes(), path.stat().st_mtime_ns)
+                                  for path in sorted(self.root.iterdir())])
+
+    def test_missing_database_with_rollback_journal_is_not_fresh_world(self):
+        journal = Path(str(self.db) + "-journal")
+        journal.write_bytes(b"stray recovery evidence")
+        report = preflight_local_host(self.db)
+        self.assertFalse(report.ready)
+        self.assertIn("db_journal_unverified", {f.code for f in report.findings})
+        self.assertEqual(b"stray recovery evidence", journal.read_bytes())
+        self.assertFalse(self.db.exists())
+
+    def test_symlink_alias_journal_is_not_hidden_by_resolved_target(self):
+        Engine(self.db)
+        alias = self.root / "alias.sqlite3"
+        try:
+            alias.symlink_to(self.db)
+        except OSError:
+            self.skipTest("Symbolic-link creation not available on this platform")
+        journal = Path(str(alias) + "-journal")
+        journal.write_bytes(b"unreviewed alias journal")
+
+        report = preflight_local_host(alias)
+
+        self.assertFalse(report.ready)
+        self.assertIn("db_journal_unverified", {f.code for f in report.findings})
+        self.assertEqual(b"unreviewed alias journal", journal.read_bytes())
+
     def test_missing_parent_is_fatal_without_creation(self):
         target = self.root / "missing" / "world.sqlite3"
         report = preflight_local_host(target)

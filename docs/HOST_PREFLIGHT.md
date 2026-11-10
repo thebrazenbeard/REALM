@@ -22,15 +22,17 @@ Local listeners must use exactly `127.0.0.1`. `--json` returns `ready`, `mode`
 and path-redacted findings; exit code `0` means no fatal **static** finding,
 and exit code `2` means at least one fatal finding.
 
-A missing database is a warning: a separately authorized first startup may
-create it. Missing directories, corrupt SQLite, altered core schema, a broken
-symlink, or mismatched world identity are fatal observations. An existing
+A missing database **without recovery sidecars** is a warning: a separately
+authorized first startup may create it. Missing directories, corrupt SQLite,
+altered core schema, a broken symlink, or mismatched world identity are fatal
+observations. An existing
 unbound world is a warning; this check never binds or rebinds it.
 
-> Existing SQLite `-wal` or `-shm` sidecars make the check **unverified** and
-> therefore fatal. Immutable read-only inspection may miss uncheckpointed
-> records. Stop the owning process through its normal shutdown protocol;
-> never delete sidecars or coerce a passing report.
+> Existing SQLite `-wal`, `-shm` or rollback `-journal` sidecars make the
+> check **unverified** and therefore fatal. Immutable read-only inspection
+> may miss uncheckpointed records or pending rollback recovery. Stop the
+> owning process through its normal shutdown protocol; never delete
+> sidecars or coerce a passing report.
 
 Permissions checked with `os.access()` are advisory, especially on Windows
 ACLs. This check does not bind a probe port (which would change host state),

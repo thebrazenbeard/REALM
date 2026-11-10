@@ -23,6 +23,7 @@ from .engine import Engine
 
 _KEY = re.compile(r"^[a-z][a-z0-9 _-]{0,47}$")
 _COMMANDS = frozenset({"gather", "craft", "build", "resources", "recipes", "structures"})
+_READ_COMMANDS = frozenset({"resources", "recipes", "structures"})
 _MAX_BATCHES = 10
 
 
@@ -166,6 +167,11 @@ class Crafting:
         verb, arg = verb.lower(), arg.strip()
         if verb not in _COMMANDS:
             return None
+        # Query results depend on current possessions, authored recipes, room,
+        # and resource stock. Replaying a cached text response would bypass
+        # today's visibility/state checks even though the ID must remain bound
+        # to its original command for cross-module conflict detection.
+        read_only = verb in _READ_COMMANDS or (verb == "gather" and not arg)
         if action_id is not None and (not isinstance(action_id, str) or not 1 <= len(action_id) <= 128):
             raise ValueError("Action IDs must be nonempty strings up to 128 characters")
 
@@ -177,15 +183,17 @@ class Crafting:
             if player is None:
                 raise ValueError("Join this REALM before gathering or crafting")
             actor, room = player["id"], player["room_id"]
+            receipt = None
             if action_id is not None:
                 receipt = db.execute(
                     "SELECT command,response FROM action_receipts WHERE actor=? AND action_id=?",
                     (actor, action_id),
                 ).fetchone()
-                if receipt:
+                if receipt is not None:
                     if receipt["command"] != command:
                         raise ValueError("Action ID already used for a different command")
-                    return receipt["response"]
+                    if not read_only:
+                        return receipt["response"]
 
             if verb == "resources":
                 found = db.execute(
@@ -214,10 +222,10 @@ class Crafting:
             else:
                 response = self._make(db, actor, room, verb, arg)
 
-            if action_id is not None:
+            if action_id is not None and receipt is None:
                 db.execute(
                     "INSERT INTO action_receipts (actor,action_id,command,response) VALUES (?,?,?,?)",
-                    (actor, action_id, command, response),
+                    (actor, action_id, command, "" if read_only else response),
                 )
             return response
 

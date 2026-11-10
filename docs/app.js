@@ -38,6 +38,7 @@
   const POLL_DELAY_MS = 2200;
   const MAX_RATE_RETRY_MS = 30000;
   const MAX_FEED_ITEMS = 160;
+  const MAX_COMMAND_HISTORY = 50;
   let requestSerial = 0;
   let current = null; // In-memory only: no session, endpoint, or token storage.
   let connecting = null; // Prevent overlapping joins while current is still null.
@@ -58,7 +59,7 @@
     ui.disconnect.disabled = !connected;
     ui.commandInput.disabled = !connected;
     ui.send.disabled = !connected;
-    ui.commandHint.textContent = connected ? "Commands run on your REALM host" : "Connect to issue commands";
+    ui.commandHint.textContent = connected ? "Host commands · ↑/↓ recall up to 50 recent entries" : "Connect to issue commands";
     quickActions.forEach((button) => { button.disabled = !connected; });
     [ui.hostUrl, ui.playerName, ui.accessToken].forEach((input) => { input.disabled = connected; });
   }
@@ -173,6 +174,10 @@
       // this session, and release its credential before a future reconnect.
       current.abortController.abort();
       current.token = "";
+      // Command recall is session-local and never survives a disconnect.
+      current.commandHistory.length = 0;
+      current.historyIndex = null;
+      current.commandDraft = "";
       current = null;
     }
     // Drop the only DOM copy of the access token on disconnect.
@@ -323,7 +328,8 @@
     const session = { base, token, player, abortController: new AbortController(), cursor: 0, polling: false, failures: 0,
       throttled: false, overloaded: false, overloadFailures: 0, pollPauseUntil: 0, roomRevision: 0,
       commandPending: false, pendingCommandRetry: null,
-      mapUnsupported: false, mapPolling: false, mapRefreshPending: false, mapUpdated: 0, timer: null };
+      mapUnsupported: false, mapPolling: false, mapRefreshPending: false, mapUpdated: 0, timer: null,
+      commandHistory: [], historyIndex: null, commandDraft: "" };
     connecting = session;
     // The cancellable in-memory session now owns the sole token copy.
     ui.accessToken.value = "";
@@ -374,13 +380,18 @@
   async function sendCommand(event) {
     event.preventDefault();
     const session = current;
-    if (!session) return;
-    if (session.commandPending) return;
+    if (!session || session.commandPending) return;
     const command = ui.commandInput.value.trim();
     if (!command) return;
+    // Disabling the DOM controls does not prevent synthetic/reentrant submit
+    // events; guard at handler entry before creating another action ID.
+    session.commandPending = true;
+    session.commandHistory.push(command);
+    if (session.commandHistory.length > MAX_COMMAND_HISTORY) session.commandHistory.shift();
+    session.historyIndex = null;
+    session.commandDraft = "";
     ui.send.disabled = true;
     ui.commandInput.disabled = true;
-    session.commandPending = true;
     const prior = session.pendingCommandRetry;
     const actionId = prior && prior.command === command ? prior.actionId
       : (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function"
@@ -430,8 +441,38 @@
     }
   }
 
+  function recallCommand(event) {
+    if (event.key !== "ArrowUp" && event.key !== "ArrowDown") return;
+    const session = current;
+    if (!session || session.commandHistory.length === 0) return;
+    if (event.key === "ArrowUp") {
+      if (session.historyIndex === null) {
+        session.commandDraft = ui.commandInput.value;
+        session.historyIndex = session.commandHistory.length - 1;
+      } else if (session.historyIndex > 0) {
+        session.historyIndex--;
+      }
+    } else {
+      if (session.historyIndex === null) return;
+      if (session.historyIndex < session.commandHistory.length - 1) {
+        session.historyIndex++;
+      } else {
+        session.historyIndex = null;
+        ui.commandInput.value = session.commandDraft;
+        event.preventDefault();
+        return;
+      }
+    }
+    ui.commandInput.value = session.commandHistory[session.historyIndex];
+    event.preventDefault();
+  }
+
   ui.connectionForm.addEventListener("submit", connect);
   ui.commandForm.addEventListener("submit", sendCommand);
+  ui.commandInput.addEventListener("keydown", recallCommand);
+  ui.commandInput.addEventListener("input", () => {
+    if (current) current.historyIndex = null;
+  });
   ui.disconnect.addEventListener("click", () => stopSession({ note: "Disconnected locally. The world remains on your host." }));
   quickActions.forEach((button) => button.addEventListener("click", () => {
     if (!current) return;

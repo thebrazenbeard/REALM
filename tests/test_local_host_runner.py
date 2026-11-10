@@ -21,7 +21,7 @@ from realm.engine import Engine
 from realm.gateway import Gateway, GatewayServer
 from realm.telnet import LocalTelnetServer
 from realm.world_clock import WorldClock
-from realm.local_host_runner import run_local_host
+from realm.local_host_runner import _AcceptedSessions, run_local_host
 
 
 UTC = datetime(2026, 11, 9, 12, 0, tzinfo=timezone.utc)
@@ -64,6 +64,57 @@ class LocalHostRunnerTests(unittest.TestCase):
         )
         with request.urlopen(req, timeout=3) as response:
             return response.status, json.load(response)
+
+    def test_shutdown_socket_abort_reporting_is_narrowly_scoped(self):
+        """Intentional Windows socket revocation never masks other errors."""
+        http, _ = self.servers()
+        reported = []
+        http.handle_error = lambda request, address: reported.append(sys.exc_info()[1])
+        custody = _AcceptedSessions(http)
+
+        def deliver(error, tracked_request):
+            try:
+                raise error
+            except Exception:
+                http.handle_error(tracked_request, ("127.0.0.1", 1))
+
+        def winerror(code):
+            error = OSError(code, "synthetic Windows socket abort")
+            error.winerror = code
+            return error
+
+        chosen, peer = socket.socketpair()
+        unrelated = socket.socket()
+        self.addCleanup(unrelated.close)
+        self.addCleanup(peer.close)
+        self.addCleanup(chosen.close)
+        with custody._condition:
+            custody._active.add(chosen)
+        for code in (10038, 10053):
+            deliver(winerror(code), chosen)
+        self.assertEqual([10038, 10053], [e.winerror for e in reported])
+
+        stopper = threading.Thread(target=custody.quiesce)
+        stopper.start()
+        try:
+            self.assertTrue(custody._quiescing.wait(2), "Shutdown never began")
+            for code in (10038, 10053):
+                deliver(winerror(code), chosen)
+            self.assertEqual(2, len(reported), "Only selected shutdown sockets become quiet")
+
+            deliver(winerror(10053), unrelated)
+            self.assertEqual(3, len(reported), "Unrelated socket abort must still be reported")
+            deliver(winerror(10054), chosen)
+            deliver(RuntimeError("unexpected worker failure"), chosen)
+            self.assertEqual(5, len(reported), "Unexpected socket and code errors remain visible")
+        finally:
+            with custody._condition:
+                custody._active.discard(chosen)
+                custody._condition.notify_all()
+            stopper.join(timeout=2)
+        self.assertFalse(stopper.is_alive(), "Quiesce did not finish")
+        deliver(winerror(10053), chosen)
+        self.assertEqual(6, len(reported), "Suppression must end with quiescence")
 
     def test_two_live_clients_receive_one_trusted_utc_event_and_stop_closes_ports(self):
         http, telnet = self.servers()

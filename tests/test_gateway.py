@@ -116,6 +116,63 @@ class GatewayTests(unittest.TestCase):
         status, payload = self.send("/api/v1/map?player=NotJoined")
         self.assertEqual(403, status)
 
+    def test_scene_is_auth_scoped_and_only_reports_persisted_room_facts(self):
+        status, payload = self.send("/api/v1/scene?player=Patrick", token=False)
+        self.assertEqual(401, status)
+        self.assertFalse(payload["ok"])
+        self.send("/api/v1/join", {"player": "Patrick"})
+        self.send("/api/v1/join", {"player": "Vera"})
+        status, payload = self.send("/api/v1/scene?player=Vera", token_player="Patrick")
+        self.assertEqual(403, status)
+        status, scene = self.send("/api/v1/scene?player=Patrick")
+        self.assertEqual(200, status)
+        self.assertEqual("atrium", scene["room"]["id"])
+        self.assertEqual("The Atrium", scene["room"]["name"])
+        self.assertEqual(["north"], scene["exits"])
+        self.assertEqual([{"id": "token", "name": "Brass token"}], scene["items"])
+        # Positions are durable saved locations, not online-presence telemetry.
+        self.assertEqual([{"name": "Vera"}], scene["occupants"])
+        self.assertEqual("saved_position_only", scene["presence_semantics"])
+        # A textual appearance or a model proposal cannot turn into a
+        # fabricated interaction/action or a first-class NPC.
+        self.assertNotIn("npcs", scene)
+        self.assertNotIn("actions", scene)
+        self.send("/api/v1/command", {"player": "Vera", "command": "north"})
+        _, moved = self.send("/api/v1/scene?player=Vera")
+        self.assertEqual("corridor", moved["room"]["id"])
+        self.assertEqual(["east", "south"], moved["exits"])
+        self.assertEqual([], moved["occupants"])
+        _, unchanged = self.send("/api/v1/scene?player=Patrick")
+        self.assertEqual([], unchanged["occupants"])
+
+    def test_scene_rejects_unjoined_identity_and_bounds_large_room(self):
+        status, payload = self.send("/api/v1/scene?player=Patrick")
+        self.assertEqual(400, status)
+        self.assertIn("Join", payload["error"])
+        self.send("/api/v1/join", {"player": "Patrick"})
+        with closing(sqlite3.connect(self.db)) as db, db:
+            db.executemany(
+                "INSERT INTO items (id,name,description,room_id) VALUES (?,?,?,?)",
+                [(f"extra-{idx}", f"Extra item {idx}", "Visible fixture", "atrium")
+                 for idx in range(60)],
+            )
+        status, scene = self.send("/api/v1/scene?player=Patrick")
+        self.assertEqual(200, status)
+        self.assertEqual(50, len(scene["items"]))
+        self.assertTrue(scene["truncated"]["items"])
+        self.assertFalse(scene["truncated"]["occupants"])
+
+    def test_scene_does_not_infer_npc_type_or_talk_action_from_engine_actor(self):
+        self.send("/api/v1/join", {"player": "Patrick"})
+        # ResidentController hosts can pre-join actors through Engine.join;
+        # the underlying table does not encode human-versus-NPC status.
+        self.gateway.engine.join("ResidentFixture")
+        status, scene = self.send("/api/v1/scene?player=Patrick")
+        self.assertEqual(200, status)
+        self.assertEqual([{"name": "ResidentFixture"}], scene["occupants"])
+        self.assertNotIn("npcs", scene)
+        self.assertNotIn("actions", scene)
+
     def test_map_endpoint_reads_actual_player_room_and_moves(self):
         self._install_generic_map()
         self.send("/api/v1/join", {"player": "Patrick"})
@@ -190,6 +247,45 @@ class GatewayTests(unittest.TestCase):
         self.assertEqual(400, status)
         status, _ = self.send("/api/v1/join", {"player": "../admin"})
         self.assertEqual(403, status)
+
+    def test_feed_does_not_reveal_speech_before_first_room_entry(self):
+        self.send("/api/v1/join", {"player": "Vera"})
+        self.send("/api/v1/command", {"player": "Vera", "command": "say Before Patrick arrived"})
+        self.send("/api/v1/join", {"player": "Patrick"})
+        status, feed = self.send("/api/v1/feed?player=Patrick&after=0")
+        self.assertEqual(200, status)
+        self.assertFalse(any("Before Patrick arrived" in event["text"] for event in feed["events"]))
+        self.assertTrue(any(event["actor"] == "Patrick" and event["kind"] == "join" for event in feed["events"]))
+
+    def test_feed_reentry_blocks_older_room_speech_even_with_zero_cursor(self):
+        self.send("/api/v1/join", {"player": "Patrick"})
+        self.send("/api/v1/join", {"player": "Vera"})
+        self.send("/api/v1/command", {"player": "Patrick", "command": "north"})
+        self.send("/api/v1/command", {"player": "Vera", "command": "say Private while Patrick was away"})
+        self.send("/api/v1/command", {"player": "Patrick", "command": "south"})
+        status, feed = self.send("/api/v1/feed?player=Patrick&after=0")
+        self.assertEqual(200, status)
+        self.assertFalse(any("Private while Patrick was away" in event["text"] for event in feed["events"]))
+        self.assertTrue(any(event["actor"] == "Patrick" and event["kind"] == "move" for event in feed["events"]))
+        self.send("/api/v1/command", {"player": "Vera", "command": "say Welcome back Patrick"})
+        _, fresh = self.send("/api/v1/feed?player=Patrick&after=0")
+        self.assertTrue(any("Welcome back Patrick" in event["text"] for event in fresh["events"]))
+        self.assertFalse(any("Private while Patrick was away" in event["text"] for event in fresh["events"]))
+        _, later = self.send(f"/api/v1/feed?player=Patrick&after={fresh['cursor']}")
+        self.assertEqual([], later["events"], "pagination must remain incremental after the floor")
+
+    def test_feed_fails_closed_for_legacy_position_without_arrival_event(self):
+        self.send("/api/v1/join", {"player": "Vera"})
+        self.send("/api/v1/command", {"player": "Vera", "command": "say Legacy occupant has no arrival"})
+        with closing(sqlite3.connect(self.db)) as db, db:
+            db.execute(
+                "INSERT INTO players (id,room_id,created_at) VALUES (?,?,?)",
+                ("Patrick", "atrium", "2026-11-10T00:00:00+00:00"),
+            )
+        status, feed = self.send("/api/v1/feed?player=Patrick&after=0")
+        self.assertEqual(200, status)
+        self.assertEqual([], feed["events"], "unproven room entry must not expose history")
+        self.assertEqual(0, feed["cursor"])
 
     def test_restart_reads_same_persisted_state(self):
         self.send("/api/v1/join", {"player": "Patrick"})
