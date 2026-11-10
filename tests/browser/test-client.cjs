@@ -46,7 +46,7 @@ function worldMap() {
   };
 }
 
-function instantiate({ missingMap = false, mapOnMove = false, rejectUnauthorized = false, fetchImpl = null, mapGate = null, roomGate = null, joinGate = null } = {}) {
+function instantiate({ missingMap = false, mapOnMove = false, rejectUnauthorized = false, fetchImpl = null, mapGate = null, roomGate = null, joinGate = null, nowMs = null } = {}) {
   const elements = new Map();
   const get = (id) => {
     if (!elements.has(id)) elements.set(id, new Element());
@@ -92,6 +92,7 @@ function instantiate({ missingMap = false, mapOnMove = false, rejectUnauthorized
     setInterval: (fn, delay) => { timers.push({ fn, delay }); return timers.length; },
     clearInterval: () => {},
     crypto: require("node:crypto").webcrypto, AbortController,
+    Date: nowMs ? class extends Date { static now() { return nowMs.value; } } : Date,
   }, { filename: "docs/app.js" });
   const event = { preventDefault() {} };
   return { get, requests, timers, connect: () => get("connection-form").events.submit(event),
@@ -140,6 +141,85 @@ test("moving from unmapped to mapped territory refreshes map after initial 404",
   client.get("command-input").value = "go north";
   await client.send();
   assert.equal(client.get("map-status").textContent, "LIVE HOST MAP · 2×2");
+});
+
+test("a slow periodic map fetch cannot overwrite a post-command position", async () => {
+  let resolveOldMap, signalOldMap;
+  const oldMapEntered = new Promise((resolve) => { signalOldMap = resolve; });
+  const releaseOldMap = new Promise((resolve) => { resolveOldMap = resolve; });
+  let playerX = 0;
+  let mapCalls = 0;
+  const clock = { value: 1000 };
+  const client = instantiate({ nowMs: clock, fetchImpl: async (url) => {
+    const route = new URL(url).pathname;
+    if (route === "/api/v1/map") {
+      const snapshot = playerX;
+      mapCalls++;
+      if (mapCalls === 2) { signalOldMap(); await releaseOldMap; }
+      return { ok: true, status: 200, json: async () => ({
+        ...worldMap(), player: { x: snapshot, y: 0 },
+      }) };
+    }
+    if (route === "/api/v1/command") playerX = 1;
+    const payload = route === "/api/v1/health" ? { ok: true, world_id: "race-world" }
+      : route === "/api/v1/join" ? { text: "Welcome", cursor: 0 }
+        : route === "/api/v1/room" ? { text: "Deck" }
+          : route === "/api/v1/feed" ? { cursor: 0, events: [] }
+            : { text: "Moved east" };
+    return { ok: true, status: 200, json: async () => payload };
+  } });
+  client.get("host-url").value = "http://127.0.0.1:8765";
+  client.get("player-name").value = "Explorer";
+  client.get("access-token").value = "secret-token";
+  await client.connect();
+  assert.equal(client.get("map-position").textContent, "@ 0,0");
+  clock.value += 15000;
+  const stalePoll = client.timers[0].fn();
+  await oldMapEntered;
+  client.get("command-input").value = "go east";
+  await client.send();
+  assert.equal(playerX, 1, "host movement must have completed");
+  resolveOldMap();
+  await stalePoll;
+  assert.equal(client.get("map-position").textContent, "@ 1,0",
+    "an older map response must not hide a movement whose command already committed");
+  assert.equal(mapCalls, 3, "an in-flight old map requires one coalesced post-command refresh");
+});
+
+test("a slow initial room response cannot overwrite a room reached by a command", async () => {
+  let enterOldRoom, releaseOldRoom;
+  const oldRoomEntered = new Promise((resolve) => { enterOldRoom = resolve; });
+  const pendingOldRoom = new Promise((resolve) => { releaseOldRoom = resolve; });
+  let room = "Old Deck", roomCalls = 0;
+  const client = instantiate({ fetchImpl: async (url) => {
+    const route = new URL(url).pathname;
+    if (route === "/api/v1/room") {
+      const snapshot = room;
+      if (++roomCalls === 1) { enterOldRoom(); await pendingOldRoom; }
+      return { ok: true, status: 200, json: async () => ({ text: snapshot }) };
+    }
+    if (route === "/api/v1/command") room = "New Deck";
+    const payload = route === "/api/v1/health" ? { ok: true, world_id: "room-race" }
+      : route === "/api/v1/join" ? { text: "Welcome", cursor: 0 }
+        : route === "/api/v1/map" ? worldMap()
+          : route === "/api/v1/feed" ? { cursor: 0, events: [] }
+            : { text: "Moved east" };
+    return { ok: true, status: 200, json: async () => payload };
+  } });
+  client.get("host-url").value = "http://127.0.0.1:8765";
+  client.get("player-name").value = "Explorer";
+  client.get("access-token").value = "secret-token";
+  const entering = client.connect();
+  await oldRoomEntered;
+  client.get("command-input").value = "go east";
+  await client.send();
+  assert.equal(room, "New Deck");
+  assert.equal(client.get("room-description").textContent, "New Deck");
+  releaseOldRoom();
+  await entering;
+  assert.equal(roomCalls, 2);
+  assert.equal(client.get("room-description").textContent, "New Deck",
+    "a stale initial room snapshot must not overwrite the later authorized command result");
 });
 
 test("disconnect during initial map fetch does not leave an orphan polling timer", async () => {
@@ -240,6 +320,56 @@ test("a duplicate connection submit cannot race the first in-flight join", async
   assert.equal(client.get("connection-status").textContent, "Connected — receiving host state");
 });
 
+test("a pending join can be cancelled without reviving a disconnected session", async () => {
+  let releaseJoin, enteredJoin;
+  const waitingForJoin = new Promise((resolve) => { enteredJoin = resolve; });
+  const pendingJoin = new Promise((resolve) => { releaseJoin = resolve; });
+  const client = instantiate({ joinGate: () => { enteredJoin(); return pendingJoin; } });
+  client.get("host-url").value = "http://localhost:8765";
+  client.get("player-name").value = "Explorer";
+  client.get("access-token").value = "secret-token";
+  const joining = client.connect();
+  await waitingForJoin;
+  assert.equal(client.get("disconnect-button").disabled, false, "pending joins must be cancellable");
+  assert.equal(client.get("access-token").value, "", "pending joins must not leave a secret in the DOM");
+  client.disconnect();
+  const joinRequest = client.requests.find(({ url }) => url.includes("/api/v1/join"));
+  assert.equal(joinRequest.options.signal.aborted, true, "cancel must abort pending join");
+  releaseJoin();
+  await joining;
+  assert.equal(client.get("world-name").textContent, "Unconnected");
+  assert.equal(client.get("connection-status").textContent, "Offline — no world connected");
+  assert.equal(client.get("connect-button").disabled, false);
+  assert.equal(client.timers.length, 0);
+});
+
+test("a cancelled old join cannot overwrite a newly connected world", async () => {
+  let releaseOldJoin, enteredOldJoin;
+  const firstJoinEntered = new Promise((resolve) => { enteredOldJoin = resolve; });
+  const oldJoin = new Promise((resolve) => { releaseOldJoin = resolve; });
+  let joins = 0;
+  const client = instantiate({ joinGate: () => {
+    if (++joins === 1) { enteredOldJoin(); return oldJoin; }
+  } });
+  client.get("host-url").value = "http://localhost:8765";
+  client.get("player-name").value = "Explorer";
+  client.get("access-token").value = "old-token";
+  const original = client.connect();
+  await firstJoinEntered;
+  client.disconnect();
+  client.get("access-token").value = "new-token";
+  await client.connect();
+  releaseOldJoin();
+  await original;
+  assert.equal(client.get("connection-status").textContent, "Connected — receiving host state");
+  assert.equal(client.get("world-name").textContent, "test-world");
+  assert.equal(client.get("access-token").value, "");
+  assert.equal(client.get("disconnect-button").disabled, false);
+  const transcript = client.get("feed").children.map((item) => item.children[1].children[0].textContent);
+  assert.deepEqual(transcript, ["HOST / JOIN"], "old join must not append its own transcript");
+  assert.equal(joins, 2);
+});
+
 test("a completed old connection cannot re-enable controls during a newer join", async () => {
   let releaseOldRoom, reachedOldRoom, releaseNewJoin, reachedNewJoin;
   const oldRoomEntered = new Promise((resolve) => { reachedOldRoom = resolve; });
@@ -288,6 +418,70 @@ test("refuses cleartext remote worlds before sending any bearer token", async ()
   await client.connect();
   assert.equal(client.requests.length, 0);
   assert.match(client.get("connection-note").textContent, /HTTP is permitted only for loopback/);
+});
+
+test("feed throttling honors bounded Retry-After without disconnecting the session", async () => {
+  const clock = { value: 100000 };
+  let feedRequests = 0;
+  const responses = {
+    "/api/v1/health": { ok: true, world_id: "limited-world" },
+    "/api/v1/join": { ok: true, text: "Welcome", cursor: 0 },
+    "/api/v1/room": { ok: true, text: "The Deck" },
+    "/api/v1/map": worldMap(),
+    "/api/v1/feed": { ok: true, cursor: 1, events: [{ id: 1, kind: "say", actor: "Tessa", text: "Ready" }] },
+  };
+  const client = instantiate({ nowMs: clock, fetchImpl: async (url) => {
+    const route = new URL(url).pathname;
+    assert.ok(route in responses);
+    if (route === "/api/v1/feed" && ++feedRequests === 1) {
+      return { ok: false, status: 429, headers: { get: () => "5" }, json: async () => ({ error: "Too many requests" }) };
+    }
+    return { ok: true, status: 200, json: async () => responses[route] };
+  } });
+  client.get("host-url").value = "http://localhost:8765";
+  client.get("player-name").value = "Explorer";
+  client.get("access-token").value = "secret-token";
+  await client.connect();
+  await client.timers[0].fn();
+  assert.equal(feedRequests, 1);
+  for (let i = 0; i < 4; i++) await client.timers[0].fn();
+  assert.equal(feedRequests, 1, "polling must honor the host's retry window");
+  assert.equal(client.get("connection-status").textContent, "Connected — receiving host state");
+  clock.value += 5001;
+  await client.timers[0].fn();
+  assert.equal(feedRequests, 2);
+  assert.ok(client.get("feed").children.some((item) => item.children[1].children[0].textContent === "Tessa / say"));
+});
+
+test("malformed and excessive retry intervals cannot suspend browser feed indefinitely", async () => {
+  for (const [header, expectedDelay] of [["invalid", 4400], ["99999", 30000]]) {
+    const clock = { value: 100000 };
+    let attempts = 0;
+    const client = instantiate({ nowMs: clock, fetchImpl: async (url) => {
+      const route = new URL(url).pathname;
+      if (route === "/api/v1/feed") {
+        attempts++;
+        if (attempts === 1) return { ok: false, status: 429, headers: { get: () => header }, json: async () => ({ error: "Rate limited" }) };
+        return { ok: true, status: 200, json: async () => ({ cursor: 0, events: [] }) };
+      }
+      const data = route === "/api/v1/health" ? { ok: true, world_id: "host" }
+        : route === "/api/v1/join" ? { text: "Hello", cursor: 0 }
+          : route === "/api/v1/room" ? { text: "Deck" } : worldMap();
+      return { ok: true, status: 200, json: async () => data };
+    } });
+    client.get("host-url").value = "http://127.0.0.1:8765";
+    client.get("player-name").value = "Explorer";
+    client.get("access-token").value = "limited-token";
+    await client.connect();
+    await client.timers[0].fn();
+    clock.value += expectedDelay - 1;
+    await client.timers[0].fn();
+    assert.equal(attempts, 1, `must wait for bounded retry interval (${header})`);
+    clock.value++;
+    await client.timers[0].fn();
+    assert.equal(attempts, 2, `must resume after bounded retry interval (${header})`);
+    client.disconnect();
+  }
 });
 
 const gatewayRoot = process.env.REALM_LIVE_GATEWAY_ROOT || path.join(__dirname, "../..");

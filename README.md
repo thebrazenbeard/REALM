@@ -55,19 +55,42 @@ The current integration candidate supports:
   (see `docs/GATEWAY_PROTOCOL.md`).
 - A Pages-compatible static browser client under `docs/`, including a live map
   display. GitHub Pages does not run the game server.
-- A separately gated loopback-only Telnet adapter (`TERMINAL.md`). Its local
-  token is not the HTTP player identity system.
+- A separately gated loopback-only Telnet adapter (`TERMINAL.md`). Legacy
+  shared-token/player-chosen-name mode remains for compatibility; an opt-in
+  host-provisioned player-credential mode enforces identity at the writer
+  transaction boundary. **Both are plaintext and local-only.**
+- A host-local per-player gateway request limiter and browser retries for
+  `429 Retry-After`, plus a bounded socket-worker pool and absolute POST body
+  deadline ([abuse controls](docs/GATEWAY_ABUSE_CONTROLS.md),
+  [worker bounds](docs/GATEWAY_SLOW_BODY.md)).
+- An explicitly invoked, bounded local-model proposal bridge for NPCs, with
+  host-owned identities, allowed actions, and SQLite receipts
+  ([model transport](docs/NPC_LOCAL_MODEL_BRIDGE.md),
+  [turn execution](docs/NPC_TURNS.md)). Model weights and scheduling are not
+  included.
+- A read-only host preflight for SQLite/world-path and local-runtime suitability
+  ([host preflight](docs/HOST_PREFLIGHT.md)).
+- A direct world-clock callback guard that prevents accidental COMMIT,
+  ROLLBACK, implicit COMMIT, or ATTACH escaping the clock's receipt transaction
+  ([atomicity boundary](docs/CLOCK_CALLBACK_ATOMICITY.md)).
+- A **source-only, not yet displayed in-game** ship-title formatter that
+  derives the captain label from current persisted ship ownership and requires
+  a host-signed, short-lived proof for first-officer presentation
+  ([title policy](docs/TITLE_FLAGS.md)).
 
-**Not implemented or qualified:** public TLS hosting, rate limits, public
-account registration, expiring sessions, fog of war, AI/NPC co-player loops,
-automatic simulation ticks, inter-world portals, combat, moderation,
-distributed state, or the canonical Driftspace setting. Local CLI/Telnet names
-are not durable authenticated account identities. **Do not expose these
-development servers to the public internet.**
+**Not implemented or qualified:** public TLS hosting, full unauthenticated
+flood protection and header deadlines, cross-process rate quotas, public account registration,
+expiring sessions, fog of war, autonomous AI/NPC co-player scheduling, a
+privacy-scoped NPC scene builder, inter-world portals, combat, moderation,
+distributed state, or the canonical Driftspace setting. CLI names and legacy
+Telnet names are not durable authenticated account identities. **Do not expose
+these development servers to the public internet.**
 
-The model-free [`ResidentController`](docs/RESIDENT_PROPOSALS.md) now gives a
-host one validation boundary for future NPC **action proposals**, but does
-not generate actions or provide resident drives, memories, or autonomous ticks.
+The model-free [`ResidentController`](docs/RESIDENT_PROPOSALS.md) gives a
+host one validation boundary for NPC **action proposals**. The optional local
+bridge can now ask an already-running model endpoint for a proposed command,
+but does not provide weights, character drives, memories, autonomous ticks, or
+a deployed resident service.
 Small local NPC-model options, including Patrick's Hugging Face `character` and
 `npc` searches, are tracked as **research candidates** in
 [`docs/NPC_MODEL_CANDIDATES.md`](docs/NPC_MODEL_CANDIDATES.md) and the offline

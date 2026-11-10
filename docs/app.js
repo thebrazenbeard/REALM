@@ -36,6 +36,7 @@
   const quickActions = [...document.querySelectorAll("[data-command]")];
   const NAME_PATTERN = /^[A-Za-z][A-Za-z0-9_-]{0,23}$/;
   const POLL_DELAY_MS = 2200;
+  const MAX_RATE_RETRY_MS = 30000;
   const MAX_FEED_ITEMS = 160;
   let requestSerial = 0;
   let current = null; // In-memory only: no session, endpoint, or token storage.
@@ -133,6 +134,15 @@
       const detail = typeof data.error === "string" ? data.error : "Request rejected by the host";
       const error = new Error(detail + " (HTTP " + response.status + ")");
       error.status = response.status;
+      if (response.status === 429) {
+        // Only bounded numeric Retry-After seconds affect host-feed polling.
+        const header = response.headers?.get?.("Retry-After");
+        const seconds = typeof header === "string" && /^\d{1,5}$/.test(header.trim())
+          ? Number(header.trim()) : NaN;
+        error.retryAfterMs = Number.isFinite(seconds)
+          ? Math.max(POLL_DELAY_MS, Math.min(MAX_RATE_RETRY_MS, seconds * 1000))
+          : POLL_DELAY_MS * 2;
+      }
       throw error;
     }
     return data;
@@ -144,6 +154,13 @@
   }
 
   function stopSession({ note } = {}) {
+    if (connecting && connecting !== current) {
+      // An in-flight join may outlive a user's cancellation. Clear the token
+      // and invalidate its session before any delayed response can join us.
+      connecting.abortController.abort();
+      connecting.token = "";
+      connecting = null;
+    }
     if (current) {
       if (connecting === current) connecting = null;
       clearInterval(current.timer);
@@ -170,15 +187,20 @@
   const mapElements = { grid: ui.mapGrid, space: ui.mapSpace, position: ui.mapPosition,
     status: ui.mapStatus, note: ui.mapNote, legend: ui.mapLegend };
 
-  async function refreshMap(session) {
-    if (!window.RealmMap || current !== session || session.mapUnsupported || session.mapPolling) return;
+  async function refreshMap(session, { afterCommand = false } = {}) {
+    if (!window.RealmMap || current !== session || session.mapUnsupported) return;
+    if (session.mapPolling) {
+      if (afterCommand) session.mapRefreshPending = true;
+      return;
+    }
     session.mapPolling = true;
     try {
       const payload = await request(session, "/api/v1/map?player=" + encodeURIComponent(session.player));
-      if (current !== session) return;
+      // A command may have committed while this older response was pending.
+      if (current !== session || session.mapRefreshPending) return;
       window.RealmMap.renderMap(document, mapElements, payload);
     } catch (error) {
-      if (current !== session) return;
+      if (current !== session || session.mapRefreshPending) return;
       // A 404 may mean this particular room has no mapped space; retry after travel.
       if (error.status === 501) session.mapUnsupported = true;
       window.RealmMap.setUnavailable(mapElements, error.status === 404
@@ -188,13 +210,23 @@
     } finally {
       session.mapPolling = false;
       session.mapUpdated = Date.now();
+      if (current === session && session.mapRefreshPending) {
+        session.mapRefreshPending = false;
+        await refreshMap(session);
+      }
     }
   }
 
   async function refreshRoom(session) {
-    const room = await request(session, "/api/v1/room?player=" + encodeURIComponent(session.player));
-    if (current !== session) return;
-    ui.room.textContent = typeof room.text === "string" ? room.text : "The host did not return a room description.";
+    const revision = ++session.roomRevision;
+    try {
+      const room = await request(session, "/api/v1/room?player=" + encodeURIComponent(session.player));
+      if (current !== session || revision !== session.roomRevision) return;
+      ui.room.textContent = typeof room.text === "string" ? room.text : "The host did not return a room description.";
+    } catch (error) {
+      if (current !== session || revision !== session.roomRevision) return;
+      throw error;
+    }
   }
 
   function describeEvent(event) {
@@ -206,7 +238,7 @@
   }
 
   async function poll(session) {
-    if (current !== session || session.polling) return;
+    if (current !== session || session.polling || Date.now() < session.pollPauseUntil) return;
     session.polling = true;
     try {
       const data = await request(session, "/api/v1/feed?player=" + encodeURIComponent(session.player) + "&after=" + session.cursor);
@@ -220,9 +252,18 @@
       }
       session.cursor = Math.max(session.cursor, parseCursor(data.cursor, session.cursor));
       session.failures = 0;
+      session.throttled = false;
+      session.pollPauseUntil = 0;
       if (Date.now() - session.mapUpdated > 12000) await refreshMap(session);
     } catch (error) {
       if (current !== session) return;
+      if (error.status === 429) {
+        session.pollPauseUntil = Date.now() + error.retryAfterMs;
+        session.failures = 0;
+        if (!session.throttled) appendFeed({ category: "system", label: "HOST / RATE LIMIT", message: "The host is busy. Feed updates will resume after its retry interval.", icon: "◇" });
+        session.throttled = true;
+        return;
+      }
       session.failures++;
       if (session.failures === 1) appendFeed({ category: "error", label: "CONNECTION INTERRUPTED", message: error.message, icon: "!" });
       if (session.failures >= 3) {
@@ -249,12 +290,18 @@
     ui.connect.textContent = "Connecting…";
     setNote("Contacting the host…");
     const session = { base, token, player, abortController: new AbortController(), cursor: 0, polling: false, failures: 0,
-      mapUnsupported: false, mapPolling: false, mapUpdated: 0, timer: null };
+      throttled: false, pollPauseUntil: 0, roomRevision: 0,
+      mapUnsupported: false, mapPolling: false, mapRefreshPending: false, mapUpdated: 0, timer: null };
     connecting = session;
+    // The cancellable in-memory session now owns the sole token copy.
+    ui.accessToken.value = "";
+    ui.disconnect.disabled = false;
     try {
       const health = await request(session, "/api/v1/health", { unauthenticated: true });
+      if (connecting !== session) return;
       if (health.ok !== true || typeof health.world_id !== "string") throw new Error("The endpoint is not a compatible REALM gateway.");
       const joined = await request(session, "/api/v1/join", { body: { player } });
+      if (connecting !== session) return;
       session.cursor = parseCursor(joined.cursor);
       current = session;
       resetFeed();
@@ -277,8 +324,10 @@
       session.timer = setInterval(() => poll(session), POLL_DELAY_MS);
       ui.commandInput.focus();
     } catch (error) {
-      stopSession({ note: "Connection failed: " + error.message });
-      ui.note.classList.add("is-error");
+      if (connecting === session || current === session) {
+        stopSession({ note: "Connection failed: " + error.message });
+        ui.note.classList.add("is-error");
+      }
     } finally {
       // A disconnected attempt may finish after a newer connection starts.
       // Its finally block must not change the new attempt's controls.
@@ -317,7 +366,7 @@
       if (current !== session) return;
       await poll(session);
       if (current !== session) return;
-      await refreshMap(session);
+      await refreshMap(session, { afterCommand: true });
     } catch (error) {
       if (current === session) appendFeed({ category: "error", label: "COMMAND REJECTED", message: error.message, icon: "!" });
     } finally {
