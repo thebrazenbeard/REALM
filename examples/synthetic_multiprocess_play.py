@@ -299,7 +299,8 @@ def run_demo() -> dict:
                 ).fetchall())
                 receipts = {
                     "npc": db.execute(
-                        "SELECT COUNT(*) FROM action_receipts WHERE actor='Gatherer'"
+                        "SELECT COUNT(*) FROM action_receipts "
+                        "WHERE actor='@clock:Gatherer'"
                     ).fetchone()[0],
                     "ship_arrival": db.execute(
                         "SELECT COUNT(*) FROM geo_ship_receipts WHERE actor='system'"

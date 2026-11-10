@@ -97,6 +97,26 @@ class RosterUtcTests(unittest.TestCase):
         self.assertIsNotNone(self.clock.lookup("roster_test_1").processed_at)
         self.assertEqual(result.proposal.evidence_sha256, plan.evidence_sha256)
 
+    def test_player_preclaims_signed_roster_actor_id_without_stalling_grant(self):
+        """Read-only player receipt cannot impersonate a signed roster receipt."""
+        plan = self.proposal()
+        selected = next(a for a in plan.assignments if a.site is not None)
+        action_id = "npcR_" + hashlib.sha256(
+            f"roster_test_1|{selected.actor}".encode("utf-8")
+        ).hexdigest()[:50]
+        self.assertIn("Commands:", self.engine.act(
+            selected.actor, "help", action_id=action_id))
+        policy, mac = self.grant(plan)
+        result = self.run_grant(policy, mac)
+        self.assertEqual((result.executed, result.waiting), (2, 1))
+        self.assertEqual(self.counts(), (2, 3, 0))
+        self.assertIsNotNone(self.clock.lookup("roster_test_1").processed_at)
+        with closing(sqlite3.connect(self.dbpath)) as db:
+            self.assertEqual(1, db.execute(
+                "SELECT COUNT(*) FROM action_receipts WHERE actor=? AND action_id=?",
+                ("@roster:" + selected.actor, action_id),
+            ).fetchone()[0])
+
     def test_two_actors_both_gather_under_exact_host_grant(self):
         with closing(sqlite3.connect(self.dbpath)) as db:
             latest = db.execute("SELECT COALESCE(MAX(id),0) FROM events").fetchone()[0]
@@ -349,8 +369,8 @@ class RosterUtcTests(unittest.TestCase):
                 db, event, engine=self.engine, crafting=self.crafting,
                 policy=policy, host_key=HOST_KEY, grant_mac_hex=mac, now_utc=NOW,
             )
-            db.execute("DELETE FROM main.action_receipts WHERE actor='Ada'")
-            db.execute("DELETE FROM main.action_receipts WHERE actor='Ben'")
+            db.execute("DELETE FROM main.action_receipts WHERE actor='@roster:Ada'")
+            db.execute("DELETE FROM main.action_receipts WHERE actor='@roster:Ben'")
             return result
         with self.assertRaisesRegex(ValueError, "exact actor action receipt"):
             self.clock.tick(NOW, silently_removed_receipt)

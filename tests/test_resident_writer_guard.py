@@ -30,7 +30,7 @@ class ResidentWriterGuardTests(unittest.TestCase):
         with closing(sqlite3.connect(self.db_path)) as db:
             return (
                 db.execute("SELECT COUNT(*) FROM events WHERE actor='Scout' AND kind='say'").fetchone()[0],
-                db.execute("SELECT COUNT(*) FROM action_receipts WHERE actor='Scout'").fetchone()[0],
+                db.execute("SELECT COUNT(*) FROM action_receipts WHERE actor='@resident:Scout'").fetchone()[0],
             )
 
     def test_guard_denial_aborts_action_and_receipt(self):

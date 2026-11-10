@@ -204,7 +204,8 @@ def run_demo(*, interactive: bool = False) -> dict:
             with closing(sqlite3.connect(db_path)) as db:
                 receipts = {
                     "npc": db.execute(
-                        "SELECT COUNT(*) FROM action_receipts WHERE actor='Gatherer'"
+                        "SELECT COUNT(*) FROM action_receipts "
+                        "WHERE actor='@clock:Gatherer'"
                     ).fetchone()[0],
                     "arrival": db.execute(
                         "SELECT COUNT(*) FROM geo_ship_events WHERE kind='arrive'"

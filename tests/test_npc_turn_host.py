@@ -29,6 +29,8 @@ class _ModelFixture(BaseHTTPRequestHandler):
         size = int(self.headers.get("Content-Length", "0"))
         self.server.requests.append(json.loads(self.rfile.read(size)))
         reply = self.server.responses.pop(0)
+        if self.server.before_reply is not None:
+            self.server.before_reply()
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(reply)))
@@ -53,6 +55,7 @@ class ResidentTurnHostTests(unittest.TestCase):
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), _ModelFixture)
         self.server.requests = []
         self.server.responses = []
+        self.server.before_reply = None
         self.addCleanup(self.server.server_close)
         thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         thread.start()
@@ -94,6 +97,178 @@ class ResidentTurnHostTests(unittest.TestCase):
         self.assertTrue(again.replayed)
         self.assertEqual(1, len(self.server.requests))
         self.assertEqual(1, len(self._speech(self.first_path, "Moss")))
+
+    def test_player_preclaimed_turn_id_does_not_impersonate_host_receipt(self):
+        action_id = "npc:fixture-schedule:0:0123456789abcdef"
+        self.assertEqual("You say: Claimed by player", self.engine.act(
+            "Moss", "say Claimed by player", action_id=action_id))
+        turn = ResidentTurn(self.moss, "Host-approved scene", action_id)
+        with self.assertRaisesRegex(ValueError, "unverified legacy|player receipt"):
+            self.host.run_tick([turn])
+        self.assertEqual(0, len(self.server.requests))
+        self.assertEqual(1, len(self._speech(self.first_path, "Moss")))
+        with closing(sqlite3.connect(self.first_path)) as db:
+            rows = db.execute("SELECT actor,command FROM action_receipts "
+                              "WHERE action_id=? ORDER BY actor", (action_id,)).fetchall()
+        self.assertEqual([("Moss", "say Claimed by player")], rows)
+        # A distinct, owner-selected new logical action ID is usable.
+        self.server.responses.append(_answer("say Genuine host turn"))
+        fresh = self.host.run_tick([ResidentTurn(self.moss, "Scene", "host-fresh-1")])[0]
+        self.assertFalse(fresh.replayed)
+        self.assertEqual("You say: Genuine host turn", fresh.response)
+
+    def test_preclaiming_early_move_does_not_falsify_resident_due_movement(self):
+        action_id = "npc:next-movement:0:fedcba9876543210"
+        self.engine.act("Moss", "north", action_id=action_id)
+        self.engine.act("Moss", "south")
+        mover = ResidentController(self.engine, "Moss", allowed_verbs=frozenset({"north"}))
+        with self.assertRaisesRegex(ValueError, "unverified legacy|player receipt"):
+            self.host.run_tick([ResidentTurn(mover, "Current room", action_id)])
+        self.assertIn("The Atrium", self.engine.act("Moss", "look"))
+        self.assertEqual(0, len(self.server.requests))
+
+    def test_upgrade_legacy_host_receipt_never_silently_reexecutes(self):
+        old_id = "same-host-turn"
+        # This is the persisted v1 host effect/receipt shape. It is identical
+        # to a player's receipt, and cannot be trusted as proof of host origin.
+        # The historical controller implemented this exact Engine.act call.
+        # The current controller instead uses a separate host-only receipt.
+        self.assertEqual("You say: Legitimate old host", self.engine.act(
+            "Moss", "say Legitimate old host", action_id=old_id))
+        with self.assertRaisesRegex(ValueError, "unverified legacy|player receipt"):
+            self.host.run_tick([ResidentTurn(self.moss, "Scene", old_id)])
+        self.assertEqual(0, len(self.server.requests))
+        self.assertEqual(1, len(self._speech(self.first_path, "Moss")))
+        with closing(sqlite3.connect(self.first_path)) as db:
+            self.assertEqual([("Moss", "say Legitimate old host")], db.execute(
+                "SELECT actor,command FROM action_receipts WHERE action_id=?", (old_id,)
+            ).fetchall())
+
+    def test_player_preclaim_during_model_call_is_denied_inside_writer_transaction(self):
+        action_id = "race-preclaim"
+        self.server.responses.append(_answer("say Model result must not commit"))
+        self.server.before_reply = lambda: self.engine.act(
+            "Moss", "say Claimed during inference", action_id=action_id,
+        )
+        with self.assertRaisesRegex(ValueError, "unverified legacy|player receipt"):
+            self.host.run_tick([ResidentTurn(self.moss, "Private", action_id)])
+        self.assertEqual(1, len(self.server.requests))
+        self.assertEqual(1, len(self._speech(self.first_path, "Moss")))
+        with closing(sqlite3.connect(self.first_path)) as db:
+            self.assertEqual([("Moss", "say Claimed during inference")], db.execute(
+                "SELECT actor,command FROM action_receipts WHERE action_id=?", (action_id,)
+            ).fetchall())
+
+    def test_host_receipt_failure_rolls_back_its_own_mutating_effect(self):
+        with closing(sqlite3.connect(self.first_path)) as db, db:
+            db.execute("CREATE TRIGGER block_resident_receipt BEFORE INSERT ON action_receipts "
+                       "WHEN NEW.actor='@resident:Moss' "
+                       "BEGIN SELECT RAISE(ABORT, 'resident receipt blocked'); END")
+        self.server.responses.append(_answer("say Must not commit"))
+        with self.assertRaisesRegex(sqlite3.DatabaseError, "resident receipt blocked"):
+            self.host.run_tick([ResidentTurn(self.moss, "Private scene", "host-abort")])
+        self.assertEqual([], self._speech(self.first_path, "Moss"))
+
+    def test_host_observation_replay_is_fresh_and_cannot_rebind_action_id(self):
+        viewer = ResidentController(self.engine, "Moss", allowed_verbs=frozenset({"look"}))
+        self.server.responses.append(_answer("look"))
+        first = self.host.run_tick([ResidentTurn(viewer, "Scene", "observe-one")])[0]
+        self.assertIn("The Atrium", first.response)
+        self.engine.act("Moss", "north")
+        second = self.host.run_tick([ResidentTurn(viewer, "Scene", "observe-one")])[0]
+        self.assertTrue(second.replayed)
+        self.assertIn("The Corridor", second.response)
+        with closing(sqlite3.connect(self.first_path)) as db:
+            response = db.execute(
+                "SELECT response FROM action_receipts WHERE actor='@resident:Moss' "
+                "AND action_id='observe-one'"
+            ).fetchone()[0]
+        self.assertEqual("", response)
+        self.assertEqual(1, len(self.server.requests))
+        with self.assertRaisesRegex(ValueError, "different command"):
+            self.host._commit_host_turn(viewer, "Moss", {"command": "look around"},
+                                        "observe-one")
+
+    def test_resident_writer_guard_denial_is_atomic_and_not_replayed(self):
+        def deny(db):
+            self.assertTrue(db.in_transaction)
+            raise PermissionError("scene proof expired")
+
+        with self.assertRaisesRegex(PermissionError, "scene proof expired"):
+            self.host._commit_host_turn(
+                self.moss, "Moss", {"command": "say DENIED"}, "guard-1",
+                writer_guard=deny,
+            )
+        self.assertEqual([], self._speech(self.first_path, "Moss"))
+        with closing(sqlite3.connect(self.first_path)) as db:
+            self.assertEqual(0, db.execute(
+                "SELECT COUNT(*) FROM action_receipts WHERE actor='@resident:Moss'"
+            ).fetchone()[0])
+
+    def test_unavailable_model_does_not_create_any_host_receipt(self):
+        unreachable = LocalChatProposer(LocalChatConfig(
+            endpoint="http://127.0.0.1:1/v1/chat/completions",
+            model="unreachable-test-model", timeout_seconds=0.2,
+        ))
+        with self.assertRaises(OSError):
+            ResidentTurnHost(self.engine, unreachable).run_tick([
+                ResidentTurn(self.moss, "Scene", "model-unavailable")
+            ])
+        with closing(sqlite3.connect(self.first_path)) as db:
+            self.assertEqual(0, db.execute(
+                "SELECT COUNT(*) FROM action_receipts WHERE actor='@resident:Moss'"
+            ).fetchone()[0])
+        self.assertEqual([], self._speech(self.first_path, "Moss"))
+
+    def test_host_receipt_actor_is_not_joinable_and_direction_alias_keeps_engine_semantics(self):
+        with self.assertRaisesRegex(ValueError, "Player name"):
+            self.engine.join("@resident:Moss")
+        self.server.responses.append(_answer("n"))
+        mover = ResidentController(self.engine, "Moss", allowed_verbs=frozenset({"n"}))
+        result = self.host.run_tick([ResidentTurn(mover, "Private room", "alias-n")])[0]
+        self.assertIn("The Corridor", result.response)
+        with closing(sqlite3.connect(self.first_path)) as db:
+            row = db.execute(
+                "SELECT actor,command FROM action_receipts WHERE action_id='alias-n'"
+            ).fetchone()
+        self.assertEqual(("@resident:Moss", "n"), row)
+
+    def test_direct_host_commit_rejects_controller_actor_and_world_mismatch(self):
+        # The private trusted helper is callable by other local integrations;
+        # a controller approved for Moss cannot lend its command policy to
+        # Ember, even though both players exist in the same world.
+        with self.assertRaisesRegex(ValueError, "resident.*actor|actor.*resident"):
+            self.host._commit_host_turn(
+                self.moss, "Ember", {"command": "say Wrong resident"}, "cross-actor",
+            )
+        self.assertEqual([], self._speech(self.first_path, "Ember"))
+        with closing(sqlite3.connect(self.first_path)) as db:
+            self.assertEqual(0, db.execute(
+                "SELECT COUNT(*) FROM action_receipts WHERE actor='@resident:Ember'"
+            ).fetchone()[0])
+
+    def test_direct_host_commit_rejects_foreign_engine_controller(self):
+        foreign = ResidentController(self.other, "Moss", allowed_verbs=frozenset({"say"}))
+        with self.assertRaisesRegex(ValueError, "same Engine|host Engine"):
+            self.host._commit_host_turn(
+                foreign, "Moss", {"command": "say Wrong world"}, "foreign-world",
+            )
+        self.assertEqual([], self._speech(self.first_path, "Moss"))
+        with closing(sqlite3.connect(self.first_path)) as db:
+            self.assertEqual(0, db.execute(
+                "SELECT COUNT(*) FROM action_receipts WHERE actor LIKE '@resident:%'"
+            ).fetchone()[0])
+
+    def test_canonical_player_case_alias_still_binds_host_resident(self):
+        self.server.responses.append(_answer("say Alias allowed"))
+        alias = ResidentController(self.engine, "mOSS", allowed_verbs=frozenset({"say"}))
+        result = self.host.run_tick([ResidentTurn(alias, "Same identity", "alias-case")])[0]
+        self.assertEqual("Moss", result.actor)
+        self.assertEqual("You say: Alias allowed", result.response)
+        with closing(sqlite3.connect(self.first_path)) as db:
+            self.assertEqual(("@resident:Moss", "alias-case"), db.execute(
+                "SELECT actor,action_id FROM action_receipts WHERE action_id='alias-case'"
+            ).fetchone())
 
     def test_cross_world_controller_is_rejected_before_inference(self):
         foreign = ResidentController(self.other, "Moss", allowed_verbs=frozenset({"say"}))

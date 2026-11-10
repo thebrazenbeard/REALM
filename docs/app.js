@@ -42,6 +42,9 @@
   let requestSerial = 0;
   let current = null; // In-memory only: no session, endpoint, or token storage.
   let connecting = null; // Prevent overlapping joins while current is still null.
+  // One uncertain mutation may outlive a disconnect in this page's memory.
+  // Never retain its bearer: a reconnect must independently authenticate.
+  let unresolvedCommand = null;
 
   function setNote(message, error = false) {
     ui.note.textContent = message;
@@ -174,6 +177,11 @@
     }
     if (current) {
       if (connecting === current) connecting = null;
+      const retry = current.pendingCommandRetry || current.inflightCommand;
+      unresolvedCommand = retry && current.worldId ? {
+        base: current.base, worldId: current.worldId, player: current.player,
+        command: retry.command, actionId: retry.actionId,
+      } : null;
       clearInterval(current.timer);
       // Cancel any in-flight room, map, feed, or command response belonging to
       // this session, and release its credential before a future reconnect.
@@ -339,7 +347,7 @@
     setNote("Contacting the host…");
     const session = { base, token, player, abortController: new AbortController(), cursor: 0, polling: false, failures: 0,
       throttled: false, overloaded: false, overloadFailures: 0, pollPauseUntil: 0, roomRevision: 0,
-      commandPending: false, pendingCommandRetry: null,
+      commandPending: false, pendingCommandRetry: null, inflightCommand: null,
       commandHistory: [], historyIndex: null, commandDraft: "",
       mapUnsupported: false, mapPolling: false, mapRefreshPending: false, mapUpdated: 0, timer: null };
     connecting = session;
@@ -350,12 +358,28 @@
       const health = await request(session, "/api/v1/health", { unauthenticated: true });
       if (connecting !== session) return;
       if (health.ok !== true || typeof health.world_id !== "string") throw new Error("The endpoint is not a compatible REALM gateway.");
+      session.worldId = health.world_id;
       const joined = await request(session, "/api/v1/join", { body: { player } });
       if (connecting !== session) return;
-      session.cursor = parseCursor(joined.cursor);
+      // A 200 alone is not a successful join: the cursor is required to
+      // distinguish newly visible events from the room's previous history.
+      // Older compatible hosts may omit `ok` or `text`, but an explicit
+      // negative acknowledgment or missing/invalid cursor cannot connect.
+      if (!joined || !Object.prototype.hasOwnProperty.call(joined, "cursor") ||
+          !Number.isSafeInteger(joined.cursor) || joined.cursor < 0 ||
+          (Object.prototype.hasOwnProperty.call(joined, "ok") && joined.ok !== true)) {
+        throw new Error("Host join response lacks a valid success cursor.");
+      }
+      session.cursor = joined.cursor;
       current = session;
       resetFeed();
       setConnectionState(true);
+      const retry = unresolvedCommand;
+      unresolvedCommand = null;
+      if (retry && retry.base === base && retry.worldId === health.world_id && retry.player === player) {
+        session.pendingCommandRetry = { command: retry.command, actionId: retry.actionId };
+        ui.commandInput.value = retry.command;
+      }
       // Keep the token in the session object only, not in the password input DOM.
       ui.accessToken.value = "";
       ui.worldName.textContent = health.world_id;
@@ -364,6 +388,8 @@
       ui.accessState.textContent = "Session connected";
       setNote("Connected. Your browser token is held in memory only and will be cleared when you disconnect.");
       appendFeed({ label: "HOST / JOIN", message: typeof joined.text === "string" ? joined.text : "Connected to host.", icon: "✦" });
+      if (session.pendingCommandRetry) appendFeed({ category: "system", label: "HOST / RETRY",
+        message: "Your last command may have completed before disconnect. Press Send to retry the unchanged command with its original action ID, or edit it to start a new action.", icon: "◇" });
       try { await refreshRoom(session); }
       catch (error) {
         if (current === session) appendFeed({ category: "error", label: "ROOM UPDATE", message: error.message, icon: "!" });
@@ -406,6 +432,7 @@
         : (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function"
           ? crypto.randomUUID()
           : "web-" + Date.now() + "-" + (++requestSerial));
+      if (prior && prior.command !== command) session.pendingCommandRetry = null;
       ui.send.disabled = true;
       ui.commandInput.disabled = true;
       // No history entry for a command that failed before reaching dispatch.
@@ -413,9 +440,11 @@
       if (session.commandHistory.length > MAX_COMMAND_HISTORY) session.commandHistory.shift();
       session.historyIndex = null;
       session.commandDraft = "";
+      session.inflightCommand = { command, actionId };
       try {
         const answer = await request(session, "/api/v1/command", { body: { player: session.player, command, action_id: actionId } });
         if (current !== session) return;
+        session.inflightCommand = null;
         session.pendingCommandRetry = null;
         appendFeed({ category: "response", label: session.player + " / " + command, message: answer.text || "(No response)", icon: "›" });
         ui.commandInput.value = "";
@@ -450,6 +479,7 @@
       }
     } finally {
       session.commandPending = false;
+      session.inflightCommand = null;
       if (current === session) {
         ui.send.disabled = false;
         ui.commandInput.disabled = false;

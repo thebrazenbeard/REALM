@@ -20,6 +20,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable
 
+from .clock_gameplay import (_CLOCK_RECEIPT_ACTOR_PREFIX,
+                             _ROSTER_RECEIPT_ACTOR_PREFIX)
 from .ship_history_custody import ShipHistoryCustody
 
 _EVENT_ID = re.compile(r"^[A-Za-z][A-Za-z0-9_-]{0,127}$")
@@ -369,7 +371,7 @@ def _verify_roster_utc_ack(db: sqlite3.Connection, event: DueEvent, outcome: obj
         receipt = db.execute(
             "SELECT command,response FROM main.action_receipts "
             "WHERE actor=? AND action_id=?",
-            (assignment.actor, action_id),
+            (_ROSTER_RECEIPT_ACTOR_PREFIX + assignment.actor, action_id),
         ).fetchone()
         if (receipt is None
                 or receipt["command"] != "gather " + assignment.site.material
@@ -543,6 +545,24 @@ class WorldClock:
                     "AND name IN ('events','gathering_nodes','material_pouches')"
                 )
             }
+            has_action_receipts = db.execute(
+                "SELECT 1 FROM main.sqlite_master "
+                "WHERE type='table' AND name='action_receipts'"
+            ).fetchone() is not None
+
+            def action_receipts_for(event_id):
+                # A player or another actor may already own this action ID.
+                # Only a *new*, event-scoped host receipt can attest this
+                # selected callback's economy transition.
+                if not has_action_receipts:
+                    return {}
+                return {
+                    r["actor"]: (r["command"], r["response"])
+                    for r in db.execute(
+                        "SELECT actor,command,response FROM main.action_receipts "
+                        "WHERE action_id=?", (event_id,),
+                    )
+                }
             if roster_in_batch and economy_tables != {
                     "events", "gathering_nodes", "material_pouches"}:
                 raise ValueError("Roster tick requires complete economy storage")
@@ -664,6 +684,9 @@ class WorldClock:
                     prior_event_ids = {
                         r["id"] for r in db.execute("SELECT id FROM main.events")
                     }
+                if event.kind in ("host_action", "npc_economic_gather",
+                                  "trusted_game_action"):
+                    receipt_before = action_receipts_for(event.event_id)
                 handler_changes = db.total_changes
                 handler_schema = _schema_versions(db)
                 with _guard_clock_callback_transaction(db):
@@ -730,19 +753,64 @@ class WorldClock:
                     # semantics; typed per-action attestation remains pending.
                     new_nodes = node_state()
                     new_pouches = pouch_state()
-                    if ((new_nodes != expected_nodes or new_pouches != expected_pouches)
-                            and db.execute(
-                                "SELECT 1 FROM main.action_receipts WHERE action_id=?",
-                                (event.event_id,),
-                            ).fetchone() is None):
-                        raise ValueError("Legacy host economy change lacks action receipt")
+                    new_gathers = [
+                        r for r in db.execute("SELECT * FROM main.events WHERE kind='gather'")
+                        if r["id"] not in prior_event_ids
+                    ]
+                    if (new_nodes != expected_nodes or new_pouches != expected_pouches
+                            or new_gathers):
+                        receipt_after = action_receipts_for(event.event_id)
+                        new_receipts = [
+                            (actor, receipt) for actor, receipt in receipt_after.items()
+                            if actor not in receipt_before
+                        ]
+                        if len(new_receipts) != 1 or not new_receipts[0][0].startswith(
+                                _CLOCK_RECEIPT_ACTOR_PREFIX):
+                            raise ValueError("Legacy host economy change lacks new host receipt")
+                        receipt_actor, (receipt_command, _response) = new_receipts[0]
+                        host_actor = receipt_actor[len(_CLOCK_RECEIPT_ACTOR_PREFIX):]
+                        actual_host_actor = db.execute(
+                            "SELECT id FROM main.players WHERE id=? COLLATE NOCASE",
+                            (host_actor,),
+                        ).fetchone()
+                        if (actual_host_actor is None
+                                or actual_host_actor["id"] != host_actor):
+                            raise ValueError("Legacy host economy receipt has no canonical actor")
+                        expected_actor = event.payload.get("actor")
+                        if "actor" in event.payload:
+                            if type(expected_actor) is not str:
+                                raise ValueError("Legacy host economy actor is invalid")
+                            canonical = db.execute(
+                                "SELECT id FROM main.players WHERE id=? COLLATE NOCASE",
+                                (expected_actor,),
+                            ).fetchone()
+                            if (canonical is None or receipt_actor !=
+                                    _CLOCK_RECEIPT_ACTOR_PREFIX + canonical["id"]):
+                                raise ValueError("Legacy host economy receipt actor mismatches event")
+                        if ("command" in event.payload
+                                and (type(event.payload["command"]) is not str
+                                     or receipt_command != event.payload["command"].strip())):
+                            raise ValueError("Legacy host economy receipt command mismatches event")
+                        # Gather history must match the host receipt's actor
+                        # even when a queued payload omits an actor (as with
+                        # signed NPC policy events).
+                        if any(receipt_actor != _CLOCK_RECEIPT_ACTOR_PREFIX
+                               + r["actor"] for r in new_gathers):
+                            raise ValueError("Legacy host economy gather actor mismatches receipt")
+                        if (expected_pouches is not None
+                                and any(
+                                    receipt_actor != _CLOCK_RECEIPT_ACTOR_PREFIX + actor
+                                    for actor, material in set(expected_pouches) | set(new_pouches)
+                                    if expected_pouches.get((actor, material)) !=
+                                    new_pouches.get((actor, material))
+                                )):
+                            raise ValueError("Legacy host economy pouch actor mismatches receipt")
                     expected_nodes, expected_pouches = new_nodes, new_pouches
                     # This is a post-handler *observation*, not a semantic
                     # authorization of its in-handler economic effects. The
                     # typed legacy action adapter owns that distinct proof.
-                    for gathered in db.execute("SELECT * FROM main.events WHERE kind='gather'"):
-                        if gathered["id"] not in prior_event_ids:
-                            gather_events[gathered["id"]] = tuple(gathered)
+                    for gathered in new_gathers:
+                        gather_events[gathered["id"]] = tuple(gathered)
                     expected_gathers.update(gather_events)
                 if gather_state() != expected_gathers:
                     raise ValueError("Roster gather history changed within ungranted UTC action")

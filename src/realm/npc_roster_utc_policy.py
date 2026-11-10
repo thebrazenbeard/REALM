@@ -17,7 +17,9 @@ import re
 import sqlite3
 from typing import Callable, Mapping
 
-from .clock_gameplay import _guard_connection, perform_in_transaction
+from .clock_gameplay import (
+    _ROSTER_RECEIPT_ACTOR_PREFIX, _guard_connection, perform_in_transaction,
+)
 from .crafting import Crafting
 from .engine import Engine
 from .npc_game_theory import ResourceSite
@@ -206,7 +208,7 @@ def perform_host_roster_gather_in_transaction(
         ).hexdigest()[:50]
         if db.execute(
             "SELECT 1 FROM main.action_receipts WHERE actor=? AND action_id=?",
-            (a.actor, action_id),
+            (_ROSTER_RECEIPT_ACTOR_PREFIX + a.actor, action_id),
         ).fetchone() is not None:
             raise ValueError("Roster actor receipt already exists")
         expected_actions.append((a, action_id))
@@ -227,6 +229,7 @@ def perform_host_roster_gather_in_transaction(
             response = perform_in_transaction(
                 db, engine=engine, crafting=crafting, actor=a.actor,
                 command="gather " + a.site.material, action_id=action_id,
+                receipt_origin="roster",
             )
             after_node = db.execute(
                 "SELECT remaining FROM main.gathering_nodes WHERE room_id=? AND material=?",

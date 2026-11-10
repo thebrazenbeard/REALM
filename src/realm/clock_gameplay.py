@@ -20,6 +20,11 @@ from .engine import Engine, _DIRECTIONS, _LONG_DIRECTIONS
 
 _ENGINE_ACTIONS = frozenset({"go", "take", "drop", "say"})
 _CRAFT_ACTIONS = frozenset({"gather", "craft", "build"})
+# This actor namespace is impossible for a player to join (Engine._PLAYER_RE
+# permits only letters, digits, '_' and '-'). Host receipts retain the real
+# event ID while keeping player-chosen action IDs in a different key space.
+_CLOCK_RECEIPT_ACTOR_PREFIX = "@clock:"
+_ROSTER_RECEIPT_ACTOR_PREFIX = "@roster:"
 _GATHER_EFFECT_TABLES = frozenset({
     "gathering_nodes", "material_pouches", "crafted_goods",
     "built_structures", "craft_recipes", "events", "action_receipts",
@@ -181,7 +186,8 @@ def _planned_transfer(db: sqlite3.Connection, before: dict, engine: Engine,
 
 
 def _verify_transfer_effect(db: sqlite3.Connection, before: dict, domain: dict,
-                            *, plan: tuple, actor: str, action_id: str,
+                            *, plan: tuple, actor: str, receipt_actor: str,
+                            action_id: str,
                             command: str, response: str,
                             emissions: list[tuple[int, str]]) -> None:
     """Attest typed row/event/receipt/allocator effects before UTC ACK.
@@ -204,10 +210,10 @@ def _verify_transfer_effect(db: sqlite3.Connection, before: dict, domain: dict,
                    for key, row in before["events"].items())):
         raise ValueError("Host action gameplay event history diverged")
     expected_receipts = dict(before["receipts"])
-    receipt_key = (actor, action_id)
+    receipt_key = (receipt_actor, action_id)
     if receipt_key in expected_receipts:
         raise ValueError("Host action receipt unexpectedly preexists")
-    expected_receipts[receipt_key] = (actor, action_id, command, response)
+    expected_receipts[receipt_key] = (receipt_actor, action_id, command, response)
     if after["receipts"] != expected_receipts:
         raise ValueError("Host action receipt effects diverged")
     added = [row for key, row in domain["events"].items()
@@ -291,7 +297,8 @@ def _planned_make(before: dict, actor: str, room: str, kind: str, arg: str) -> t
 
 
 def _verify_make_effect(db: sqlite3.Connection, before: dict, domain: dict,
-                        *, actor: str, room: str, verb: str, arg: str,
+                        *, actor: str, receipt_actor: str, room: str,
+                        verb: str, arg: str,
                         action_id: str, command: str, response: str,
                         emissions: list[tuple[int, str]],
                         constructions: list[tuple[int, str]]) -> None:
@@ -322,10 +329,11 @@ def _verify_make_effect(db: sqlite3.Connection, before: dict, domain: dict,
             structure_id, room, output[0], actor, constructions[0][1])
         expected_allocators["built_structures"] = structure_id
     expected["structures"] = structures
-    receipt_key = (actor, action_id)
+    receipt_key = (receipt_actor, action_id)
     if receipt_key in expected["receipts"]:
         raise ValueError("Craft/build receipt unexpectedly preexists")
-    expected["receipts"][receipt_key] = (actor, action_id, command, response)
+    expected["receipts"][receipt_key] = (
+        receipt_actor, action_id, command, response)
     if len(emissions) != (1 if valid else 0):
         raise ValueError("Craft/build gameplay event provenance diverged")
     if valid:
@@ -354,7 +362,8 @@ def _verify_make_effect(db: sqlite3.Connection, before: dict, domain: dict,
 
 def _verify_gather_effect(db: sqlite3.Connection, before: dict[str, dict],
                           domain: dict[str, dict],
-                          *, actor: str, room: str, arg: str, action_id: str,
+                          *, actor: str, receipt_actor: str, room: str,
+                          arg: str, action_id: str,
                           command: str, response: str,
                           emissions: list[tuple[int, str]]) -> None:
     """A legacy gather grants only typed stock→pouch→event→receipt deltas.
@@ -398,10 +407,10 @@ def _verify_gather_effect(db: sqlite3.Connection, before: dict[str, dict],
         raise ValueError("Gather receipt inserted an ungranted gameplay event")
     expected = {name: dict(rows) for name, rows in before.items()
                 if name not in ("other_world", "allocators")}
-    key = (actor, action_id)
+    key = (receipt_actor, action_id)
     if key in expected["receipts"]:
         raise ValueError("Gather receipt unexpectedly preexists")
-    expected["receipts"][key] = (actor, action_id, command, response)
+    expected["receipts"][key] = (receipt_actor, action_id, command, response)
     planned = _expected_gather(before["nodes"], room, arg)
     new_events = {
         event_id: row for event_id, row in after["events"].items()
@@ -448,7 +457,8 @@ def _verify_gather_effect(db: sqlite3.Connection, before: dict[str, dict],
 
 
 def _verify_say_effect(db: sqlite3.Connection, before: dict[str, dict],
-                       domain: dict[str, dict], *, actor: str, room: str,
+                       domain: dict[str, dict], *, actor: str,
+                       receipt_actor: str, room: str,
                        arg: str, action_id: str, command: str, response: str,
                        emissions: list[tuple[int, str]]) -> None:
     """A typed host `say` grants one exact speech event and one action receipt.
@@ -470,10 +480,10 @@ def _verify_say_effect(db: sqlite3.Connection, before: dict[str, dict],
             or after["events"] != domain["events"]):
         raise ValueError("Say action changed ungranted gameplay event history")
     expected_receipts = dict(before["receipts"])
-    key = (actor, action_id)
+    key = (receipt_actor, action_id)
     if key in expected_receipts:
         raise ValueError("Say receipt unexpectedly preexists")
-    expected_receipts[key] = (actor, action_id, command, response)
+    expected_receipts[key] = (receipt_actor, action_id, command, response)
     if after["receipts"] != expected_receipts:
         raise ValueError("Say action receipt effect diverged")
 
@@ -547,6 +557,7 @@ def _guard_connection(db: sqlite3.Connection, engine: Engine, crafting: Crafting
 def perform_in_transaction(
     db: sqlite3.Connection, *, engine: Engine, crafting: Crafting | None,
     actor: str, command: str, action_id: str,
+    receipt_origin: str = "clock",
 ) -> str:
     """Apply a trusted scheduled action without opening or closing a transaction.
 
@@ -563,6 +574,8 @@ def perform_in_transaction(
         raise ValueError("Command must be text")
     if not isinstance(action_id, str) or not 1 <= len(action_id) <= 128:
         raise ValueError("action_id must be a nonempty string up to 128 characters")
+    if receipt_origin not in ("clock", "roster"):
+        raise ValueError("Unknown host receipt origin")
     command = command.strip()
     verb, _, arg = command.partition(" ")
     verb, arg = verb.casefold(), arg.strip()
@@ -587,15 +600,42 @@ def perform_in_transaction(
         if player is None:
             raise ValueError("Join this REALM before issuing commands")
         actual_actor, room = player["id"], player["room_id"]
+        receipt_prefix = (_CLOCK_RECEIPT_ACTOR_PREFIX if receipt_origin == "clock"
+                          else _ROSTER_RECEIPT_ACTOR_PREFIX)
+        receipt_actor = receipt_prefix + actual_actor
+        clock_row = None
+        if receipt_origin == "clock" and db.execute(
+            "SELECT 1 FROM main.sqlite_master "
+            "WHERE type='table' AND name='clock_events'"
+        ).fetchone() is not None:
+            clock_row = db.execute(
+                "SELECT processed_utc FROM main.clock_events WHERE event_id=?",
+                (action_id,),
+            ).fetchone()
         previous = db.execute(
             "SELECT command,response FROM main.action_receipts WHERE actor=? AND action_id=?",
-            (actual_actor, action_id),
+            (receipt_actor, action_id),
         ).fetchone()
         if previous is not None:
             if previous["command"] != command:
                 raise ValueError("Action ID already used for a different command")
+            # A pending event can never have a durable *host-owned* receipt
+            # from an earlier successful tick: gameplay+receipt+UTC ACK are
+            # atomic. Reject pre-existing host receipts in this impossible
+            # state, while still allowing direct adapter idempotent replay.
+            if clock_row is not None and clock_row["processed_utc"] is None:
+                raise ValueError(
+                    "A pending clock event cannot reuse a pre-existing host receipt"
+                )
             response = previous["response"]
         else:
+            # Pre-upgrade worlds have player-keyed host receipts. The clock
+            # will never select a processed row again, but an explicit host
+            # adapter replay must not silently repeat its legacy effect.
+            if clock_row is not None and clock_row["processed_utc"] is not None:
+                raise ValueError(
+                    "Processed clock event has no host-owned receipt for replay"
+                )
             gather_before = _gather_evidence(db) if verb == "gather" else None
             make_before = (_gather_evidence(db)
                            if verb in ("craft", "build") else None)
@@ -626,29 +666,35 @@ def perform_in_transaction(
                                if transfer_before is not None else None)
             db.execute(
                 "INSERT INTO main.action_receipts(actor,action_id,command,response) VALUES(?,?,?,?)",
-                (actual_actor, action_id, command, response),
+                (receipt_actor, action_id, command, response),
             )
             if gather_before is not None:
                 _verify_gather_effect(db, gather_before, gather_domain,
                                       actor=actual_actor,
+                                      receipt_actor=receipt_actor,
                                       room=room, arg=arg, action_id=action_id,
                                       command=command, response=response,
                                       emissions=emissions)
             if make_before is not None:
                 _verify_make_effect(db, make_before, make_domain,
-                                    actor=actual_actor, room=room, verb=verb,
+                                    actor=actual_actor,
+                                    receipt_actor=receipt_actor,
+                                    room=room, verb=verb,
                                     arg=arg, action_id=action_id,
                                     command=command, response=response,
                                     emissions=emissions,
                                     constructions=constructions)
             if say_before is not None:
                 _verify_say_effect(db, say_before, say_domain,
-                                   actor=actual_actor, room=room, arg=arg,
+                                   actor=actual_actor,
+                                   receipt_actor=receipt_actor,
+                                   room=room, arg=arg,
                                    action_id=action_id, command=command,
                                    response=response, emissions=emissions)
             if transfer_before is not None:
                 _verify_transfer_effect(db, transfer_before, transfer_domain,
                                         plan=transfer_plan, actor=actual_actor,
+                                        receipt_actor=receipt_actor,
                                         action_id=action_id, command=command,
                                         response=response, emissions=emissions)
     except BaseException:

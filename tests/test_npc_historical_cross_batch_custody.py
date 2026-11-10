@@ -174,7 +174,7 @@ class HistoricalNpcCustodyTests(unittest.TestCase):
             ).fetchone())
             self.assertEqual((1,), db.execute(
                 "SELECT COUNT(*) FROM action_receipts "
-                "WHERE actor='Ada' AND action_id='z_host'"
+                "WHERE actor='@clock:Ada' AND action_id='z_host'"
             ).fetchone())
 
     def test_legacy_gather_late_clock_receipt_cannot_grant_extra_pouch(self):

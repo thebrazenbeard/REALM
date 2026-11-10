@@ -13,7 +13,7 @@ from contextlib import closing
 from dataclasses import dataclass
 from typing import Sequence
 
-from .engine import Engine
+from .engine import Engine, _DIRECTIONS, _LONG_DIRECTIONS
 from .npc_local_model import LocalChatProposer
 from .npc_scene import ResidentScene, ResidentSceneBuilder
 from .residents import ResidentController
@@ -22,6 +22,14 @@ from .residents import ResidentController
 _RECEIPT_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}\Z", re.ASCII)
 _MAX_VIEW_CHARS = 6000
 _HARD_MAX_TURNS = 8
+# Receipt keys are (actor, action_id). Player identities cannot contain '@',
+# so a bearer-authenticated player can never write this host-owned actor key
+# through Engine.act, even if the player guesses the exact schedule action ID.
+_RESIDENT_RECEIPT_PREFIX = "@resident:"
+_READ_VERBS = frozenset({
+    "look", "l", "examine", "x", "where", "location", "inventory", "inv",
+    "i", "who", "history", "listen", "help", "?", "quit", "exit",
+})
 
 
 @dataclass(frozen=True)
@@ -152,26 +160,111 @@ class ResidentTurnHost:
                 writer_guard = None
             with closing(self.engine._connect()) as db:
                 stored = db.execute(
-                    "SELECT command FROM action_receipts WHERE actor=? COLLATE NOCASE AND action_id=?",
-                    (actor, turn.action_id),
+                    "SELECT command FROM main.action_receipts WHERE actor=? AND action_id=?",
+                    (_RESIDENT_RECEIPT_PREFIX + actor, turn.action_id),
                 ).fetchone()
+                legacy = (db.execute(
+                    "SELECT 1 FROM main.action_receipts WHERE actor=? AND action_id=?",
+                    (actor, turn.action_id),
+                ).fetchone() if stored is None else None)
+            if legacy is not None:
+                # Old host receipts and player-preclaimed IDs are byte-for-byte
+                # indistinguishable. Stop before unnecessary model inference;
+                # the writer transaction below repeats this check to close
+                # a race with a player POST arriving during model inference.
+                raise ValueError(
+                    "unverified legacy/player receipt blocks resident turn; "
+                    "owner must review provenance and issue a governed new action ID"
+                )
             if stored is not None:
                 # Current host policy is still authoritative. Never replay a
                 # previously accepted command merely because receipt exists.
+                # In particular, actor-keyed *player* receipts are never
+                # admitted as evidence of a host-authorized turn.
                 proposal = {"command": stored[0]}
                 turn.controller.validate(proposal)
-                response = turn.controller.commit(
-                    proposal, action_id=turn.action_id, writer_guard=writer_guard,
-                )
-                replayed = True
             else:
                 proposal = self.proposer.propose(host_view)
-                response = turn.controller.commit(
-                    proposal, action_id=turn.action_id, writer_guard=writer_guard,
-                )
-                replayed = False
+            response, replayed = self._commit_host_turn(
+                turn.controller, actor, proposal, turn.action_id,
+                writer_guard=writer_guard,
+                require_existing=stored is not None,
+            )
             results.append(ResidentTurnResult(
                 actor=actor, action_id=turn.action_id,
                 response=response, replayed=replayed,
             ))
         return tuple(results)
+
+    def _commit_host_turn(self, controller: ResidentController, actor: str,
+                          proposal: dict, action_id: str, *, writer_guard=None,
+                          require_existing: bool = False) -> tuple[str, bool]:
+        """Atomically commit a game action and a player-unclaimable host receipt.
+
+        Engine.act opens its own SQLite transaction and writes a receipt under
+        the ordinary player actor. Calling it here would allow a client to
+        preclaim the ID and impersonate a host replay. Instead, use Engine's
+        existing command interpreter within this one BEGIN IMMEDIATE scope.
+        No historical player-keyed receipt is deleted, trusted, or rewritten:
+        old host receipts cannot be distinguished from player preclaims without
+        independently proven migration evidence.
+
+        This internal Engine._perform seam retains the present Engine.act
+        command/room transaction rules, but future outer Engine.act policies
+        (notably opt-in combat/death mutation guards) must explicitly be
+        composed here before enabling those features for resident turns.
+        """
+        if not isinstance(controller, ResidentController) or controller._engine is not self.engine:
+            raise ValueError("Resident controller must use the same host Engine")
+        if not isinstance(actor, str) or actor.casefold() != controller._resident.casefold():
+            raise ValueError("Resident controller and host actor must identify the same resident")
+        if writer_guard is not None and not callable(writer_guard):
+            raise TypeError("Host resident writer guard must be callable")
+        accepted = controller.validate(proposal)
+        command = accepted.command
+        verb, _, arg = command.partition(" ")
+        verb, arg = verb.casefold(), arg.strip()
+        if verb in _DIRECTIONS:
+            arg, verb = _DIRECTIONS[verb], "go"
+        elif verb in _LONG_DIRECTIONS:
+            arg, verb = verb, "go"
+        read_only = verb in _READ_VERBS
+        receipt_actor = _RESIDENT_RECEIPT_PREFIX + actor
+        with closing(self.engine._connect()) as db, db:
+            db.execute("BEGIN IMMEDIATE")
+            if writer_guard is not None:
+                writer_guard(db)
+            player = db.execute(
+                "SELECT id,room_id FROM main.players WHERE id=? COLLATE NOCASE", (actor,)
+            ).fetchone()
+            if player is None or player["id"] != actor:
+                raise ValueError("Host resident identity is no longer joined as expected")
+            prior = db.execute(
+                "SELECT command,response FROM main.action_receipts WHERE actor=? AND action_id=?",
+                (receipt_actor, action_id),
+            ).fetchone()
+            if prior is None and db.execute(
+                "SELECT 1 FROM main.action_receipts WHERE actor=? AND action_id=?",
+                (actor, action_id),
+            ).fetchone() is not None:
+                raise ValueError(
+                    "unverified legacy/player receipt blocks resident turn; "
+                    "owner must review provenance and issue a governed new action ID"
+                )
+            if require_existing and prior is None:
+                raise ValueError("Host turn receipt changed before its replay")
+            if prior is not None:
+                if prior["command"] != command:
+                    raise ValueError("Host action ID already used for a different command")
+                if not read_only:
+                    return prior["response"], True
+            response = self.engine._perform(db, actor, player["room_id"], verb, arg)
+            if prior is None:
+                # Observation receipts bind ID and command, never stale private
+                # room, inventory, or speech content.
+                db.execute(
+                    "INSERT INTO main.action_receipts(actor,action_id,command,response) "
+                    "VALUES(?,?,?,?)",
+                    (receipt_actor, action_id, command, "" if read_only else response),
+                )
+            return response, prior is not None

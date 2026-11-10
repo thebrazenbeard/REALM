@@ -18,7 +18,7 @@ import re
 import sqlite3
 from typing import Callable, Mapping
 
-from .clock_gameplay import perform_in_transaction
+from .clock_gameplay import _CLOCK_RECEIPT_ACTOR_PREFIX, perform_in_transaction
 from .crafting import Crafting
 from .engine import Engine
 from .npc_game_theory import (
@@ -152,8 +152,8 @@ def perform_host_npc_gather_in_transaction(
     if not main or Path(main).resolve() != engine.db_path.resolve():
         raise ValueError("NPC event connection belongs to another world")
     if db.execute(
-        "SELECT 1 FROM main.action_receipts WHERE action_id=?",
-        (event.event_id,),
+        "SELECT 1 FROM main.action_receipts WHERE actor=? AND action_id=?",
+        (_CLOCK_RECEIPT_ACTOR_PREFIX + policy.actor, event.event_id),
     ).fetchone():
         raise ValueError("Host NPC grant event ID has already executed")
     try:

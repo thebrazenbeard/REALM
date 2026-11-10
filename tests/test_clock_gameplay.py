@@ -1,16 +1,19 @@
 """Clock-driven real Engine and Crafting actions share one SQLite transaction."""
 from __future__ import annotations
 
+import json
 import sqlite3
 import sys
 import tempfile
+import threading
 import unittest
 from contextlib import closing
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from urllib import request
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
-from realm.gateway import Gateway
+from realm.gateway import Gateway, GatewayServer
 from realm.engine import Engine
 from realm.crafting import Crafting
 from realm.clock_dispatch import schedule_in_transaction
@@ -81,7 +84,8 @@ class ClockGameplayTests(unittest.TestCase):
                 "SELECT quantity FROM crafted_goods WHERE actor='BotA' AND good='blade'"
             ).fetchone()[0]
             receipts = db.execute(
-                "SELECT action_id FROM action_receipts WHERE actor='BotA' ORDER BY action_id"
+                "SELECT action_id FROM action_receipts WHERE actor='@clock:BotA' "
+                "ORDER BY action_id"
             ).fetchall()
         self.assertEqual((3, 0, 1), (remaining, pouch, good))
         self.assertEqual(["craft_1", "gather_1"], [x[0] for x in receipts])
@@ -128,6 +132,194 @@ class ClockGameplayTests(unittest.TestCase):
             ).fetchone()[0])
             self.assertEqual(1, db.execute(
                 "SELECT count(*) FROM events WHERE kind='gather'"
+            ).fetchone()[0])
+
+    def test_player_preclaimed_receipt_cannot_acknowledge_unprocessed_clock_action(self):
+        """A player-controlled action ID must not counterfeit clock execution."""
+        event_id = "preclaimed_scheduled_event"
+        command = "say scheduled " + event_id
+        self.clock.schedule(event_id, due_at=BASE, kind="trusted_game_action",
+                            payload={"actor": "BotA", "command": command})
+        self.assertEqual(
+            "You say: scheduled " + event_id,
+            self.engine.act("BotA", command, action_id=event_id),
+        )
+        self.assertEqual([event_id], [event.event_id for event in self.clock.tick(
+            BASE, lambda db, event: self._apply(
+                db, event.payload["actor"], event.payload["command"], event.event_id,
+            ))])
+        self.assertIsNotNone(self.clock.lookup(event_id).processed_at)
+        with closing(self._connection()) as db:
+            self.assertEqual(2, db.execute(
+                "SELECT COUNT(*) FROM events WHERE actor='BotA' AND kind='say' "
+                "AND payload_json LIKE ?", ('%' + event_id + '%',),
+            ).fetchone()[0])
+            self.assertEqual([("@clock:BotA", event_id), ("BotA", event_id)],
+                             [tuple(row) for row in db.execute(
+                                 "SELECT actor,action_id FROM action_receipts ORDER BY actor")])
+
+    def test_scheduling_after_player_receipt_cannot_preclaim_clock_action(self):
+        """An event created after a user receipt is just as vulnerable."""
+        event_id = "preclaimed_later_event"
+        command = "say scheduled " + event_id
+        self.assertEqual(
+            "You say: scheduled " + event_id,
+            self.engine.act("BotA", command, action_id=event_id),
+        )
+        self.clock.schedule(event_id, due_at=BASE, kind="trusted_game_action",
+                            payload={"actor": "BotA", "command": command})
+        self.assertEqual([event_id], [event.event_id for event in self.clock.tick(
+            BASE, lambda db, event: self._apply(
+                db, event.payload["actor"], event.payload["command"], event.event_id,
+            ))])
+        self.assertIsNotNone(self.clock.lookup(event_id).processed_at)
+        with closing(self._connection()) as db:
+            self.assertEqual(2, db.execute(
+                "SELECT COUNT(*) FROM events WHERE actor='BotA' AND kind='say' "
+                "AND payload_json LIKE ?", ('%' + event_id + '%',),
+            ).fetchone()[0])
+
+    def test_authenticated_http_player_can_preclaim_an_action_id_but_not_clock_effect(self):
+        """The hostile actor needs only a normal bearer and command POST."""
+        event_id = "authenticated_preclaim"
+        command = "say clock-bound text"
+        self.clock.schedule(event_id, due_at=BASE, kind="host_action",
+                            payload={"actor": "BotA", "command": command})
+        gateway = Gateway(self.path, world_id="world_first")
+        token = gateway.credentials.provision("BotA")
+        server = GatewayServer(gateway, ("http://127.0.0.1:8000",), port=0)
+        thread = threading.Thread(target=server.serve_forever,
+                                  kwargs={"poll_interval": 0.02}, daemon=True)
+        thread.start()
+        try:
+            body = json.dumps({"player": "BotA", "command": command,
+                               "action_id": event_id}).encode()
+            req = request.Request(
+                f"http://127.0.0.1:{server.server_port}/api/v1/command",
+                data=body,
+                headers={"Content-Type": "application/json",
+                         "Authorization": "Bearer " + token},
+                method="POST",
+            )
+            with request.urlopen(req, timeout=3) as response:
+                self.assertEqual(200, response.status)
+                self.assertEqual("You say: clock-bound text",
+                                 json.load(response)["text"])
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=2)
+        self.assertEqual([event_id], [event.event_id for event in self.clock.tick(
+            BASE, lambda db, event: self._apply(
+                db, event.payload["actor"], event.payload["command"], event.event_id,
+            ))])
+        self.assertIsNotNone(self.clock.lookup(event_id).processed_at)
+        with closing(self._connection()) as db:
+            self.assertEqual(2, db.execute(
+                "SELECT COUNT(*) FROM events WHERE actor='BotA' AND kind='say'"
+            ).fetchone()[0])
+
+    def test_preclaimed_gather_cannot_skip_a_second_scheduled_economic_effect(self):
+        """Receipt preclaim must not ACK a gather without due-time resource debit."""
+        event_id = "economic_preclaim"
+        command = "gather iron"
+        self.clock.schedule(event_id, due_at=BASE, kind="host_action",
+                            payload={"actor": "BotA", "command": command})
+        self.assertEqual("You gather iron x3.", self.crafting.perform(
+            "BotA", command, action_id=event_id))
+        self.assertEqual([event_id], [event.event_id for event in self.clock.tick(
+            BASE, lambda db, event: self._apply(
+                db, event.payload["actor"], event.payload["command"], event.event_id,
+            ))])
+        self.assertIsNotNone(self.clock.lookup(event_id).processed_at)
+        with closing(self._connection()) as db:
+            self.assertEqual(0, db.execute(
+                "SELECT remaining FROM gathering_nodes WHERE room_id='atrium' "
+                "AND material='iron'"
+            ).fetchone()[0])
+            self.assertEqual(6, db.execute(
+                "SELECT quantity FROM material_pouches WHERE actor='BotA' "
+                "AND material='iron'"
+            ).fetchone()[0])
+            self.assertEqual(2, db.execute(
+                "SELECT COUNT(*) FROM events WHERE kind='gather'"
+            ).fetchone()[0])
+
+    def test_colliding_player_receipt_does_not_block_other_due_clock_events(self):
+        """One user-chosen idempotency key must not stop an unrelated UTC tick."""
+        self.clock.schedule("a_preclaim", due_at=BASE, kind="host_action",
+                            payload={"actor": "BotA", "command": "say first"})
+        self.clock.schedule("z_healthy", due_at=BASE, kind="host_action",
+                            payload={"actor": "BotA", "command": "say second"})
+        self.assertEqual("You say: first", self.engine.act(
+            "BotA", "say first", action_id="a_preclaim"))
+        self.assertEqual(["a_preclaim", "z_healthy"], [event.event_id
+            for event in self.clock.tick(BASE, lambda db, event: self._apply(
+                db, event.payload["actor"], event.payload["command"], event.event_id))])
+        self.assertIsNotNone(self.clock.lookup("a_preclaim").processed_at)
+        self.assertIsNotNone(self.clock.lookup("z_healthy").processed_at)
+        with closing(self._connection()) as db:
+            self.assertEqual(3, db.execute(
+                "SELECT COUNT(*) FROM events WHERE kind='say'"
+            ).fetchone()[0])
+
+    def test_full_length_event_id_uses_private_actor_namespace_and_host_replays_safely(self):
+        """Host receipt identity does not grow past the 128-character event ID limit."""
+        event_id = "L" + "q" * 127
+        self.clock.schedule(event_id, due_at=BASE, kind="host_action",
+                            payload={"actor": "BotA", "command": "say long id"})
+        self.assertEqual([event_id], [event.event_id for event in self.clock.tick(
+            BASE, lambda db, event: self._apply(
+                db, event.payload["actor"], event.payload["command"], event.event_id))])
+        self.assertIsNotNone(self.clock.lookup(event_id).processed_at)
+        with closing(self._connection()) as db:
+            db.execute("BEGIN IMMEDIATE")
+            self.assertEqual("You say: long id",
+                             self._apply(db, "BotA", "say long id", event_id))
+            db.commit()
+            self.assertEqual(("@clock:BotA", event_id), tuple(db.execute(
+                "SELECT actor,action_id FROM action_receipts WHERE action_id=?",
+                (event_id,),
+            ).fetchone()))
+            self.assertEqual(1, db.execute(
+                "SELECT COUNT(*) FROM events WHERE kind='say'"
+            ).fetchone()[0])
+
+    def test_player_names_cannot_enter_the_clock_receipt_actor_namespace(self):
+        """No authenticated player name can select the host's receipt keyspace."""
+        for forbidden in ("@clock:BotA", "@roster:BotA"):
+            with self.subTest(forbidden=forbidden):
+                with self.assertRaises(ValueError):
+                    self.engine.join(forbidden)
+                with self.assertRaises(ValueError):
+                    self.engine.act(forbidden, "say forged", action_id="forge")
+                with self.assertRaises(ValueError):
+                    self.crafting.perform(forbidden, "gather iron", action_id="forge")
+        with closing(self._connection()) as db:
+            self.assertEqual(0, db.execute(
+                "SELECT COUNT(*) FROM action_receipts WHERE actor LIKE '@%'"
+            ).fetchone()[0])
+
+    def test_legacy_processed_event_without_host_receipt_cannot_repeat_effect(self):
+        """A post-upgrade direct retry must not duplicate a legacy ACKed action."""
+        event_id = "legacy_clock_receipt"
+        self.assertEqual("You say: legacy", self.engine.act(
+            "BotA", "say legacy", action_id=event_id))
+        self.clock.schedule(event_id, due_at=BASE, kind="host_action",
+                            payload={"actor": "BotA", "command": "say legacy"})
+        # Model a pre-upgrade durable ACK plus the historical player-keyed
+        # receipt, without running or blessing an actual legacy callback.
+        with closing(self._connection()) as db, db:
+            db.execute("UPDATE clock_events SET processed_utc=? WHERE event_id=?",
+                       (BASE.isoformat(timespec="microseconds"), event_id))
+        with closing(self._connection()) as db:
+            db.execute("BEGIN IMMEDIATE")
+            with self.assertRaisesRegex(ValueError, "Processed clock event"):
+                self._apply(db, "BotA", "say legacy", event_id)
+            db.rollback()
+        with closing(self._connection()) as db:
+            self.assertEqual(1, db.execute(
+                "SELECT COUNT(*) FROM events WHERE kind='say'"
             ).fetchone()[0])
 
     def test_fail_closed_for_foreign_world_or_missing_transaction(self):

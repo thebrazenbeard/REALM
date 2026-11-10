@@ -27,7 +27,7 @@ resident, as enforced by `Engine._room_entry_floor`. A newer departure, room
 change, missing arrival record, or departure followed by reentry prevents
 fallback to an older stay's messages. Any resulting change to room or arrival
 after scene construction is checked once before inference and **again inside
-`Engine.act`'s `BEGIN IMMEDIATE` writer transaction**, through the resident
+the resident host's `BEGIN IMMEDIATE` writer transaction**, through the resident
 controller's `writer_guard`. A stale scene fails closed, including on receipt
 replay. Commands are still validated and committed by `ResidentController`;
 the model never receives raw write authority.

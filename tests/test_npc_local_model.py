@@ -83,6 +83,14 @@ class LocalModelTests(unittest.TestCase):
             self.proposer.commit(controller, "Moss's room", action_id="moss-2")
         self.assertEqual(1, self._speech("Moss"))
 
+    def test_model_bridge_cannot_replay_player_preclaimed_host_action(self):
+        controller = ResidentController(self.engine, "Moss", allowed_verbs=frozenset({"say"}))
+        self.engine.act("Moss", "say Preclaimed", action_id="model-host-preclaim")
+        self.http.responses.append((200, _reply("say Preclaimed")))
+        with self.assertRaisesRegex(ValueError, "legacy/player receipt"):
+            self.proposer.commit(controller, "Moss's room", action_id="model-host-preclaim")
+        self.assertEqual(1, self._speech("Moss"))
+
     def test_rejects_any_remote_or_credentialed_endpoint(self):
         bad = (
             "http://example.com:9999/v1/chat/completions",

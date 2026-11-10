@@ -703,6 +703,115 @@ test("a mismatched player token never reaches a joined session", async () => {
   assert.ok(client.requests.some(({ options }) => options.headers.Authorization === "Bearer wrong-player-token"));
 });
 
+test("HTTP 200 join without an authoritative success cursor never connects", async () => {
+  const invalid = [
+    {}, { text: "Welcome" }, { cursor: null }, { cursor: true }, { cursor: -1 },
+    { cursor: 1.25 }, { cursor: "7" }, { ok: false, cursor: 7 },
+  ];
+  for (const body of invalid) {
+    const routes = [];
+    const client = instantiate({ fetchImpl: async (url) => {
+      const route = new URL(url).pathname;
+      routes.push(route);
+      const data = route === "/api/v1/health" ? { ok: true, world_id: "test-world" }
+        : route === "/api/v1/join" ? body : { text: "Should never load" };
+      return { ok: true, status: 200, json: async () => data };
+    } });
+    client.get("host-url").value = "http://localhost:8765";
+    client.get("player-name").value = "Explorer";
+    client.get("access-token").value = "secret-token";
+    await client.connect();
+    assert.equal(client.get("world-name").textContent, "Unconnected", JSON.stringify(body));
+    assert.equal(client.get("command-input").disabled, true);
+    assert.equal(client.get("access-token").value, "");
+    assert.match(client.get("connection-note").textContent, /join response/i);
+    assert.deepEqual(routes, ["/api/v1/health", "/api/v1/join"], "no post-join reads after malformed success");
+    assert.equal(client.timers.length, 0);
+  }
+});
+
+test("an inherited prototype cursor cannot turn an empty HTTP 200 join into a session", async () => {
+  const original = Object.getOwnPropertyDescriptor(Object.prototype, "cursor");
+  try {
+    Object.defineProperty(Object.prototype, "cursor", { value: 3, configurable: true });
+    const body = JSON.parse("{}");
+    assert.equal(Object.prototype.hasOwnProperty.call(body, "cursor"), false);
+    assert.equal(body.cursor, 3, "the test reproduces a polluted JSON prototype");
+    const routes = [];
+    const client = instantiate({ fetchImpl: async (url) => {
+      const route = new URL(url).pathname;
+      routes.push(route);
+      const data = route === "/api/v1/health" ? { ok: true, world_id: "test-world" }
+        : route === "/api/v1/join" ? body : { text: "Should never load" };
+      return { ok: true, status: 200, json: async () => data };
+    } });
+    client.get("host-url").value = "http://localhost:8765";
+    client.get("player-name").value = "Explorer";
+    client.get("access-token").value = "secret-token";
+    await client.connect();
+    assert.equal(client.get("world-name").textContent, "Unconnected");
+    assert.match(client.get("connection-note").textContent, /join response/i);
+    assert.deepEqual(routes, ["/api/v1/health", "/api/v1/join"]);
+  } finally {
+    if (original) Object.defineProperty(Object.prototype, "cursor", original);
+    else delete Object.prototype.cursor;
+  }
+});
+
+test("partial legacy-compatible join with a valid cursor still connects", async () => {
+  for (const accepted of [{ cursor: 3 }, { ok: true, cursor: 0 }]) {
+    const client = instantiate({ fetchImpl: async (url) => {
+      const route = new URL(url).pathname;
+      const data = route === "/api/v1/health" ? { ok: true, world_id: "test-world" }
+        : route === "/api/v1/join" ? accepted
+          : route === "/api/v1/room" ? { text: "A room" }
+            : route === "/api/v1/feed" ? { cursor: accepted.cursor, events: [] } : worldMap();
+      return { ok: true, status: 200, json: async () => data };
+    } });
+    client.get("host-url").value = "http://localhost:8765";
+    client.get("player-name").value = "Explorer";
+    client.get("access-token").value = "secret-token";
+    await client.connect();
+    assert.equal(client.get("connection-status").textContent, "Connected — receiving host state");
+    assert.ok(client.get("feed").children.some((item) =>
+      item.children[1].children[1].textContent === "Connected to host."));
+  }
+});
+
+test("late malformed join from cancelled session cannot undo a new valid join", async () => {
+  let entered, release;
+  const oldEntered = new Promise((resolve) => { entered = resolve; });
+  const oldHeld = new Promise((resolve) => { release = resolve; });
+  let joins = 0;
+  const client = instantiate({ fetchImpl: async (url) => {
+    const route = new URL(url).pathname;
+    if (route === "/api/v1/join" && ++joins === 1) {
+      entered();
+      await oldHeld;
+      return { ok: true, status: 200, json: async () => ({}) };
+    }
+    const data = route === "/api/v1/health" ? { ok: true, world_id: "new-world" }
+      : route === "/api/v1/join" ? { ok: true, cursor: 5 }
+        : route === "/api/v1/room" ? { text: "New room" }
+          : route === "/api/v1/feed" ? { events: [], cursor: 5 } : worldMap();
+    return { ok: true, status: 200, json: async () => data };
+  } });
+  client.get("host-url").value = "http://localhost:8765";
+  client.get("player-name").value = "Explorer";
+  client.get("access-token").value = "old-token";
+  const previous = client.connect();
+  await oldEntered;
+  client.disconnect();
+  client.get("access-token").value = "new-token";
+  await client.connect();
+  release();
+  await previous;
+  assert.equal(joins, 2);
+  assert.equal(client.get("world-name").textContent, "new-world");
+  assert.equal(client.get("connection-status").textContent, "Connected — receiving host state");
+  assert.equal(client.get("connection-note").classList.contains("is-error"), false);
+});
+
 test("refuses cleartext remote worlds before sending any bearer token", async () => {
   const client = instantiate();
   client.get("host-url").value = "http://remote.example:8765";
@@ -984,6 +1093,150 @@ test("HTTP 503/408 commands retain the same action ID for explicit manual retry"
     /HOST \/ RETRY/.test(item.children[1].children[0].textContent)));
 });
 
+test("an ambiguous committed command needs explicit same-ID retry after reconnect", async () => {
+  const sent = [];
+  const commits = new Set();
+  let nextId = 0;
+  const client = instantiate({ cryptoImpl: { randomUUID: () => "action-" + (++nextId) },
+    fetchImpl: async (url, options) => {
+      const route = new URL(url).pathname;
+      if (route === "/api/v1/command") {
+        const body = JSON.parse(options.body);
+        sent.push(body);
+        commits.add(body.action_id);
+        if (sent.length === 1) throw new Error("response lost after commit");
+        return { ok: true, status: 200, json: async () => ({ text: "Accepted" }) };
+      }
+      const data = route === "/api/v1/health" ? { ok: true, world_id: "world-1" }
+        : route === "/api/v1/join" ? { ok: true, cursor: 0, text: "Welcome" }
+          : route === "/api/v1/room" ? { text: "Here" }
+            : route === "/api/v1/feed" ? { cursor: 0, events: [] } : worldMap();
+      return { ok: true, status: 200, json: async () => data };
+    },
+  });
+  client.get("host-url").value = "http://127.0.0.1:8765";
+  client.get("player-name").value = "Explorer";
+  client.get("access-token").value = "first-secret";
+  await client.connect();
+  client.get("command-input").value = "say Once";
+  await client.send();
+  assert.equal(commits.size, 1);
+  client.disconnect();
+  assert.equal(client.get("access-token").value, "");
+  client.get("access-token").value = "fresh-secret";
+  await client.connect();
+  assert.equal(sent.length, 1, "reconnect must never replay automatically");
+  assert.equal(client.get("command-input").value, "say Once");
+  assert.ok(client.get("feed").children.some((item) => item.children[1].children[0].textContent === "HOST / RETRY"));
+  await client.send();
+  assert.equal(sent.length, 2);
+  assert.equal(sent[1].action_id, sent[0].action_id);
+  assert.equal(commits.size, 1, "one mutation receipt must be reused");
+});
+
+test("uncertain command identity never crosses host, world, actor, or edited text", async () => {
+  for (const changed of ["host", "world", "actor", "command"]) {
+    let world = "world-1";
+    let nextId = 0;
+    const sent = [];
+    const client = instantiate({ cryptoImpl: { randomUUID: () => "action-" + (++nextId) },
+      fetchImpl: async (url, options) => {
+        const route = new URL(url).pathname;
+        if (route === "/api/v1/command") {
+          sent.push(JSON.parse(options.body));
+          if (sent.length === 1) throw new Error("ambiguous completion");
+          return { ok: true, status: 200, json: async () => ({ text: "Accepted" }) };
+        }
+        const data = route === "/api/v1/health" ? { ok: true, world_id: world }
+          : route === "/api/v1/join" ? { ok: true, cursor: 0 }
+            : route === "/api/v1/room" ? { text: "Here" }
+              : route === "/api/v1/feed" ? { cursor: 0, events: [] } : worldMap();
+        return { ok: true, status: 200, json: async () => data };
+      },
+    });
+    client.get("host-url").value = "http://127.0.0.1:8765";
+    client.get("player-name").value = "Explorer";
+    client.get("access-token").value = "first-secret";
+    await client.connect();
+    client.get("command-input").value = "say Once";
+    await client.send();
+    client.disconnect();
+    if (changed === "host") client.get("host-url").value = "http://127.0.0.1:8766";
+    if (changed === "world") world = "world-2";
+    if (changed === "actor") client.get("player-name").value = "Another";
+    client.get("access-token").value = "fresh-secret";
+    await client.connect();
+    client.get("command-input").value = changed === "command" ? "say Edited" : "say Once";
+    await client.send();
+    assert.equal(sent.length, 2, changed);
+    assert.notEqual(sent[1].action_id, sent[0].action_id, changed);
+  }
+});
+
+test("disconnect during in-flight POST retains ID without auto-sending", async () => {
+  let entered, release;
+  const started = new Promise((resolve) => { entered = resolve; });
+  const held = new Promise((resolve) => { release = resolve; });
+  let requests = 0;
+  let sequence = 0;
+  const client = instantiate({ cryptoImpl: { randomUUID: () => "action-" + (++sequence) },
+    commandGate: () => { if (++requests === 1) { entered(); return held; } },
+  });
+  client.get("host-url").value = "http://127.0.0.1:8765";
+  client.get("player-name").value = "Explorer";
+  client.get("access-token").value = "first-secret";
+  await client.connect();
+  client.get("command-input").value = "say Maybe";
+  const oldSend = client.send();
+  await started;
+  const first = client.requests.find(({ url }) => url.endsWith("/api/v1/command"));
+  client.disconnect();
+  client.get("access-token").value = "fresh-secret";
+  await client.connect();
+  assert.equal(client.requests.filter(({ url }) => url.endsWith("/api/v1/command")).length, 1);
+  assert.equal(client.get("command-input").value, "say Maybe");
+  await client.send();
+  const posts = client.requests.filter(({ url }) => url.endsWith("/api/v1/command"));
+  assert.equal(posts.length, 2);
+  assert.equal(JSON.parse(posts[1].options.body).action_id, JSON.parse(first.options.body).action_id);
+  release();
+  await oldSend;
+  assert.equal(client.get("connection-status").textContent, "Connected — receiving host state");
+});
+
+test("malformed reconnect join cannot consume an uncertain command receipt", async () => {
+  let joinCount = 0;
+  let postCount = 0;
+  const client = instantiate({ fetchImpl: async (url) => {
+    const route = new URL(url).pathname;
+    if (route === "/api/v1/command") {
+      postCount++;
+      throw new Error("ambiguous post");
+    }
+    const data = route === "/api/v1/health" ? { ok: true, world_id: "world-1" }
+      : route === "/api/v1/join" ? (++joinCount === 2 ? {} : { ok: true, cursor: 0 })
+        : route === "/api/v1/room" ? { text: "Here" }
+          : route === "/api/v1/feed" ? { cursor: 0, events: [] } : worldMap();
+    return { ok: true, status: 200, json: async () => data };
+  } });
+  client.get("host-url").value = "http://127.0.0.1:8765";
+  client.get("player-name").value = "Explorer";
+  client.get("access-token").value = "first-secret";
+  await client.connect();
+  client.get("command-input").value = "say uncertain";
+  await client.send();
+  client.disconnect();
+  client.get("access-token").value = "fresh-secret";
+  await client.connect();
+  assert.equal(client.get("connection-status").textContent, "Offline — no world connected");
+  assert.equal(postCount, 1);
+  client.get("access-token").value = "later-secret";
+  await client.connect();
+  assert.equal(client.get("connection-status").textContent, "Connected — receiving host state");
+  assert.equal(client.get("command-input").value, "say uncertain");
+  assert.equal(postCount, 1, "failed reconnect must not auto-replay or consume pending command");
+});
+
 test("editing a failed command creates a distinct action ID", async () => {
   const sent = [];
   const client = instantiate({ fetchImpl: async (url, options) => {
@@ -1047,7 +1300,7 @@ test("duplicate Send event while a command is in flight never submits twice", as
   assert.equal(client.get("command-input").value, "");
 });
 
-test("a late 503 command response cannot alter a freshly rejoined session", async () => {
+test("a late 503 response cannot overwrite the reconnect retry intent or transcript", async () => {
   let releaseOld, reachedOld;
   const waiting = new Promise((resolve) => { reachedOld = resolve; });
   const held = new Promise((resolve) => { releaseOld = resolve; });
@@ -1074,12 +1327,16 @@ test("a late 503 command response cannot alter a freshly rejoined session", asyn
   client.disconnect();
   client.get("access-token").value = "new-token";
   await client.connect();
+  const beforeLate = client.get("feed").children.map((item) =>
+    item.children[1].children[0].textContent);
+  assert.deepEqual(beforeLate, ["HOST / JOIN", "HOST / RETRY"]);
+  assert.equal(client.get("command-input").value, "north");
   releaseOld();
   await oldSend;
   assert.equal(client.get("world-name").textContent, "rejoined-world");
-  assert.equal(client.get("command-input").value, "");
+  assert.equal(client.get("command-input").value, "north");
   assert.deepEqual(client.get("feed").children.map((item) =>
-    item.children[1].children[0].textContent), ["HOST / JOIN"]);
+    item.children[1].children[0].textContent), beforeLate);
 });
 
 const gatewayRoot = process.env.REALM_LIVE_GATEWAY_ROOT || path.join(__dirname, "../..");

@@ -52,6 +52,10 @@ class NpcUtcPolicyTests(unittest.TestCase):
                        hashlib.sha256).hexdigest()
         self.clock.schedule("npc_ada_1", due_at=BASE, kind="npc_economic_gather",
                             payload={"policy_id": "gather_ada", "world_id": "npc_world"})
+        # A normal player may preclaim even a signed event ID with a read-only
+        # command. It grants no host receipt and must not starve the UTC grant.
+        self.assertIn("Commands:", self.engine.act(
+            "Ada", "help", action_id="npc_ada_1"))
         results = []
         self.clock.tick(
             BASE, lambda db, event: results.append(
@@ -63,7 +67,9 @@ class NpcUtcPolicyTests(unittest.TestCase):
         self.assertIn("gather", results[0].response.lower())
         with closing(sqlite3.connect(self.db)) as db:
             events = db.execute("SELECT COUNT(*) FROM main.events WHERE kind='gather'").fetchone()[0]
-            receipts = db.execute("SELECT COUNT(*) FROM main.action_receipts WHERE actor='Ada'").fetchone()[0]
+            receipts = db.execute(
+                "SELECT COUNT(*) FROM main.action_receipts WHERE actor='@clock:Ada'"
+            ).fetchone()[0]
             total = db.execute("SELECT SUM(remaining) FROM main.gathering_nodes").fetchone()[0]
         self.assertEqual((events, receipts, total), (1, 1, 9))
         self.assertIsNotNone(self.clock.lookup("npc_ada_1").processed_at)
