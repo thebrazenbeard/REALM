@@ -384,53 +384,58 @@
     const session = current;
     if (!session) return;
     if (session.commandPending) return;
-    const command = ui.commandInput.value.trim();
-    if (!command) return;
-    // Acquire the per-session guard before any UI/history setter can reenter.
+    // Acquire before any command input getter or UI/history setter can reenter.
     session.commandPending = true;
-    session.commandHistory.push(command);
-    if (session.commandHistory.length > MAX_COMMAND_HISTORY) session.commandHistory.shift();
-    session.historyIndex = null;
-    session.commandDraft = "";
-    ui.send.disabled = true;
-    ui.commandInput.disabled = true;
-    const prior = session.pendingCommandRetry;
-    const actionId = prior && prior.command === command ? prior.actionId
-      : (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function"
-        ? crypto.randomUUID()
-        : "web-" + Date.now() + "-" + (++requestSerial));
     try {
-      const answer = await request(session, "/api/v1/command", { body: { player: session.player, command, action_id: actionId } });
-      if (current !== session) return;
-      session.pendingCommandRetry = null;
-      appendFeed({ category: "response", label: session.player + " / " + command, message: answer.text || "(No response)", icon: "›" });
-      ui.commandInput.value = "";
-      if (/^(quit|exit)$/i.test(command)) {
-        stopSession({ note: "Your character's last position remains saved on the host." });
-        return;
-      }
-      try { await refreshRoom(session); }
-      catch (error) {
-        if (current === session) appendFeed({ category: "error", label: "ROOM UPDATE", message: error.message, icon: "!" });
-      }
-      if (current !== session) return;
-      await poll(session);
-      if (current !== session) return;
-      await refreshMap(session, { afterCommand: true });
-    } catch (error) {
-      if (current === session) {
-        if (error.status === 503 || error.status === 408 || error.status == null) {
-          // Never auto-replay a mutating POST after an ambiguous response.
-          // A manual retry with unchanged text reuses its durable action ID.
-          session.pendingCommandRetry = { command, actionId };
-          appendFeed({
-            category: "system", label: "HOST / RETRY",
-            message: "The command response was interrupted. If you retry the same command manually, its action ID will be reused.",
-            icon: "◇",
-          });
-        } else {
-          session.pendingCommandRetry = null;
-          appendFeed({ category: "error", label: "COMMAND REJECTED", message: error.message, icon: "!" });
+      // Synchronous input/UUID/DOM setup must share the finally boundary: a
+      // thrown getter or setter must not poison the current session's latch.
+      const command = ui.commandInput.value.trim();
+      if (!command) return;
+      const prior = session.pendingCommandRetry;
+      const actionId = prior && prior.command === command ? prior.actionId
+        : (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function"
+          ? crypto.randomUUID()
+          : "web-" + Date.now() + "-" + (++requestSerial));
+      ui.send.disabled = true;
+      ui.commandInput.disabled = true;
+      // No history entry for a command that failed before reaching dispatch.
+      session.commandHistory.push(command);
+      if (session.commandHistory.length > MAX_COMMAND_HISTORY) session.commandHistory.shift();
+      session.historyIndex = null;
+      session.commandDraft = "";
+      try {
+        const answer = await request(session, "/api/v1/command", { body: { player: session.player, command, action_id: actionId } });
+        if (current !== session) return;
+        session.pendingCommandRetry = null;
+        appendFeed({ category: "response", label: session.player + " / " + command, message: answer.text || "(No response)", icon: "›" });
+        ui.commandInput.value = "";
+        if (/^(quit|exit)$/i.test(command)) {
+          stopSession({ note: "Your character's last position remains saved on the host." });
+          return;
+        }
+        try { await refreshRoom(session); }
+        catch (error) {
+          if (current === session) appendFeed({ category: "error", label: "ROOM UPDATE", message: error.message, icon: "!" });
+        }
+        if (current !== session) return;
+        await poll(session);
+        if (current !== session) return;
+        await refreshMap(session, { afterCommand: true });
+      } catch (error) {
+        if (current === session) {
+          if (error.status === 503 || error.status === 408 || error.status == null) {
+            // Never auto-replay a mutating POST after an ambiguous response.
+            // A manual retry with unchanged text reuses its durable action ID.
+            session.pendingCommandRetry = { command, actionId };
+            appendFeed({
+              category: "system", label: "HOST / RETRY",
+              message: "The command response was interrupted. If you retry the same command manually, its action ID will be reused.",
+              icon: "◇",
+            });
+          } else {
+            session.pendingCommandRetry = null;
+            appendFeed({ category: "error", label: "COMMAND REJECTED", message: error.message, icon: "!" });
+          }
         }
       }
     } finally {

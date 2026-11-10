@@ -46,7 +46,7 @@ function worldMap() {
   };
 }
 
-function instantiate({ missingMap = false, mapOnMove = false, rejectUnauthorized = false, fetchImpl = null, mapGate = null, roomGate = null, joinGate = null, healthGate = null, commandGate = null, nowMs = null } = {}) {
+function instantiate({ missingMap = false, mapOnMove = false, rejectUnauthorized = false, fetchImpl = null, mapGate = null, roomGate = null, joinGate = null, healthGate = null, commandGate = null, cryptoImpl = require("node:crypto").webcrypto, nowMs = null } = {}) {
   const elements = new Map();
   const get = (id) => {
     if (!elements.has(id)) elements.set(id, new Element());
@@ -93,7 +93,7 @@ function instantiate({ missingMap = false, mapOnMove = false, rejectUnauthorized
     document, window, URL, fetch, console,
     setInterval: (fn, delay) => { timers.push({ fn, delay }); return timers.length; },
     clearInterval: () => {},
-    crypto: require("node:crypto").webcrypto, AbortController,
+    crypto: cryptoImpl, AbortController,
     Date: nowMs ? class extends Date { static now() { return nowMs.value; } } : Date,
   }, { filename: "docs/app.js" });
   const event = { preventDefault() {} };
@@ -216,6 +216,113 @@ test("rapid duplicate command submits issue only one POST and one action ID", as
   assert.equal(typeof JSON.parse(posts[0].options.body).action_id, "string");
   assert.equal(sendButton.disabled, false);
   assert.equal(client.get("command-input").value, "");
+});
+
+test("a synchronous reentrant command value getter cannot double-submit", async () => {
+  const client = instantiate();
+  client.get("host-url").value = "http://127.0.0.1:8765";
+  client.get("player-name").value = "Explorer";
+  client.get("access-token").value = "secret-token";
+  await client.connect();
+  const input = client.get("command-input");
+  let value = "say Only once";
+  let reentered = false;
+  const nested = [];
+  Object.defineProperty(input, "value", {
+    configurable: true,
+    get() {
+      if (!reentered) {
+        reentered = true;
+        nested.push(client.send());
+      }
+      return value;
+    },
+    set(next) { value = next; },
+  });
+  await client.send();
+  await Promise.all(nested);
+  const posts = client.requests.filter(({ url }) => url.endsWith("/api/v1/command"));
+  assert.equal(posts.length, 1, "the pending latch must precede any potentially reentrant input getter");
+  assert.equal(input.value, "");
+});
+
+test("a throwing command value getter releases the pending latch for retry", async () => {
+  const client = instantiate();
+  client.get("host-url").value = "http://127.0.0.1:8765";
+  client.get("player-name").value = "Explorer";
+  client.get("access-token").value = "secret-token";
+  await client.connect();
+  const input = client.get("command-input");
+  let value = "look";
+  let failOnce = true;
+  Object.defineProperty(input, "value", {
+    configurable: true,
+    get() {
+      if (failOnce) { failOnce = false; throw new Error("synthetic value getter failure"); }
+      return value;
+    },
+    set(next) { value = next; },
+  });
+  await assert.rejects(client.send(), /synthetic value getter failure/);
+  assert.equal(client.requests.filter(({ url }) => url.endsWith("/api/v1/command")).length, 0);
+  value = "   ";
+  await client.send();
+  assert.equal(client.requests.filter(({ url }) => url.endsWith("/api/v1/command")).length, 0, "blank command is a no-op");
+  value = "look";
+  await client.send();
+  assert.equal(client.requests.filter(({ url }) => url.endsWith("/api/v1/command")).length, 1);
+  assert.equal(input.value, "");
+});
+
+test("a throwing disabled setter after latch cannot permanently block manual retry", async () => {
+  const client = instantiate();
+  client.get("host-url").value = "http://127.0.0.1:8765";
+  client.get("player-name").value = "Explorer";
+  client.get("access-token").value = "secret-token";
+  await client.connect();
+  const sendButton = client.get("send-button");
+  let disabled = sendButton.disabled;
+  let failOnce = true;
+  Object.defineProperty(sendButton, "disabled", {
+    configurable: true,
+    get: () => disabled,
+    set(next) {
+      if (next && failOnce) { failOnce = false; throw new Error("synthetic disabled setter failure"); }
+      disabled = next;
+    },
+  });
+  client.get("command-input").value = "say Recover safely";
+  await assert.rejects(client.send(), /synthetic disabled setter failure/);
+  assert.equal(client.requests.filter(({ url }) => url.endsWith("/api/v1/command")).length, 0);
+  await client.send();
+  assert.equal(client.requests.filter(({ url }) => url.endsWith("/api/v1/command")).length, 1);
+  assert.equal(sendButton.disabled, false);
+});
+
+test("a throwing UUID generator cannot poison latch or record an unsent command", async () => {
+  let failOnce = true;
+  const client = instantiate({ cryptoImpl: { randomUUID() {
+    if (failOnce) { failOnce = false; throw new Error("synthetic UUID failure"); }
+    return "unique-retry-action-id";
+  } } });
+  client.get("host-url").value = "http://127.0.0.1:8765";
+  client.get("player-name").value = "Explorer";
+  client.get("access-token").value = "secret-token";
+  await client.connect();
+  const input = client.get("command-input");
+  input.value = "say Retry after setup failure";
+  await assert.rejects(client.send(), /synthetic UUID failure/);
+  assert.equal(client.requests.filter(({ url }) => url.endsWith("/api/v1/command")).length, 0);
+  input.value = "unsent draft";
+  let prevented = false;
+  input.events.keydown({ key: "ArrowUp", preventDefault() { prevented = true; } });
+  assert.equal(prevented, false, "pre-dispatch setup failure must not enter command history");
+  assert.equal(input.value, "unsent draft");
+  input.value = "say Retry after setup failure";
+  await client.send();
+  const posts = client.requests.filter(({ url }) => url.endsWith("/api/v1/command"));
+  assert.equal(posts.length, 1);
+  assert.equal(JSON.parse(posts[0].options.body).action_id, "unique-retry-action-id");
 });
 
 test("an old pending command cannot block or change a reconnected session", async () => {
