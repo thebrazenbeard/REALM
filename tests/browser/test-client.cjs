@@ -913,6 +913,326 @@ test("malformed PvP death event never echoes a private room identifier in its ti
   assert.ok(!titles.some((title) => title.includes("secret-corridor")));
 });
 
+test("emote, OOC, and private group messages render with fixed headings and inert host text", async () => {
+  const hostText = {
+    emote: 'Moss bows beneath the moon. <img src=x onerror=alert(1)>',
+    ooc: '[OOC Channel] Fenn: Where is the tavern? <script>evil()</script>',
+    crewchat: '[The Free Company][Scout] Fenn: "The west gate is open."',
+  };
+  const responses = {
+    "/api/v1/health": { ok: true, world_id: "fantasy-world" },
+    "/api/v1/join": { ok: true, text: "Welcome", cursor: 0 },
+    "/api/v1/room": { ok: true, text: "The Atrium" },
+    "/api/v1/map": worldMap(),
+    "/api/v1/command": { ok: true, text: 'You tell your group: "North gate is open."', cursor: 13 },
+    "/api/v1/feed": { ok: true, cursor: 13, channel_revision: 1, events: [
+      { id: 11, actor: "Moss", kind: "emote", room: "private-sanctum", text: hostText.emote },
+      { id: 12, actor: "Fenn / FAKE CAPTAIN", kind: "ooc", room: "secret-ooc-routing", text: hostText.ooc },
+      { id: 13, actor: "Fenn / FAKE CAPTAIN", kind: "crewchat", room: "@group:hidden-party-id", text: hostText.crewchat,
+        group_id: "unpublished-private-membership", role: "FAKE ADMIRAL" },
+    ] },
+  };
+  const client = instantiate({ fetchImpl: async (url) => {
+    const route = new URL(url).pathname;
+    assert.ok(route in responses, "unexpected route " + route);
+    return { ok: true, status: 200, json: async () => responses[route] };
+  } });
+  client.get("host-url").value = "http://localhost:8765";
+  client.get("player-name").value = "Explorer";
+  client.get("access-token").value = "secret-token";
+  await client.connect();
+  await client.timers[0].fn();
+  const records = client.get("feed").children.filter((node) =>
+    /feed-(emote|ooc|crewchat)/.test(node.className));
+  assert.equal(records.length, 3, "all three channels should have dedicated visual categories");
+  assert.deepEqual(records.map((node) => node.children[1].children[0].textContent), [
+    "SCENE / EMOTE", "WORLD / OOC", "GROUP / PRIVATE",
+  ]);
+  assert.deepEqual(records.map((node) => node.children[1].children[1].textContent), [
+    hostText.emote, hostText.ooc, hostText.crewchat,
+  ], "only host-composed display text may become message content");
+  assert.deepEqual(records.map((node) => node.children[0].textContent), ["✧", "◉", "◆"]);
+  const headings = records.map((node) => node.children[1].children[0].textContent).join(" | ");
+  for (const secret of ["private-sanctum", "secret-ooc-routing", "@group:hidden-party-id",
+    "unpublished-private-membership", "FAKE CAPTAIN", "FAKE ADMIRAL"]) {
+    assert.ok(!headings.includes(secret), "channel headings must not disclose/echo " + secret);
+  }
+  await client.timers[0].fn();
+  assert.equal(client.get("feed").children.filter((node) =>
+    /feed-(emote|ooc|crewchat)/.test(node.className)).length, 3,
+  "repeated feed results must not duplicate prior channel events");
+  client.get("command-input").value = "crewchat North gate is open.";
+  await client.send();
+  const sent = client.get("feed").children.find((node) =>
+    node.children[1].children[1].textContent === responses["/api/v1/command"].text);
+  assert.ok(sent, "own committed private chat should be acknowledged");
+  assert.match(sent.className, /feed-crewchat/,
+    "the outgoing private response must be marked for cleanup on disconnect");
+  assert.equal(sent.children[1].children[0].textContent, "GROUP / PRIVATE");
+  client.disconnect();
+  assert.equal(client.get("feed").children.filter((node) =>
+    /feed-crewchat/.test(node.className)).length, 0,
+  "private group chat must leave the transcript on disconnect");
+});
+
+test("feed credential revocation or channel epoch conflict hides private chat immediately", async () => {
+  for (const status of [401, 403, 409]) {
+    let polls = 0;
+    const client = instantiate({ fetchImpl: async (url) => {
+      const route = new URL(url).pathname;
+      if (route === "/api/v1/feed") {
+        if (++polls > 1) return { ok: false, status, json: async () => ({ error: "Access changed" }) };
+        return { ok: true, status: 200, json: async () => ({ cursor: 2, channel_revision: 1, events: [
+          { id: 2, actor: "Fenn", kind: "crewchat", room: null,
+            text: '[The Free Company][Scout] Fenn: "Meet at dusk."' },
+        ] }) };
+      }
+      const data = route === "/api/v1/health" ? { ok: true, world_id: "group-world" }
+        : route === "/api/v1/join" ? { ok: true, cursor: 0 }
+          : route === "/api/v1/room" ? { text: "The Atrium" } : worldMap();
+      return { ok: true, status: 200, json: async () => data };
+    } });
+    client.get("host-url").value = "http://localhost:8765";
+    client.get("player-name").value = "Explorer";
+    client.get("access-token").value = "secret-token";
+    await client.connect();
+    await client.timers[0].fn();
+    assert.equal(client.get("feed").children.filter((node) => /feed-crewchat/.test(node.className)).length, 1);
+    await client.timers[0].fn();
+    assert.equal(client.get("connection-status").textContent, "Offline — no world connected",
+      `HTTP ${status} must revoke the local session on the first rejection`);
+    assert.equal(client.get("feed").children.filter((node) => /feed-crewchat/.test(node.className)).length, 0,
+      `HTTP ${status} must remove private group text from the DOM immediately`);
+    assert.equal(client.get("command-input").value, "");
+  }
+});
+
+test("authorization loss while crewchat POST is uncertain does not resurrect its private draft", async () => {
+  let entered, release;
+  const started = new Promise((resolve) => { entered = resolve; });
+  const held = new Promise((resolve) => { release = resolve; });
+  let polls = 0;
+  const posts = [];
+  const client = instantiate({ fetchImpl: async (url, options) => {
+    const route = new URL(url).pathname;
+    if (route === "/api/v1/command") {
+      posts.push(JSON.parse(options.body));
+      entered();
+      return held;
+    }
+    if (route === "/api/v1/feed") {
+      if (++polls === 2) return { ok: false, status: 409, json: async () => ({ error: "Channel membership changed" }) };
+      return { ok: true, status: 200, json: async () => ({ cursor: 0, channel_revision: polls, events: [] }) };
+    }
+    const data = route === "/api/v1/health" ? { ok: true, world_id: "group-world" }
+      : route === "/api/v1/join" ? { ok: true, cursor: 0 }
+        : route === "/api/v1/room" ? { text: "The Atrium" } : worldMap();
+    return { ok: true, status: 200, json: async () => data };
+  } });
+  client.get("host-url").value = "http://localhost:8765";
+  client.get("player-name").value = "Explorer";
+  client.get("access-token").value = "first-token";
+  await client.connect();
+  await client.timers[0].fn();
+  client.get("command-input").value = "crewchat Confidential scout report";
+  const pending = client.send();
+  await started;
+  assert.equal(posts.length, 1);
+  await client.timers[0].fn();
+  assert.equal(client.get("connection-status").textContent, "Offline — no world connected");
+  assert.equal(client.get("command-input").value, "");
+  release({ ok: true, status: 200, json: async () => ({ text: "Group message accepted" }) });
+  await pending;
+  client.get("access-token").value = "fresh-token";
+  await client.connect();
+  assert.equal(posts.length, 1, "private POST must never be automatically resent");
+  assert.equal(client.get("command-input").value, "", "authorization loss discards the private retry draft");
+  assert.ok(!client.get("feed").children.some((item) =>
+    item.children[1].children[0].textContent === "HOST / RETRY"),
+  "no private retry should be offered after roster/credential invalidation");
+});
+
+test("a changed authenticated channel revision scrubs prior private chat on an otherwise empty feed", async () => {
+  let polls = 0;
+  const client = instantiate({ fetchImpl: async (url) => {
+    const route = new URL(url).pathname;
+    if (route === "/api/v1/feed") {
+      if (++polls === 1) return { ok: true, status: 200, json: async () => ({
+        cursor: 4, channel_revision: 12, events: [
+          { id: 3, actor: "Fenn", kind: "ooc", room: null, text: "[OOC Channel] Fenn: hello" },
+          { id: 4, actor: "Fenn", kind: "crewchat", room: null,
+            text: '[The Free Company][Scout] Fenn: "Retreat before dawn."' },
+        ],
+      }) };
+      if (polls === 2) return { ok: true, status: 200, json: async () => ({
+        cursor: 4, channel_revision: 13, events: [],
+      }) };
+      return { ok: true, status: 200, json: async () => ({
+        cursor: 5, channel_revision: 13, events: [
+          { id: 5, actor: "Fenn", kind: "ooc", room: null, text: "[OOC Channel] Fenn: still here" },
+        ],
+      }) };
+    }
+    const data = route === "/api/v1/health" ? { ok: true, world_id: "group-world" }
+      : route === "/api/v1/join" ? { ok: true, cursor: 0 }
+        : route === "/api/v1/room" ? { text: "The Atrium" } : worldMap();
+    return { ok: true, status: 200, json: async () => data };
+  } });
+  client.get("host-url").value = "http://localhost:8765";
+  client.get("player-name").value = "Explorer";
+  client.get("access-token").value = "secret-token";
+  await client.connect();
+  await client.timers[0].fn();
+  assert.equal(client.get("feed").children.filter((node) => /feed-crewchat/.test(node.className)).length, 1);
+  assert.equal(client.get("feed").children.filter((node) => /feed-ooc/.test(node.className)).length, 1);
+  await client.timers[0].fn();
+  assert.equal(client.get("connection-status").textContent, "Connected — receiving host state",
+    "a normal 200 epoch change should not require disconnection");
+  assert.equal(client.get("feed").children.filter((node) => /feed-crewchat/.test(node.className)).length, 0,
+    "the host's newer permission epoch invalidates already-rendered group text");
+  assert.equal(client.get("feed").children.filter((node) => /feed-ooc/.test(node.className)).length, 1,
+    "public OOC narration survives group revocation");
+  await client.timers[0].fn();
+  assert.equal(client.get("feed").children.filter((node) => /feed-ooc/.test(node.className)).length, 2);
+});
+
+test("a private-channel revision change also scrubs command recall and late private ACK text", async () => {
+  let entered, release;
+  const started = new Promise((resolve) => { entered = resolve; });
+  const held = new Promise((resolve) => { release = resolve; });
+  let polls = 0;
+  const client = instantiate({ fetchImpl: async (url) => {
+    const route = new URL(url).pathname;
+    if (route === "/api/v1/command") { entered(); return held; }
+    if (route === "/api/v1/feed") return { ok: true, status: 200, json: async () => ({
+      cursor: 0, channel_revision: ++polls === 1 ? 4 : 5, events: [],
+    }) };
+    const data = route === "/api/v1/health" ? { ok: true, world_id: "group-world" }
+      : route === "/api/v1/join" ? { ok: true, cursor: 0 }
+        : route === "/api/v1/room" ? { text: "The Atrium" } : worldMap();
+    return { ok: true, status: 200, json: async () => data };
+  } });
+  client.get("host-url").value = "http://localhost:8765";
+  client.get("player-name").value = "Explorer";
+  client.get("access-token").value = "secret-token";
+  await client.connect();
+  await client.timers[0].fn();
+  client.get("command-input").value = "crewchat Secret rendezvous";
+  const sending = client.send();
+  await started;
+  await client.timers[0].fn();
+  assert.equal(client.get("connection-status").textContent, "Connected — receiving host state");
+  assert.equal(client.get("command-input").value, "",
+    "a changed membership must remove stale private drafts from the shared screen");
+  client.get("command-input").events.keydown({ key: "ArrowUp", preventDefault() {} });
+  assert.equal(client.get("command-input").value, "",
+    "up-arrow must not recall obsolete group membership messages");
+  release({ ok: true, status: 200, json: async () => ({ text: "Private message accepted before revocation" }) });
+  await sending;
+  assert.ok(!client.get("feed").children.some((node) =>
+    node.children[1].children[1].textContent.includes("Private message accepted")),
+  "a late pre-revocation private ACK must not resurrect a hidden group message");
+});
+
+test("a feed dropping an established channel revision cannot reintroduce private events", async () => {
+  let polls = 0;
+  const client = instantiate({ fetchImpl: async (url) => {
+    const route = new URL(url).pathname;
+    if (route === "/api/v1/feed") {
+      if (++polls === 1) return { ok: true, status: 200, json: async () => ({
+        cursor: 2, channel_revision: 7, events: [
+          { id: 2, kind: "crewchat", actor: "Fenn", room: null, text: "[Company][Scout] Fenn: old" },
+        ],
+      }) };
+      return { ok: true, status: 200, json: async () => ({
+        cursor: 3, events: [
+          { id: 3, kind: "crewchat", actor: "Fenn", room: null, text: "[Company][Scout] Fenn: unqualified" },
+        ],
+      }) };
+    }
+    const data = route === "/api/v1/health" ? { ok: true, world_id: "group-world" }
+      : route === "/api/v1/join" ? { ok: true, cursor: 0 }
+        : route === "/api/v1/room" ? { text: "The Atrium" } : worldMap();
+    return { ok: true, status: 200, json: async () => data };
+  } });
+  client.get("host-url").value = "http://localhost:8765";
+  client.get("player-name").value = "Explorer";
+  client.get("access-token").value = "secret-token";
+  await client.connect();
+  await client.timers[0].fn();
+  assert.equal(client.get("feed").children.filter((node) => /feed-crewchat/.test(node.className)).length, 1);
+  await client.timers[0].fn();
+  assert.equal(client.get("connection-status").textContent, "Offline — no world connected",
+    "a host that loses its established channel access attestation requires a fresh session");
+  assert.equal(client.get("feed").children.filter((node) => /feed-crewchat/.test(node.className)).length, 0);
+});
+
+test("private chat rejection and its room-refresh errors are scrubbed on disconnect", async () => {
+  for (const failure of ["command", "room-refresh"]) {
+    let roomCalls = 0;
+    const reflected = "crewchat Secret council meeting at midnight";
+    const client = instantiate({ fetchImpl: async (url) => {
+      const route = new URL(url).pathname;
+      if (route === "/api/v1/command") {
+        if (failure === "command") return { ok: false, status: 422,
+          json: async () => ({ error: "Rejected " + reflected }) };
+        return { ok: true, status: 200, json: async () => ({ text: "Group acknowledged" }) };
+      }
+      if (route === "/api/v1/room" && ++roomCalls > 1 && failure === "room-refresh") {
+        return { ok: false, status: 400, json: async () => ({ error: "Room update failed after " + reflected }) };
+      }
+      const data = route === "/api/v1/health" ? { ok: true, world_id: "group-world" }
+        : route === "/api/v1/join" ? { ok: true, cursor: 0 }
+          : route === "/api/v1/room" ? { text: "The Atrium" }
+            : route === "/api/v1/feed" ? { cursor: 0, channel_revision: 1, events: [] } : worldMap();
+      return { ok: true, status: 200, json: async () => data };
+    } });
+    client.get("host-url").value = "http://localhost:8765";
+    client.get("player-name").value = "Explorer";
+    client.get("access-token").value = "secret-token";
+    await client.connect();
+    client.get("command-input").value = reflected;
+    await client.send();
+    const echoes = client.get("feed").children.filter((node) =>
+      node.children[1].children[1].textContent.includes(reflected));
+    assert.ok(echoes.length, "synthetic host should reproduce a reflected private error");
+    assert.ok(echoes.every((node) => /feed-crewchat/.test(node.className)),
+      "private command errors must be marked as scrub targets");
+    client.disconnect();
+    assert.ok(!client.get("feed").children.some((node) =>
+      node.children[1].children[1].textContent.includes(reflected)),
+    "reflected private errors must not survive disconnect");
+  }
+});
+
+test("legacy public feeds stay compatible but unauthenticated crew messages require channel revision", async () => {
+  for (const privateEvent of [false, true]) {
+    const client = instantiate({ fetchImpl: async (url) => {
+      const route = new URL(url).pathname;
+      if (route === "/api/v1/feed") return { ok: true, status: 200, json: async () => ({
+        cursor: 4, events: [{ id: 4, actor: "Fenn", kind: privateEvent ? "crewchat" : "say",
+          room: privateEvent ? null : "atrium", text: privateEvent ? "[Company][Scout] Fenn: secret" : "Fenn says hello" }],
+      }) };
+      const data = route === "/api/v1/health" ? { ok: true, world_id: "legacy-world" }
+        : route === "/api/v1/join" ? { ok: true, cursor: 0 }
+          : route === "/api/v1/room" ? { text: "The Atrium" } : worldMap();
+      return { ok: true, status: 200, json: async () => data };
+    } });
+    client.get("host-url").value = "http://localhost:8765";
+    client.get("player-name").value = "Explorer";
+    client.get("access-token").value = "secret-token";
+    await client.connect();
+    await client.timers[0].fn();
+    if (privateEvent) {
+      assert.equal(client.get("connection-status").textContent, "Offline — no world connected");
+      assert.ok(!client.get("feed").children.some((node) => /feed-crewchat/.test(node.className)));
+    } else {
+      assert.equal(client.get("connection-status").textContent, "Connected — receiving host state");
+      assert.ok(client.get("feed").children.some((node) => node.children[1].children[1].textContent === "Fenn says hello"));
+    }
+  }
+});
+
 test("malformed and excessive retry intervals cannot suspend browser feed indefinitely", async () => {
   for (const [header, expectedDelay] of [["invalid", 4400], ["99999", 30000]]) {
     const clock = { value: 100000 };
@@ -1079,7 +1399,7 @@ test("repeated transport resets fail closed after four bounded feed attempts", a
   assert.equal(client.get("access-token").value, "");
 });
 
-test("malformed JSON and forbidden feed responses still fail closed without transport backoff", async () => {
+test("malformed JSON retries boundedly while forbidden feed access ends immediately", async () => {
   for (const caseName of ["malformed-json", "forbidden"]) {
     let feedCalls = 0;
     const client = instantiate({ fetchImpl: async (url) => {
@@ -1100,9 +1420,11 @@ test("malformed JSON and forbidden feed responses still fail closed without tran
     client.get("access-token").value = "synthetic-token";
     await client.connect();
     for (let i = 0; i < 3; i++) await client.timers[0].fn();
-    assert.equal(feedCalls, 3, caseName + " must not be disguised as transport backoff");
+    assert.equal(feedCalls, caseName === "forbidden" ? 1 : 3,
+      caseName + " must not be disguised as transport backoff");
     assert.equal(client.get("connection-status").textContent, "Offline — no world connected");
-    assert.match(client.get("connection-note").textContent, /polling failed repeatedly/i);
+    assert.match(client.get("connection-note").textContent,
+      caseName === "forbidden" ? /access or private channel membership changed/i : /polling failed repeatedly/i);
   }
 });
 
@@ -1190,6 +1512,53 @@ test("an ambiguous committed command needs explicit same-ID retry after reconnec
   assert.equal(sent.length, 2);
   assert.equal(sent[1].action_id, sent[0].action_id);
   assert.equal(commits.size, 1, "one mutation receipt must be reused");
+});
+
+test("uncertain crewchat retains same-actor retry custody without public DOM retention or cross-actor disclosure", async () => {
+  for (const switchActor of [false, true]) {
+    let sequence = 0;
+    const sent = [];
+    const secret = "crewchat The eastern gate is unguarded";
+    const client = instantiate({ cryptoImpl: { randomUUID: () => "chat-action-" + (++sequence) },
+      fetchImpl: async (url, options) => {
+        const route = new URL(url).pathname;
+        if (route === "/api/v1/command") {
+          sent.push(JSON.parse(options.body));
+          if (sent.length === 1) throw new Error("response lost after group message commit");
+          return { ok: true, status: 200, json: async () => ({ text: "Group message accepted" }) };
+        }
+        const data = route === "/api/v1/health" ? { ok: true, world_id: "same-world" }
+          : route === "/api/v1/join" ? { ok: true, cursor: 0, text: "Welcome" }
+            : route === "/api/v1/room" ? { text: "The Atrium" }
+              : route === "/api/v1/feed" ? { cursor: 0, events: [] } : worldMap();
+        return { ok: true, status: 200, json: async () => data };
+      },
+    });
+    client.get("host-url").value = "http://localhost:8765";
+    client.get("player-name").value = "Explorer";
+    client.get("access-token").value = "first-secret";
+    await client.connect();
+    client.get("command-input").value = secret;
+    await client.send();
+    assert.equal(sent.length, 1);
+    client.disconnect();
+    assert.equal(client.get("command-input").value, "");
+    assert.ok(!client.get("feed").children.some((node) =>
+      node.children[1].children[0].textContent.includes(secret)),
+    "failed private command must not persist in displayed headings");
+    if (switchActor) client.get("player-name").value = "Another";
+    client.get("access-token").value = "fresh-secret";
+    await client.connect();
+    assert.equal(sent.length, 1, "reconnect may never auto-repeat private speech");
+    assert.equal(client.get("command-input").value, switchActor ? "" : secret,
+      "only exactly matching actor, host and world may see an unresolved private draft");
+    client.get("command-input").value = secret;
+    await client.send();
+    assert.equal(sent.length, 2);
+    assert.equal(sent[0].action_id === sent[1].action_id, !switchActor,
+      "same-actor manual retry reuses ID; another actor receives a fresh ID");
+    assert.match(client.get("feed").children.at(-1).className, /feed-crewchat/);
+  }
 });
 
 test("uncertain command identity never crosses host, world, actor, or edited text", async () => {

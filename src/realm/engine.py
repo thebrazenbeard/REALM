@@ -202,7 +202,8 @@ class Engine:
         return "\n".join(parts)
 
     def act(self, name: str, raw_command: str, *, action_id: str | None = None,
-            writer_guard: Callable[[sqlite3.Connection], None] | None = None) -> str:
+            writer_guard: Callable[[sqlite3.Connection], None] | None = None,
+            private_channels: bool = True) -> str:
         """Perform one action atomically; optional keys make retries idempotent.
 
         Action IDs are scoped to an actor and MUST be unique per logical command.
@@ -252,7 +253,24 @@ class Engine:
             if player is None:
                 raise ValueError("Join this REALM before issuing commands")
             actor, room_id = player["id"], player["room_id"]
-            if (not read_only and verb != "say" and
+            receipt_command = command
+            if verb in {"emote", "ooc", "crewchat"} and not private_channels:
+                # A shared-token terminal has no authenticated actor. Its
+                # caller can choose any name and forge local or global speech.
+                return "Channel posting requires player-bound credentials."
+            if verb == "crewchat":
+                from .channel_roster import member_for_actor
+                member = member_for_actor(db, actor)
+                if member is None:
+                    return "No active group channel membership."
+                # This proof is re-evaluated before every cached receipt.
+                # Role changes cannot replay old role-labeled responses.
+                receipt_command = json.dumps(
+                    [command, member["world_id"], member["group_id"],
+                     member["joined_floor"], member["role"]],
+                    separators=(",", ":"),
+                )
+            if (not read_only and verb not in {"say", "emote", "ooc", "crewchat"} and
                     (verb != "pvp" or arg.casefold() == "on")):
                 from .combat import Combat
                 # Check BEFORE replay, so a receipt minted while alive cannot
@@ -265,7 +283,7 @@ class Engine:
                     (actor, action_id),
                 ).fetchone()
                 if receipt is not None:
-                    if receipt["command"] != command:
+                    if receipt["command"] != receipt_command:
                         raise ValueError("Action ID already used for a different command")
                     # A read receipt is never a standing authorization grant.
                     # Re-evaluate the room, item ownership and speech entry
@@ -278,6 +296,9 @@ class Engine:
             if verb in {"pvp", "attack"}:
                 response = self._perform(db, actor, room_id, verb, arg,
                                          action_id=action_id)
+            elif not private_channels:
+                response = self._perform(db, actor, room_id, verb, arg,
+                                         private_channels=False)
             else:
                 response = self._perform(db, actor, room_id, verb, arg)
             # A read-only action ID binds command identity, not its current
@@ -286,7 +307,7 @@ class Engine:
             if action_id is not None and receipt is None:
                 db.execute(
                     "INSERT INTO action_receipts (actor,action_id,command,response) VALUES (?,?,?,?)",
-                    (actor, action_id, command, "" if read_only else response),
+                    (actor, action_id, receipt_command, "" if read_only else response),
                 )
             return response
 
@@ -310,7 +331,8 @@ class Engine:
 
     def _perform(self, db: sqlite3.Connection, actor: str, room_id: str, verb: str,
                  arg: str, *, emissions: list[tuple[int, str]] | None = None,
-                 action_id: str | None = None) -> str:
+                 action_id: str | None = None,
+                 private_channels: bool = True) -> str:
             if verb in {"pvp", "attack"}:
                 from .combat import Combat
                 if verb == "attack" or arg.casefold() == "on":
@@ -319,7 +341,8 @@ class Engine:
                                       verb=verb, arg=arg, action_id=action_id)
             if verb not in {"quit", "exit", "look", "l", "examine", "x", "where",
                             "location", "inventory", "inv", "i", "who",
-                            "history", "listen", "help", "?", "say"}:
+                            "history", "listen", "help", "?", "say",
+                            "emote", "ooc", "crewchat"}:
                 from .combat import Combat
                 # This is the connection-aware guard for trusted adapters
                 # invoking _perform directly rather than Engine.act.
@@ -433,6 +456,29 @@ class Engine:
             if verb == "who":
                 people = db.execute("SELECT id FROM players ORDER BY id COLLATE NOCASE").fetchall()
                 return "Players who have joined this world: " + ", ".join(p[0] for p in people)
+            if verb == "emote" and not private_channels:
+                return "Channel posting requires player-bound credentials."
+            if verb in {"ooc", "crewchat"}:
+                if not private_channels:
+                    return "Channel posting requires player-bound credentials."
+                from .channel_roster import channel_room, event_text, member_for_actor
+                message = "".join(c for c in arg if c.isprintable()).strip()
+                if not message:
+                    return "Say what to the channel?"
+                if len(message) > 280:
+                    return "Messages must be 280 characters or fewer."
+                if verb == "ooc":
+                    payload = {"text": message}
+                    target = "@ooc"
+                else:
+                    member = member_for_actor(db, actor)
+                    if member is None:
+                        return "No active group channel membership."
+                    payload = {"text": message, "group_id": member["group_id"],
+                               "group_display": member["display_name"], "role": member["role"]}
+                    target = channel_room(member["group_id"])
+                self._event(db, actor, target, verb, payload, emissions=emissions)
+                return event_text(actor, verb, payload)
             if verb == "say":
                 message = "".join(c for c in arg if c.isprintable()).strip()
                 if not message:
@@ -442,21 +488,43 @@ class Engine:
                 self._event(db, actor, room_id, "say", {"text": message},
                             emissions=emissions)
                 return f"You say: {message}"
+            if verb == "emote":
+                action = "".join(c for c in arg if c.isprintable()).strip()
+                if not action:
+                    return "Emote what?"
+                if len(action) > 280:
+                    return "Emotes must be 280 characters or fewer."
+                self._event(db, actor, room_id, "emote", {"text": action},
+                            emissions=emissions)
+                return f"{actor} {action}"
             if verb in {"history", "listen"}:
+                from .channel_roster import event_text, visible_channel_events
                 if arg and (not arg.isdigit() or not 1 <= int(arg) <= 50):
                     return "Use 'history' or 'history N' (1–50)."
                 limit = int(arg) if arg else 10
                 entry_id = self._room_entry_floor(db, actor, room_id)
-                events = db.execute(
-                    "SELECT actor,kind,payload_json FROM events "
-                    "WHERE room_id=? AND id>=? ORDER BY id DESC LIMIT ?",
+                local = db.execute(
+                    "SELECT id,actor,kind,payload_json FROM events "
+                    "WHERE room_id=? AND kind NOT IN ('ooc','crewchat','chat_permission_epoch') "
+                    "AND id>=? ORDER BY id DESC LIMIT ?",
                     (room_id, entry_id, limit),
                 ).fetchall()
+                channels = visible_channel_events(
+                    db, actor, after=0, limit=limit, latest=True,
+                    include_group=private_channels,
+                )
+                events = sorted(
+                    [*local, *channels], key=lambda row: row["id"], reverse=True,
+                )[:limit]
                 items = []
                 for event in reversed(events):
                     details = json.loads(event["payload_json"])
-                    if event["kind"] == "say":
+                    if event["kind"] in {"ooc", "crewchat"}:
+                        items.append(event_text(event["actor"], event["kind"], details))
+                    elif event["kind"] == "say":
                         items.append(f"{event['actor']} said: {details['text']}")
+                    elif event["kind"] == "emote":
+                        items.append(f"{event['actor']} {details['text']}")
                     elif event["kind"] == "move":
                         items.append(f"{event['actor']} arrived from {details['from']}")
                     elif event["kind"] == "leave":
@@ -470,5 +538,5 @@ class Engine:
                         items.append(f"{event['actor']} gave {details['item']} to {details['to']}")
                 return "\n".join(items) if items else "No recorded activity here yet."
             if verb in {"help", "?"}:
-                return "Commands: look [item], examine <item> (x), go <north|south|east|west>, n/s/e/w, take <item>, drop <item>, give <item> to <player>, inventory, say <text>, listen, history [1-50], who, where, help, quit. Optional host-enabled PvP: pvp status|news|on|off, attack <player>."
+                return "Commands: look [item], examine <item> (x), go <north|south|east|west>, n/s/e/w, take <item>, drop <item>, give <item> to <player>, inventory, say <text>, emote <text>, ooc <text>, crewchat <text> (host-granted group), listen, history [1-50], who, where, help, quit. Optional host-enabled PvP: pvp status|news|on|off, attack <player>."
             return "Unknown command. Type 'help' for options."

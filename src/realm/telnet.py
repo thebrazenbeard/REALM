@@ -16,6 +16,7 @@ import socket
 import socketserver
 import sqlite3
 import threading
+from contextlib import closing
 from pathlib import Path
 from typing import Callable
 
@@ -157,6 +158,12 @@ class LocalTelnetServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
 
         return guard
 
+    def channel_access_revision(self, player: str) -> int:
+        """Read-only response-time proof for host-granted group content."""
+        from .channel_roster import channel_access_revision
+        with closing(sqlite3.connect(str(self.engine.db_path), timeout=10)) as db:
+            return channel_access_revision(db, player)
+
     def release_name(self, name: str) -> None:
         with self._join_lock:
             self._active_names.discard(name.casefold())
@@ -295,13 +302,30 @@ class LocalTelnetHandler(socketserver.BaseRequestHandler):
             if not command:
                 self._send("REALM> ")
                 continue
+            channel_revision = (
+                self.server.channel_access_revision(name)
+                if self.server.player_credentials and
+                command.partition(" ")[0].casefold() in {"history", "listen", "crewchat"}
+                else None
+            )
             try:
-                result = self.server.router.act(name, command, writer_guard=guard)
+                if self.server.player_credentials:
+                    result = self.server.router.act(name, command, writer_guard=guard)
+                else:
+                    result = self.server.router.act(
+                        name, command, writer_guard=guard, private_channels=False,
+                    )
             except PermissionError:
                 self._send("Access revoked.\n")
                 return
             except ValueError as error:
                 result = f"Command rejected: {error}"
+            if channel_revision is not None:
+                if self.server.credentials.authenticate(presented) != name:
+                    self._send("Access revoked.\n")
+                    return
+                if channel_revision != self.server.channel_access_revision(name):
+                    result = "Channel membership changed; retry command."
             self._send(f"{result}\n")
             if command.casefold() in {"quit", "exit"}:
                 return

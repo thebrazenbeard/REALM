@@ -157,6 +157,7 @@ class FeedWaitHandler(GatewayHandler):
                     self._send(401, {"ok": False, "error": "Player token revoked or rotated"})
                     return
                 try:
+                    channel_revision = self.server.gateway.channel_access_revision(principal)
                     room, entry = self._room_entry(principal)
                     # Gateway enforces the private room's arrival floor. A
                     # global PK herald uses the first world-join floor and
@@ -167,10 +168,14 @@ class FeedWaitHandler(GatewayHandler):
                     # two database reads; never deliver from a stale audience.
                     if self._room_entry(principal) != (room, entry):
                         continue
+                    if channel_revision != self.server.gateway.channel_access_revision(principal):
+                        self._send(409, {"ok": False, "error": "Channel membership changed; retry"})
+                        return
                     events = [
                         e for e in result["events"]
                         if (e["room"] == room and e["id"] >= entry)
                         or (e["room"] == "global" and e["kind"] == "pvp_death")
+                        or (e["room"] is None and e["kind"] in {"ooc", "crewchat"})
                     ]
                     result["events"] = events
                     result["cursor"] = events[-1]["id"] if events else after
@@ -180,6 +185,9 @@ class FeedWaitHandler(GatewayHandler):
                 if result["events"] or time.monotonic() >= deadline:
                     if self._principal() != principal:
                         self._send(401, {"ok": False, "error": "Player token revoked or rotated"})
+                        return
+                    if channel_revision != self.server.gateway.channel_access_revision(principal):
+                        self._send(409, {"ok": False, "error": "Channel membership changed; retry"})
                         return
                     self._send(200, result)
                     return

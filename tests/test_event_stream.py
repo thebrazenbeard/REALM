@@ -13,6 +13,7 @@ import unittest
 
 from realm.event_stream import FeedWaitServer
 from realm.gateway import Gateway
+from realm.channel_roster import ChannelRoster
 
 
 class FeedWaitTests(unittest.TestCase):
@@ -86,6 +87,60 @@ class FeedWaitTests(unittest.TestCase):
         self.assertTrue(any("synthetic hello" in e["text"] for e in b["events"]))
         self.assertTrue(all(e["id"] > after_p for e in a["events"]))
         self.assertTrue(all(e["id"] > after_v for e in b["events"]))
+
+    def test_world_ooc_and_private_group_survive_room_move_but_not_revocation(self):
+        roster = ChannelRoster(self.db, world_id="one")
+        roster.install()
+        roster.create_group("flight", "Flight")
+        roster.grant("Patrick", "flight", role="Captain")
+        self.gateway.command("Vera", "ooc Global before Patrick moved", None)
+        self.gateway.command("Patrick", "north", None)
+        self.gateway.command("Vera", "say Room-only outsider speech", None)
+        self.gateway.command("Patrick", "crewchat SECRET_FOR_FLIGHT", None)
+        for path in ("/api/v1/feed?after=0", self.url(after=0, wait_ms=0)):
+            status, body = self.send(path)
+            self.assertEqual(200, status)
+            self.assertIn("Global before Patrick moved", str(body["events"]))
+            self.assertIn("SECRET_FOR_FLIGHT", str(body["events"]))
+            self.assertNotIn("Room-only outsider speech", str(body["events"]))
+            status, outsider = self.send(path, token="Vera")
+            self.assertEqual(200, status)
+            self.assertNotIn("SECRET_FOR_FLIGHT", str(outsider["events"]))
+        roster.revoke("Patrick")
+        status, after_revoke = self.send(self.url(after=0, wait_ms=0))
+        self.assertEqual(200, status)
+        self.assertNotIn("SECRET_FOR_FLIGHT", str(after_revoke["events"]))
+
+    def test_wait_feed_response_denied_after_private_membership_revoked(self):
+        roster = ChannelRoster(self.db, world_id="one")
+        roster.install()
+        roster.create_group("flight", "Flight")
+        roster.grant("Patrick", "flight", role="Captain")
+        self.gateway.command("Patrick", "crewchat WAIT_SECRET", None)
+        built, release = threading.Event(), threading.Event()
+        self.addCleanup(release.set)
+        original = self.gateway.feed
+
+        def held_feed(*args, **kwargs):
+            result = original(*args, **kwargs)
+            built.set()
+            self.assertTrue(release.wait(5))
+            return result
+
+        self.gateway.feed = held_feed
+        response = {}
+        client = threading.Thread(target=lambda: response.setdefault(
+            "result", self.send(self.url(after=0, wait_ms=0))
+        ), daemon=True)
+        client.start()
+        self.assertTrue(built.wait(3))
+        roster.revoke("Patrick")
+        release.set()
+        client.join(timeout=6)
+        self.assertFalse(client.is_alive())
+        status, body = response["result"]
+        self.assertEqual(409, status)
+        self.assertNotIn("WAIT_SECRET", json.dumps(body))
 
     def test_player_token_cross_scope_and_origin_rejected(self):
         status, _ = self.send(self.url(player="Vera"), token="Patrick")

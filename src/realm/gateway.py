@@ -130,6 +130,41 @@ class Gateway:
 
         return check
 
+    def _legacy_writer_guard(
+        self, principal: str, token: str,
+    ) -> Callable[[sqlite3.Connection], None]:
+        """Recheck a player-bound legacy bearer inside the world writer.
+
+        The earlier HTTP authentication read is not durable permission to
+        post worldwide or group chat after the credential is revoked.
+        """
+        if (not isinstance(token, str) or not 16 <= len(token) <= 255
+                or not token.isascii()):
+            raise PermissionError("Active player bearer required")
+        digest = CredentialStore._digest(token)
+
+        def check(db: sqlite3.Connection) -> None:
+            row = db.execute(
+                "SELECT player_name FROM main.player_credentials WHERE token_digest=?",
+                (digest,),
+            ).fetchone()
+            if row is None or row[0].casefold() != principal.casefold():
+                raise PermissionError("Active player bearer required")
+
+        return check
+
+    def join_legacy_remote(self, player: str, token: str) -> dict:
+        return self.join(player, writer_guard=self._legacy_writer_guard(player, token))
+
+    def command_legacy_remote(self, player: str, command: str,
+                              action_id: str | None, token: str) -> dict:
+        # Retain the canonical Gateway.command interception seam used by the
+        # host shutdown custody tests and trusted local host extensions.
+        return self.command(
+            player, command, action_id,
+            writer_guard=self._legacy_writer_guard(player, token),
+        )
+
     def join_remote(self, player: str, token: str) -> dict:
         """HTTP-only scoped join: the final check and join share one writer."""
         if not isinstance(player, str):
@@ -372,19 +407,35 @@ class Gateway:
         finally:
             db.close()
 
-    def join(self, player: str) -> dict:
+    def channel_access_revision(self, player: str) -> int:
+        """Current host channel permission watermark for response-time checks."""
+        from .channel_roster import channel_access_revision
+        with closing(self._read()) as db:
+            return channel_access_revision(db, player)
+
+    def join(self, player: str, *,
+             writer_guard: Callable[[sqlite3.Connection], None] | None = None) -> dict:
         if not isinstance(player, str):
             raise ValueError("Player must be a string")
         # The underlying join() validates syntax and preserves the current world.
-        text = self.engine.join(player)
+        if writer_guard is None:
+            text = self.engine.join(player)
+        else:
+            text = self.engine.join(player, writer_guard=writer_guard)
         return {"ok": True, "text": text, "cursor": self.cursor()}
 
-    def command(self, player: str, command: str, action_id: str | None) -> dict:
+    def command(self, player: str, command: str, action_id: str | None, *,
+                writer_guard: Callable[[sqlite3.Connection], None] | None = None) -> dict:
         if not isinstance(player, str) or not isinstance(command, str):
             raise ValueError("Player and command must be strings")
         if len(command) > 512:
             raise ValueError("Command is too long")
-        text = self.router.act(player, command, action_id=action_id)
+        if writer_guard is None:
+            text = self.router.act(player, command, action_id=action_id)
+        else:
+            text = self.router.act(
+                player, command, action_id=action_id, writer_guard=writer_guard,
+            )
         return {"ok": True, "text": text, "cursor": self.cursor()}
 
     def room(self, player: str) -> dict:
@@ -466,6 +517,7 @@ class Gateway:
         return {"ok": True, **self.geography.snapshot_for_room(room_id)}
 
     def feed(self, player: str, after: int) -> dict:
+        from .channel_roster import event_text, visible_channel_events
         if not isinstance(player, str) or not 0 <= after <= 2**63 - 1:
             raise ValueError("Invalid player or cursor")
         db = self._read()
@@ -493,13 +545,20 @@ class Gateway:
             if (entry is None or entry["kind"] not in ("join", "move") or
                     entry["room_id"] != subject["room_id"]):
                 raise ValueError("No provable current-room arrival; feed denied")
+            from .channel_roster import channel_access_revision
+            channel_revision = channel_access_revision(db, subject["id"])
             records = db.execute(
                 "SELECT id,occurred_at,actor,room_id,kind,payload_json FROM events "
-                "WHERE room_id=? AND kind!='pvp_death' "
+                "WHERE room_id=? AND kind NOT IN "
+                "('ooc','crewchat','pvp_death','chat_permission_epoch') "
                 "AND id>? AND id>=? ORDER BY id LIMIT ?",
                 (subject["room_id"], after, entry["id"], MAX_FEED_EVENTS),
             ).fetchall()
             visible = [(row["id"], row, None) for row in records]
+            channels = visible_channel_events(
+                db, subject["id"], after=after, limit=MAX_FEED_EVENTS,
+            )
+            visible.extend((row["id"], row, None) for row in channels)
             # An opt-in PvP death is announced globally using ONLY its
             # host-authored text. Never project the combat room or raw JSON.
             installed = db.execute(
@@ -531,8 +590,12 @@ class Gateway:
                     continue
                 payload = json.loads(row["payload_json"])
                 kind = row["kind"]
-                if kind == "say":
+                if kind in {"ooc", "crewchat"}:
+                    content = event_text(row["actor"], kind, payload)
+                elif kind == "say":
                     content = f"{row['actor']}: {payload.get('text','')}"
+                elif kind == "emote":
+                    content = f"{row['actor']} {payload.get('text','')}"
                 elif kind == "join":
                     content = f"{row['actor']} entered the world."
                 elif kind == "move":
@@ -555,9 +618,18 @@ class Gateway:
                     content = f"{row['actor']} acted."
                 events.append(
                     {"id": row["id"], "kind": kind, "actor": row["actor"],
-                     "text": content, "room": row["room_id"], "at": row["occurred_at"]}
+                     "text": content,
+                     "room": None if kind in {"ooc", "crewchat"} else row["room_id"],
+                     "at": row["occurred_at"]}
                 )
-            return {"ok": True, "events": events, "cursor": events[-1]["id"] if events else after}
+            return {
+                "ok": True, "events": events,
+                "cursor": events[-1]["id"] if events else after,
+                # A client must discard previously shown crewchat on ANY
+                # changed trusted-host membership/role epoch, including a
+                # 200 response with zero new events after revocation.
+                "channel_revision": channel_revision,
+            }
         finally:
             db.close()
 
@@ -914,6 +986,10 @@ class GatewayHandler(BaseHTTPRequestHandler):
         if principal is None:
             return
         ship_response_ship_id: str | None = None
+        channel_revision = (
+            self.server.gateway.channel_access_revision(principal)
+            if path == "/api/v1/feed" else None
+        )
         try:
             if path == "/api/v1/feed":
                 if not self._player_matches(params.get("player", [None])[0], principal):
@@ -979,6 +1055,10 @@ class GatewayHandler(BaseHTTPRequestHandler):
         if self._principal() != principal:
             self._send(401, {"ok": False, "error": "Player bearer revoked or rotated"})
             return
+        if (channel_revision is not None and
+                channel_revision != self.server.gateway.channel_access_revision(principal)):
+            self._send(409, {"ok": False, "error": "Channel membership changed; retry"})
+            return
         # The history read may have succeeded under an owner entitlement that
         # has since transferred. Recheck against a new DB snapshot as close to
         # writing response bytes as practical. This does not atomically block
@@ -1034,6 +1114,17 @@ class GatewayHandler(BaseHTTPRequestHandler):
                 raise ValueError("Expected a JSON object")
             if not self._player_matches(obj.get("player"), principal):
                 return
+            # Private group responses include host-issued labels. Treat a
+            # role change, revoke, or regrant after this point as a retry,
+            # never send a stale authorized group response over the socket.
+            command = obj.get("command")
+            channel_revision = (
+                self.server.gateway.channel_access_revision(principal)
+                if path == "/api/v1/command" and isinstance(command, str)
+                and command.strip().partition(" ")[0].casefold()
+                in {"history", "listen", "crewchat", "ooc"}
+                else None
+            )
             if self.server.gateway.scoped_credentials is not None:
                 # Recheck after reading slow/streamed bodies. This reduces the
                 # revocation race, but is NOT atomic with the gameplay commit.
@@ -1056,12 +1147,14 @@ class GatewayHandler(BaseHTTPRequestHandler):
                         principal, obj.get("command"), obj.get("action_id"), presented
                     )
             elif path == "/api/v1/join":
-                result = self.server.gateway.join(principal)
+                _, _, presented = self.headers.get("Authorization", "").partition(" ")
+                result = self.server.gateway.join_legacy_remote(principal, presented)
             elif path == "/api/v1/ship/depart":
                 raise PermissionError("Scoped ship credentials are required")
             else:
-                result = self.server.gateway.command(
-                    principal, obj.get("command"), obj.get("action_id")
+                _, _, presented = self.headers.get("Authorization", "").partition(" ")
+                result = self.server.gateway.command_legacy_remote(
+                    principal, obj.get("command"), obj.get("action_id"), presented,
                 )
         except PermissionError:
             self._send(401, {"ok": False, "error": "Active scoped bearer required"})
@@ -1073,6 +1166,16 @@ class GatewayHandler(BaseHTTPRequestHandler):
             return
         except (ValueError, json.JSONDecodeError) as error:
             self._send(400, {"ok": False, "error": str(error)})
+            return
+        if channel_revision is not None:
+            if self._principal() != principal:
+                self._send(401, {"ok": False, "error": "Player bearer revoked or rotated"})
+                return
+            if channel_revision != self.server.gateway.channel_access_revision(principal):
+                self._send(409, {"ok": False, "error": "Channel membership changed; retry"})
+                return
+        if self._principal() != principal:
+            self._send(401, {"ok": False, "error": "Player bearer revoked or rotated"})
             return
         self._send(200, result)
 

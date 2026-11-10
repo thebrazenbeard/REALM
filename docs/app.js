@@ -72,6 +72,10 @@
     const nearBottom = ui.feed.scrollTop + ui.feed.clientHeight >= ui.feed.scrollHeight - 54;
     const li = document.createElement("li");
     li.className = category === "herald" ? "feed-item feed-response feed-pvp-death"
+      : category === "emote" ? "feed-item feed-system feed-emote"
+      : category === "ooc" ? "feed-item feed-system feed-ooc"
+      : category === "crewchat" ? "feed-item feed-response feed-crewchat"
+      : category === "private-error" ? "feed-item feed-error feed-crewchat"
       : "feed-item feed-" + (category === "error" ? "error" : category === "response" ? "response" : "system");
     const symbol = document.createElement("span");
     symbol.className = "feed-icon";
@@ -92,6 +96,30 @@
 
   function resetFeed() {
     ui.feed.replaceChildren();
+  }
+
+  function isPrivateCommand(command) {
+    return typeof command === "string" && /^crewchat(?:\s|$)/i.test(command);
+  }
+
+  function clearPrivateFeed() {
+    // Unlike public room/world narration, the private group's transcript
+    // must not remain on screen after its authenticated session ends.
+    ui.feed.replaceChildren(...[...ui.feed.children].filter((item) =>
+      !item.className.split(/\s+/).includes("feed-crewchat")));
+  }
+
+  function clearPrivateSessionState(session) {
+    const priorLength = session.commandHistory.length;
+    session.commandHistory = session.commandHistory.filter((command) => !isPrivateCommand(command));
+    if (session.commandHistory.length !== priorLength) session.historyIndex = null;
+    if (isPrivateCommand(session.commandDraft)) session.commandDraft = "";
+    if (isPrivateCommand(ui.commandInput.value)) ui.commandInput.value = "";
+    if (session.pendingCommandRetry && isPrivateCommand(session.pendingCommandRetry.command)) {
+      session.pendingCommandRetry = null;
+    }
+    // An in-flight POST is allowed to finish for server receipt integrity,
+    // but its response must not reappear after the permission epoch changes.
   }
 
   function normalizeEndpoint(value) {
@@ -168,7 +196,7 @@
     return Number.isSafeInteger(n) && n >= 0 ? n : fallback;
   }
 
-  function stopSession({ note } = {}) {
+  function stopSession({ note, discardPrivateRetry = false } = {}) {
     if (connecting && connecting !== current) {
       // An in-flight join may outlive a user's cancellation. Clear the token
       // and invalidate its session before any delayed response can join us.
@@ -179,7 +207,8 @@
     if (current) {
       if (connecting === current) connecting = null;
       const retry = current.pendingCommandRetry || current.inflightCommand;
-      unresolvedCommand = retry && current.worldId ? {
+      unresolvedCommand = retry && current.worldId &&
+        !(discardPrivateRetry && isPrivateCommand(retry.command)) ? {
         base: current.base, worldId: current.worldId, player: current.player,
         command: retry.command, actionId: retry.actionId,
       } : null;
@@ -194,8 +223,12 @@
       current.commandDraft = "";
       current = null;
     }
+    if (discardPrivateRetry && unresolvedCommand && isPrivateCommand(unresolvedCommand.command)) {
+      unresolvedCommand = null;
+    }
     // Drop the only DOM copy of the access token on disconnect.
     ui.accessToken.value = "";
+    clearPrivateFeed();
     setConnectionState(false);
     ui.connect.textContent = "Connect";
     ui.worldName.textContent = "Unconnected";
@@ -263,6 +296,12 @@
     if (kind === "pvp_death") {
       return { category: "herald", label: "REALM / DEATH HERALD", message, icon: "⚔" };
     }
+    // Channel membership, roles, sender identity, and visibility are governed
+    // by the host. Its preformatted message stays inert text, while headings
+    // are fixed so untrusted room/role fields cannot impersonate UI labels.
+    if (kind === "emote") return { category: "emote", label: "SCENE / EMOTE", message, icon: "✧" };
+    if (kind === "ooc") return { category: "ooc", label: "WORLD / OOC", message, icon: "◉" };
+    if (kind === "crewchat") return { category: "crewchat", label: "GROUP / PRIVATE", message, icon: "◆" };
     const room = typeof event.room === "string" ? " · " + event.room : "";
     return { category: "system", label: who + " / " + kind + room, message, icon: kind === "say" ? "✦" : "◇" };
   }
@@ -274,6 +313,26 @@
       const data = await request(session, "/api/v1/feed?player=" + encodeURIComponent(session.player) + "&after=" + session.cursor);
       if (current !== session) return;
       if (!Array.isArray(data.events)) throw new Error("Host feed response has no events array.");
+      const hasRevision = Object.prototype.hasOwnProperty.call(data, "channel_revision");
+      if (hasRevision && (!Number.isSafeInteger(data.channel_revision) || data.channel_revision < 0)) {
+        stopSession({ note: "The host returned an invalid channel permission revision; disconnected.", discardPrivateRetry: true });
+        return;
+      }
+      if (session.channelRevision !== null && !hasRevision) {
+        stopSession({ note: "The host stopped attesting private channel access; disconnected.", discardPrivateRetry: true });
+        return;
+      }
+      if (!hasRevision && data.events.some((event) => event && event.kind === "crewchat")) {
+        // Legacy public-only hosts omit this field; accepting a purported
+        // private event without an epoch leaves no revocation witness.
+        stopSession({ note: "The host did not attest private channel access; disconnected.", discardPrivateRetry: true });
+        return;
+      }
+      if (session.channelRevision !== null && data.channel_revision !== session.channelRevision) {
+        clearPrivateFeed();
+        clearPrivateSessionState(session);
+      }
+      session.channelRevision = hasRevision ? data.channel_revision : null;
       for (const event of data.events) {
         const id = parseCursor(event.id, -1);
         if (id <= session.cursor) continue;
@@ -289,6 +348,10 @@
       if (Date.now() - session.mapUpdated > 12000) await refreshMap(session);
     } catch (error) {
       if (current !== session) return;
+      if ([401, 403, 409].includes(error.status)) {
+        stopSession({ note: "Host access or private channel membership changed; disconnected.", discardPrivateRetry: true });
+        return;
+      }
       if (error.status === 429) {
         session.overloadFailures = 0;
         session.overloaded = false;
@@ -354,6 +417,7 @@
     setNote("Contacting the host…");
     const session = { base, token, player, abortController: new AbortController(), cursor: 0, polling: false, failures: 0,
       throttled: false, overloaded: false, overloadFailures: 0, pollPauseUntil: 0, roomRevision: 0,
+      channelRevision: null,
       commandPending: false, pendingCommandRetry: null, inflightCommand: null,
       commandHistory: [], historyIndex: null, commandDraft: "",
       mapUnsupported: false, mapPolling: false, mapRefreshPending: false, mapUpdated: 0, timer: null };
@@ -434,6 +498,8 @@
       // thrown getter or setter must not poison the current session's latch.
       const command = ui.commandInput.value.trim();
       if (!command) return;
+      const privateChat = isPrivateCommand(command);
+      const commandRevision = session.channelRevision;
       const prior = session.pendingCommandRetry;
       const actionId = prior && prior.command === command ? prior.actionId
         : (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function"
@@ -453,7 +519,13 @@
         if (current !== session) return;
         session.inflightCommand = null;
         session.pendingCommandRetry = null;
-        appendFeed({ category: "response", label: session.player + " / " + command, message: answer.text || "(No response)", icon: "›" });
+        if (privateChat && commandRevision !== session.channelRevision) {
+          appendFeed({ label: "HOST / GROUP CHANGED", message: "Private channel access changed while the command was in flight; its response was hidden.", icon: "◇" });
+        } else {
+          appendFeed(privateChat
+            ? { category: "crewchat", label: "GROUP / PRIVATE", message: answer.text || "(No response)", icon: "◆" }
+            : { category: "response", label: session.player + " / " + command, message: answer.text || "(No response)", icon: "›" });
+        }
         ui.commandInput.value = "";
         if (/^(quit|exit)$/i.test(command)) {
           stopSession({ note: "Your character's last position remains saved on the host." });
@@ -461,7 +533,8 @@
         }
         try { await refreshRoom(session); }
         catch (error) {
-          if (current === session) appendFeed({ category: "error", label: "ROOM UPDATE", message: error.message, icon: "!" });
+          if (current === session) appendFeed({ category: privateChat ? "private-error" : "error",
+            label: privateChat ? "GROUP / ROOM UPDATE" : "ROOM UPDATE", message: error.message, icon: "!" });
         }
         if (current !== session) return;
         await poll(session);
@@ -469,6 +542,11 @@
         await refreshMap(session, { afterCommand: true });
       } catch (error) {
         if (current === session) {
+          if (privateChat && commandRevision !== session.channelRevision) {
+            session.pendingCommandRetry = null;
+            appendFeed({ label: "HOST / GROUP CHANGED", message: "A private command's outcome is uncertain after channel access changed. Do not submit it again without checking with the host.", icon: "◇" });
+            return;
+          }
           if (error.status === 503 || error.status === 408 || error.status == null) {
             // Never auto-replay a mutating POST after an ambiguous response.
             // A manual retry with unchanged text reuses its durable action ID.
@@ -480,7 +558,8 @@
             });
           } else {
             session.pendingCommandRetry = null;
-            appendFeed({ category: "error", label: "COMMAND REJECTED", message: error.message, icon: "!" });
+            appendFeed({ category: privateChat ? "private-error" : "error",
+              label: privateChat ? "GROUP / COMMAND REJECTED" : "COMMAND REJECTED", message: error.message, icon: "!" });
           }
         }
       }

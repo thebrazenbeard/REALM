@@ -20,14 +20,20 @@ class CommandRouter:
         self.crafting = Crafting(engine.db_path)
 
     def act(self, player: str, command: str, *, action_id: str | None = None,
-            writer_guard: Callable[[sqlite3.Connection], None] | None = None) -> str:
+            writer_guard: Callable[[sqlite3.Connection], None] | None = None,
+            private_channels: bool = True) -> str:
         result = self.crafting.perform(
             player, command, action_id=action_id, writer_guard=writer_guard
         )
         if result is not None:
             return result
+        if private_channels:
+            return self.engine.act(
+                player, command, action_id=action_id, writer_guard=writer_guard,
+            )
         return self.engine.act(
-            player, command, action_id=action_id, writer_guard=writer_guard
+            player, command, action_id=action_id, writer_guard=writer_guard,
+            private_channels=False,
         )
 
     def seed_demo_crafting(self) -> None:
