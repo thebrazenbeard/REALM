@@ -9,11 +9,14 @@ import tempfile
 import threading
 import time
 import unittest
+from http.server import BaseHTTPRequestHandler
 from pathlib import Path
+from types import SimpleNamespace
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from realm.gateway import Gateway, GatewayServer
+from realm.gateway import Gateway, GatewayHandler, GatewayServer
 
 
 class GatewayHeaderDeadlineTests(unittest.TestCase):
@@ -27,6 +30,7 @@ class GatewayHeaderDeadlineTests(unittest.TestCase):
             socket_idle_timeout_seconds=1.1, body_deadline_seconds=1.0,
             header_deadline_seconds=0.3,
         )
+        self.unhandled_errors = []
         thread = threading.Thread(
             target=self.server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True,
         )
@@ -74,6 +78,7 @@ class GatewayHeaderDeadlineTests(unittest.TestCase):
         self.fail(f"Expected HTTP {wanted}; observed {observed!r}")
 
     def test_slow_request_line_reclaims_worker_before_socket_idle_timeout(self):
+        self.server.handle_error = lambda request, address: self.unhandled_errors.append(sys.exc_info()[1])
         slow = self._connect()
         slow.sendall(b"GET /api/v1/health HTTP/1.1")
         self._eventual_status(503, seconds=0.18)
@@ -86,8 +91,10 @@ class GatewayHeaderDeadlineTests(unittest.TestCase):
                 break
         self._eventual_status(200, seconds=0.35)
         self.assertLess(time.monotonic() - beginning, 0.9)
+        self.assertEqual([], self.unhandled_errors, "Deadline abort escaped into request worker")
 
     def test_slow_header_line_cannot_extend_absolute_deadline(self):
+        self.server.handle_error = lambda request, address: self.unhandled_errors.append(sys.exc_info()[1])
         slow = self._connect()
         slow.sendall(b"GET /api/v1/health HTTP/1.1\r\nHost: 127.0.0.1\r\nX-Trickle: ")
         self._eventual_status(503, seconds=0.18)
@@ -98,6 +105,64 @@ class GatewayHeaderDeadlineTests(unittest.TestCase):
             except OSError:
                 break
         self._eventual_status(200, seconds=0.35)
+        self.assertEqual([], self.unhandled_errors, "Deadline abort escaped into request worker")
+
+    def test_only_expired_header_deadline_quiets_windows_read_abort(self):
+        """An ordinary worker error with the same WinError must remain visible."""
+
+        def run_simulated(error, *, expired):
+            handler = object.__new__(GatewayHandler)
+            handler.rfile = SimpleNamespace(peek=lambda amount: b"G")
+            handler.server = SimpleNamespace(header_deadline_seconds=30.0)
+            handler.close_connection = False
+
+            def request_read(value):
+                if expired:
+                    with value._header_guard_lock:
+                        value._header_guard_timed_out = True
+                        value._header_guard_pending = False
+                raise error
+
+            with mock.patch.object(BaseHTTPRequestHandler, "handle_one_request", request_read):
+                GatewayHandler.handle_one_request(handler)
+            return handler
+
+        def win_abort(code):
+            error = ConnectionAbortedError(code, "synthetic Windows socket read abort")
+            error.winerror = code
+            return error
+
+        handler = run_simulated(win_abort(10053), expired=True)
+        self.assertTrue(handler.close_connection)
+
+        with self.assertRaises(ConnectionAbortedError):
+            run_simulated(win_abort(10053), expired=False)
+        with self.assertRaises(ConnectionAbortedError):
+            run_simulated(win_abort(10054), expired=True)
+        with self.assertRaises(RuntimeError):
+            run_simulated(RuntimeError("application worker failed"), expired=True)
+
+    def test_stale_keepalive_timer_cannot_expire_next_header_guard(self):
+        """A canceled timer callback must not borrow the next request's state."""
+        handler = object.__new__(GatewayHandler)
+        handler.connection = SimpleNamespace(shutdown=mock.Mock())
+        handler._header_guard_lock = threading.Lock()
+        stale_token = object()
+        current_token = object()
+        handler._header_guard_token = current_token
+        handler._header_guard_pending = True
+        handler._header_guard_timed_out = False
+
+        handler._expire_incomplete_headers(stale_token)
+
+        self.assertTrue(handler._header_guard_pending)
+        self.assertFalse(handler._header_guard_timed_out)
+        handler.connection.shutdown.assert_not_called()
+
+        handler._expire_incomplete_headers(current_token)
+        self.assertFalse(handler._header_guard_pending)
+        self.assertTrue(handler._header_guard_timed_out)
+        handler.connection.shutdown.assert_called_once_with(socket.SHUT_RD)
 
     def test_truncated_headers_at_deadline_never_dispatch_health(self):
         client = self._connect()

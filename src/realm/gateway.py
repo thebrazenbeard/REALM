@@ -688,7 +688,7 @@ class GatewayHandler(BaseHTTPRequestHandler):
     server: GatewayServer
     protocol_version = "HTTP/1.1"
 
-    def _expire_incomplete_headers(self) -> None:
+    def _expire_incomplete_headers(self, guard_token: object) -> None:
         """Interrupt a slow-trickled request before it consumes a worker forever.
 
         BaseHTTPRequestHandler's buffered readline() uses an inactivity socket
@@ -696,9 +696,13 @@ class GatewayHandler(BaseHTTPRequestHandler):
         the request line/header parser alive indefinitely. A bounded watchdog
         is needed while stdlib owns that parser. The worker semaphore already
         bounds the number of simultaneous watchdog threads.
+
+        Timer.cancel() does not wait for an in-flight callback; the token
+        prevents a previous keep-alive request's callback from expiring this
+        handler's next request.
         """
         with self._header_guard_lock:
-            if not self._header_guard_pending:
+            if guard_token is not self._header_guard_token or not self._header_guard_pending:
                 return
             self._header_guard_pending = False
             self._header_guard_timed_out = True
@@ -726,16 +730,30 @@ class GatewayHandler(BaseHTTPRequestHandler):
             self.close_connection = True
             return
 
-        self._header_guard_lock = threading.Lock()
-        self._header_guard_pending = True
-        self._header_guard_timed_out = False
+        if not hasattr(self, "_header_guard_lock"):
+            self._header_guard_lock = threading.Lock()
+        with self._header_guard_lock:
+            self._header_guard_pending = True
+            self._header_guard_timed_out = False
+            self._header_guard_token = object()
+            guard_token = self._header_guard_token
         self._header_guard_timer = threading.Timer(
             self.server.header_deadline_seconds, self._expire_incomplete_headers,
+            args=(guard_token,),
         )
         self._header_guard_timer.daemon = True
         self._header_guard_timer.start()
         try:
             super().handle_one_request()
+        except ConnectionAbortedError as error:
+            # Windows shutdown(SHUT_RD) aborts a blocked header readline with
+            # WinError 10053; POSIX ordinarily exposes EOF. Never silence an
+            # unrelated socket or application failure, even on Windows.
+            with self._header_guard_lock:
+                expired = self._header_guard_timed_out
+            if not expired or getattr(error, "winerror", None) != 10053:
+                raise
+            self.close_connection = True
         finally:
             self._finish_header_guard()
 
