@@ -8,8 +8,9 @@ proposal cannot choose an actor or bypass the Engine's transactions.
 
 from __future__ import annotations
 
+import sqlite3
 from dataclasses import dataclass
-from typing import Mapping
+from typing import Callable, Mapping
 
 from .engine import Engine
 
@@ -80,9 +81,17 @@ class ResidentController:
             raise ValueError("Resident speech must contain 1–280 characters")
         return parsed
 
-    def commit(self, proposal: Mapping[str, object], *, action_id: str) -> str:
+    def commit(
+        self, proposal: Mapping[str, object], *, action_id: str,
+        writer_guard: Callable[[sqlite3.Connection], None] | None = None,
+    ) -> str:
         """PROPOSE → host VALIDATE → Engine COMMIT with host-owned receipt ID."""
         if not isinstance(action_id, str) or not 1 <= len(action_id) <= 128:
             raise ValueError("Host action ID must contain 1–128 characters")
+        if writer_guard is not None and not callable(writer_guard):
+            raise TypeError("Resident writer_guard must be callable")
         accepted = self.validate(proposal)
-        return self._engine.act(self._resident, accepted.command, action_id=action_id)
+        return self._engine.act(
+            self._resident, accepted.command, action_id=action_id,
+            writer_guard=writer_guard,
+        )

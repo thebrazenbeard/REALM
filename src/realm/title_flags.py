@@ -90,6 +90,26 @@ def _ship_owner(db: sqlite3.Connection, ship_id: str) -> str | None:
     return row[0] if row is not None else None
 
 
+def _roster_match(
+    db: sqlite3.Connection, ship_id: str, owner: str, officer: str,
+) -> bool | None:
+    """Tri-state role check: None means opt-in roster schema is not installed.
+
+    Once a world installs the authoritative crew ledger, a signed legacy
+    display grant must no longer bypass its revocation state.
+    """
+    installed = db.execute(
+        "SELECT 1 FROM main.sqlite_master WHERE type='table' AND name='crew_role_state'"
+    ).fetchone()
+    if installed is None:
+        return None
+    return db.execute(
+        "SELECT 1 FROM main.crew_role_state "
+        "WHERE ship_id=? AND owner=? AND officer=?",
+        (ship_id, owner, officer),
+    ).fetchone() is not None
+
+
 def _signature(signing_key: bytes, grant: OfficerGrant) -> str:
     payload = json.dumps(
         (grant.world_id, grant.ship_id, grant.owner, grant.actor,
@@ -126,6 +146,8 @@ def issue_first_officer_grant(
     # Only existing, joined owner identities can anchor a crew label.
     if _canonical_player(db, owner) != owner:
         raise PermissionError("Ship owner is not a joined canonical principal")
+    if _roster_match(db, ship_id, owner, player) is False:
+        raise PermissionError("Officer is not currently appointed in the crew ledger")
     candidate = OfficerGrant(
         world_id=world_id, ship_id=ship_id, owner=owner,
         actor=player, role=_ROLE_FIRST_OFFICER,
@@ -161,6 +183,10 @@ def ship_display_name(
         return player
     if owner == player:
         return f"Capt. {player}"
+    if _roster_match(db, ship_id, owner, player) is False:
+        # An installed crew ledger supersedes prior host-signed display
+        # grants, including after a revoke or owner-change invalidation.
+        return player
     if (
         not isinstance(officer_grant, OfficerGrant)
         or not _key_valid(signing_key)
@@ -184,3 +210,29 @@ def ship_display_name(
     if not hmac.compare_digest(expected, officer_grant.signature):
         return player
     return f"First Officer {player}"
+
+
+def ship_roster_display_name(
+    db: sqlite3.Connection, *, actor: str, ship_id: str, world_id: str,
+) -> str:
+    """Render captain/first-officer labels from the current, installed ledger.
+
+    This is a read-only *presentation* seam. It cannot grant gameplay rights,
+    and clients must not choose the actor passed by an authenticated host.
+    Legacy signed-grant rendering remains in ship_display_name until a host
+    opts into the crew ledger; it cannot bypass the ledger once installed.
+    """
+    _check_identifiers(actor, ship_id, world_id)
+    player = _canonical_player(db, actor)
+    if player is None:
+        return actor
+    if not _bound_world(db, world_id):
+        return player
+    owner = _ship_owner(db, ship_id)
+    if owner is None:
+        return player
+    if owner == player:
+        return f"Capt. {player}"
+    if _roster_match(db, ship_id, owner, player) is True:
+        return f"First Officer {player}"
+    return player

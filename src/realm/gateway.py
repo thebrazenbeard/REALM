@@ -36,6 +36,7 @@ DEFAULT_RATE_MAX_PRINCIPALS = 256
 DEFAULT_MAX_ACTIVE_REQUESTS = 32
 DEFAULT_SOCKET_IDLE_TIMEOUT_SECONDS = 15.0
 DEFAULT_BODY_DEADLINE_SECONDS = 10.0
+DEFAULT_HEADER_DEADLINE_SECONDS = 10.0
 _WORLD_ID = re.compile(r"^[A-Za-z][A-Za-z0-9_-]{0,63}$")
 _GEOGRAPHY_COLUMNS = {
     "geo_places": frozenset(("id", "name", "kind", "parent_id", "x", "y")),
@@ -231,6 +232,32 @@ class Gateway:
             ]
         return {"ok": True, "world_id": self.world_id, "ship_id": ship_id,
                 "events": events, "cursor": events[-1]["id"] if events else after}
+
+    def ship_owner_response_current(self, principal: str, ship_id: str) -> bool:
+        """Fresh, read-only owner proof for an already-authorized HTTP result.
+
+        The history query's earlier ownership snapshot is insufficient when
+        ownership can transfer before its response leaves this process. The
+        handler separately revalidates the credential before calling here.
+        """
+        with closing(self._read()) as db:
+            db.execute("BEGIN")
+            world = db.execute(
+                "SELECT value FROM main.world_meta WHERE key='world_id'"
+            ).fetchone()
+            if world is None or world[0] != self.world_id:
+                raise PermissionError("Ship world identity is not current")
+            joined = db.execute(
+                "SELECT 1 FROM main.players WHERE id=? COLLATE NOCASE", (principal,)
+            ).fetchone()
+            if joined is None or not self._schema_shape_ready(
+                    db, _GEOGRAPHY_COLUMNS, _GEOGRAPHY_INDEXES):
+                return False
+            owner = db.execute(
+                "SELECT owner FROM main.geo_ships WHERE id=?", (ship_id,)
+            ).fetchone()
+            return owner is not None and owner["owner"] == principal
+
     @property
     def router(self) -> CommandRouter:
         """Install optional crafting dispatch on first command use."""
@@ -523,6 +550,7 @@ class GatewayServer(ThreadingHTTPServer):
         max_active_requests: int = DEFAULT_MAX_ACTIVE_REQUESTS,
         socket_idle_timeout_seconds: float = DEFAULT_SOCKET_IDLE_TIMEOUT_SECONDS,
         body_deadline_seconds: float = DEFAULT_BODY_DEADLINE_SECONDS,
+        header_deadline_seconds: float = DEFAULT_HEADER_DEADLINE_SECONDS,
     ):
         # No process-wide token or 0.0.0.0 bind option: gameplay uses
         # independent per-player credentials provisioned by the host.
@@ -537,12 +565,14 @@ class GatewayServer(ThreadingHTTPServer):
         for value, label in (
             (socket_idle_timeout_seconds, "socket_idle_timeout_seconds"),
             (body_deadline_seconds, "body_deadline_seconds"),
+            (header_deadline_seconds, "header_deadline_seconds"),
         ):
             if (type(value) not in (int, float)
                     or not math.isfinite(value) or not 0 < value <= 120):
                 raise ValueError(f"{label} must be finite in (0, 120] seconds")
         self.socket_idle_timeout_seconds = float(socket_idle_timeout_seconds)
         self.body_deadline_seconds = float(body_deadline_seconds)
+        self.header_deadline_seconds = float(header_deadline_seconds)
         # Bound *all* accepted workers, including unauthenticated requests
         # and clients that never finish headers. Per-principal buckets alone
         # cannot protect thread creation and incomplete POST bodies.
@@ -595,6 +625,68 @@ class GatewayServer(ThreadingHTTPServer):
 class GatewayHandler(BaseHTTPRequestHandler):
     server: GatewayServer
     protocol_version = "HTTP/1.1"
+
+    def _expire_incomplete_headers(self) -> None:
+        """Interrupt a slow-trickled request before it consumes a worker forever.
+
+        BaseHTTPRequestHandler's buffered readline() uses an inactivity socket
+        timeout; a peer sending one byte before each timeout can otherwise keep
+        the request line/header parser alive indefinitely. A bounded watchdog
+        is needed while stdlib owns that parser. The worker semaphore already
+        bounds the number of simultaneous watchdog threads.
+        """
+        with self._header_guard_lock:
+            if not self._header_guard_pending:
+                return
+            self._header_guard_pending = False
+            self._header_guard_timed_out = True
+        try:
+            self.connection.shutdown(socket.SHUT_RD)
+        except OSError:
+            pass
+
+    def _finish_header_guard(self) -> bool:
+        with self._header_guard_lock:
+            self._header_guard_pending = False
+            expired = self._header_guard_timed_out
+        self._header_guard_timer.cancel()
+        return expired
+
+    def handle_one_request(self) -> None:
+        # Do not count idle keep-alive time as header parsing time. peek()
+        # waits for the first byte under the existing socket inactivity
+        # timeout, preserving pipeline-buffered bytes and regular reuse.
+        try:
+            if not self.rfile.peek(1):
+                self.close_connection = True
+                return
+        except OSError:
+            self.close_connection = True
+            return
+
+        self._header_guard_lock = threading.Lock()
+        self._header_guard_pending = True
+        self._header_guard_timed_out = False
+        self._header_guard_timer = threading.Timer(
+            self.server.header_deadline_seconds, self._expire_incomplete_headers,
+        )
+        self._header_guard_timer.daemon = True
+        self._header_guard_timer.start()
+        try:
+            super().handle_one_request()
+        finally:
+            self._finish_header_guard()
+
+    def parse_request(self) -> bool:
+        # A shutdown at the deadline can make a truncated header look like
+        # EOF to http.client.parse_headers. Never dispatch an action based on
+        # that partial parse, even if the stdlib parser returned True.
+        parsed = super().parse_request()
+        expired = self._finish_header_guard()
+        if expired:
+            self.close_connection = True
+            return False
+        return parsed
 
     def log_message(self, format: str, *args: object) -> None:
         # Avoid dumping authorization headers, player messages, and request URLs.
@@ -732,6 +824,7 @@ class GatewayHandler(BaseHTTPRequestHandler):
         principal = self._gate()
         if principal is None:
             return
+        ship_response_ship_id: str | None = None
         try:
             if path == "/api/v1/feed":
                 if not self._player_matches(params.get("player", [None])[0], principal):
@@ -764,6 +857,7 @@ class GatewayHandler(BaseHTTPRequestHandler):
                 result = self.server.gateway.ship_events_remote(
                     token, query["ship_id"][0], int(raw_after),
                 )
+                ship_response_ship_id = query["ship_id"][0]
                 # Revoke/rotation during the read cannot return a stale grant.
                 if self._principal() != principal:
                     self._send(401, {"ok": False, "error": "Active scoped pilot required"})
@@ -792,6 +886,24 @@ class GatewayHandler(BaseHTTPRequestHandler):
         if self._principal() != principal:
             self._send(401, {"ok": False, "error": "Player bearer revoked or rotated"})
             return
+        # The history read may have succeeded under an owner entitlement that
+        # has since transferred. Recheck against a new DB snapshot as close to
+        # writing response bytes as practical. This does not atomically block
+        # a later transfer during the socket write.
+        if ship_response_ship_id is not None:
+            try:
+                if not self.server.gateway.ship_owner_response_current(
+                        principal, ship_response_ship_id):
+                    self._send(403, {"ok": False, "error": "Ship is not owned by this pilot"})
+                    return
+            except PermissionError:
+                self._send(401, {"ok": False, "error": "Active scoped pilot required"})
+                return
+            # The owner proof itself performs SQLite reads. Revalidate the
+            # credential once more after those reads before any event bytes.
+            if self._principal() != principal:
+                self._send(401, {"ok": False, "error": "Active scoped pilot required"})
+                return
         self._send(200, result)
 
     def do_POST(self) -> None:  # noqa: N802

@@ -10,6 +10,7 @@ from __future__ import annotations
 import http.client
 import json
 import math
+import time
 from contextlib import closing
 from dataclasses import dataclass
 from urllib.parse import urlsplit
@@ -109,6 +110,7 @@ class LocalChatProposer:
         with closing(http.client.HTTPConnection(
             endpoint.hostname, endpoint.port, timeout=self.config.timeout_seconds,
         )) as connection:
+            deadline = time.monotonic() + self.config.timeout_seconds
             connection.request(
                 "POST", endpoint.path, body=request_bytes,
                 headers={"Content-Type": "application/json", "Accept": "application/json"},
@@ -116,7 +118,21 @@ class LocalChatProposer:
             response = connection.getresponse()
             if response.status != 200:
                 raise ValueError(f"Local model HTTP status {response.status}; no action committed")
-            body = response.read(_MAX_RESPONSE_BYTES + 1)
+            # HTTPResponse.read(n) may wait for all n bytes while a local
+            # inference server drips data indefinitely. Incremental reads
+            # let the host enforce a wall-clock body budget across chunks,
+            # independently of the socket's idle-read timeout.
+            chunks: list[bytes] = []
+            length = 0
+            while length <= _MAX_RESPONSE_BYTES:
+                if time.monotonic() >= deadline:
+                    raise TimeoutError("Local model response deadline exceeded")
+                chunk = response.read1(min(2048, _MAX_RESPONSE_BYTES + 1 - length))
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                length += len(chunk)
+            body = b"".join(chunks)
         if len(body) > _MAX_RESPONSE_BYTES:
             raise ValueError("Local model response exceeds configured byte limit")
         try:
