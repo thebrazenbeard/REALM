@@ -178,12 +178,13 @@ class Crafting:
             if player is None:
                 raise ValueError("Join this REALM before gathering or crafting")
             actor, room = player["id"], player["room_id"]
+            receipt = None
             if action_id is not None:
                 receipt = db.execute(
                     "SELECT command,response FROM action_receipts WHERE actor=? AND action_id=?",
                     (actor, action_id),
                 ).fetchone()
-                if receipt:
+                if receipt is not None:
                     if receipt["command"] != command:
                         raise ValueError("Action ID already used for a different command")
                     if not read_only:
@@ -216,17 +217,13 @@ class Crafting:
             else:
                 response = self._make(db, actor, room, verb, arg)
 
-            if action_id is not None:
-                if receipt is not None:
-                    db.execute(
-                        "UPDATE action_receipts SET response=? WHERE actor=? AND action_id=?",
-                        (response, actor, action_id),
-                    )
-                else:
-                    db.execute(
-                        "INSERT INTO action_receipts (actor,action_id,command,response) VALUES (?,?,?,?)",
-                        (actor, action_id, command, response),
-                    )
+            # Preserve IDs for conflict detection without keeping a stale
+            # inventory, location or authored-resource snapshot as a receipt.
+            if action_id is not None and receipt is None:
+                db.execute(
+                    "INSERT INTO action_receipts (actor,action_id,command,response) VALUES (?,?,?,?)",
+                    (actor, action_id, command, "" if read_only else response),
+                )
             return response
 
     def _gather(self, db: sqlite3.Connection, actor: str, room: str, arg: str,

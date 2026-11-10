@@ -2,11 +2,13 @@
 
 import json
 import os
+import sqlite3
 import subprocess
 import sys
 import tempfile
 import threading
 import unittest
+from contextlib import closing
 from pathlib import Path
 from urllib import error, parse, request
 
@@ -49,7 +51,8 @@ class EntrypointCraftingTests(unittest.TestCase):
             with request.urlopen(req, timeout=3) as response:
                 return response.status, json.loads(response.read())
         except error.HTTPError as exc:
-            return exc.code, json.loads(exc.read())
+            with closing(exc):
+                return exc.code, json.loads(exc.read())
 
     def test_http_gather_craft_and_visible_feed(self):
         self.assertEqual(200, self._http("/api/v1/join", {"player": "Patrick"})[0])
@@ -98,6 +101,51 @@ class EntrypointCraftingTests(unittest.TestCase):
         })
         self.assertEqual(400, status)
         self.assertIn("different command", wrong["error"])
+
+    def test_router_keeps_crafting_reads_fresh_and_core_mutations_once_only(self):
+        """HTTP must route craft verbs before Engine can see shared action IDs."""
+        self.assertEqual(200, self._http("/api/v1/join", {"player": "Patrick"})[0])
+        self.assertEqual(200, self._http("/api/v1/join", {"player": "Vera"}, as_player="Vera")[0])
+
+        read = {"player": "Patrick", "command": "gather", "action_id": "read-gather-1"}
+        status, first = self._http("/api/v1/command", read)
+        self.assertEqual(200, status)
+        self.assertIn("stone (40)", first["text"])
+        self.assertEqual(200, self._http("/api/v1/command", {
+            "player": "Vera", "command": "gather stone", "action_id": "vera-gather-1",
+        }, as_player="Vera")[0])
+        status, newer = self._http("/api/v1/command", read)
+        self.assertEqual(200, status)
+        self.assertIn("stone (37)", newer["text"])
+        with closing(sqlite3.connect(self.db)) as db:
+            receipt = db.execute(
+                "SELECT command,response FROM action_receipts "
+                "WHERE actor='Patrick' AND action_id='read-gather-1'"
+            ).fetchone()
+        self.assertEqual(("gather", ""), receipt)
+
+        status, mismatch = self._http("/api/v1/command", {
+            "player": "Patrick", "command": "resources", "action_id": "read-gather-1",
+        })
+        self.assertEqual(400, status)
+        self.assertIn("different command", mismatch["error"])
+
+        said = {"player": "Patrick", "command": "say One event only", "action_id": "say-once-1"}
+        status, original = self._http("/api/v1/command", said)
+        self.assertEqual(200, status)
+        status, repeated = self._http("/api/v1/command", said)
+        self.assertEqual(200, status)
+        self.assertEqual(original["text"], repeated["text"])
+        with closing(sqlite3.connect(self.db)) as db:
+            count = db.execute(
+                "SELECT COUNT(*) FROM events WHERE actor='Patrick' AND kind='say'"
+            ).fetchone()[0]
+        self.assertEqual(1, count, "mutating core replay must not append speech")
+        status, reverse_collision = self._http("/api/v1/command", {
+            "player": "Patrick", "command": "resources", "action_id": "say-once-1",
+        })
+        self.assertEqual(400, status)
+        self.assertIn("different command", reverse_collision["error"])
 
     def test_cli_once_two_processes_share_crafting_state(self):
         root = Path(__file__).resolve().parents[1]

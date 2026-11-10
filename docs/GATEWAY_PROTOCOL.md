@@ -191,6 +191,21 @@ authorized state on each retry. An old observation receipt cannot grant
 access to an item another actor now holds or to speech from before arrival.
 `examine <item>` (alias `x <item>` or `look at <item>`) only reveals items
 in the caller's room or inventory and writes no world event.
+New keyed read receipts retain the actor, ID and original command with an
+empty `response` sentinel; observations are returned fresh without persisting
+their contents or rewriting the receipt on replay. Existing receipts created
+by older builds may still contain nonblank observation responses. Those rows
+persist until a **separately authorized migration**; this change performs no
+automatic destructive database rewrite or receipt cleanup.
+
+`CommandRouter.act` owns the shared Engine/Crafting action-ID namespace for
+interactive commands. It dispatches recognized crafting verbs before Engine,
+which otherwise treats those verbs as unknown. Calling `Engine.act` and
+`Crafting.perform` directly with the **same** actor, command, and action ID
+across handlers is unsupported: a low-level caller can replay the other
+handler's receipt instead of its own command result. Embeddings should route
+interactive player commands through `CommandRouter` consistently; this is an
+internal API boundary, not an observed HTTP/Telnet/CLI authorization bypass.
 
 Credentials are bound to one character name, but are long-lived bearer
 capabilities rather than expiring sessions with account recovery. Anyone who

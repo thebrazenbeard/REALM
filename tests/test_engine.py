@@ -140,6 +140,32 @@ class RealmEngineTests(unittest.TestCase):
         self.engine.act("Ada", "take wrench")
         self.assertIn("Worn wrench", self.engine.act("Ada", "inventory", action_id="inv-1"))
 
+    def test_read_receipt_keeps_command_binding_but_never_stores_item_description(self):
+        self.engine.join("Ada")
+        self.engine.join("Bob")
+        first = self.engine.act("Ada", "examine token", action_id="private-read")
+        self.assertIn("small unmarked token", first)
+        with closing(sqlite3.connect(self.db_path)) as db:
+            receipt = db.execute(
+                "SELECT command,response FROM action_receipts WHERE actor='Ada' AND action_id='private-read'"
+            ).fetchone()
+        self.assertEqual(("examine token", ""), receipt)
+        with closing(sqlite3.connect(self.db_path)) as db, db:
+            db.execute("CREATE TRIGGER reject_private_receipt_update "
+                       "BEFORE UPDATE ON action_receipts "
+                       "WHEN OLD.actor='Ada' AND OLD.action_id='private-read' "
+                       "BEGIN SELECT RAISE(ABORT, 'read receipt updated'); END")
+        self.engine.act("Bob", "take token")
+        denied = self.engine.act("Ada", "examine token", action_id="private-read")
+        self.assertIn("cannot examine", denied)
+        with closing(sqlite3.connect(self.db_path)) as db:
+            stored = db.execute(
+                "SELECT response FROM action_receipts WHERE actor='Ada' AND action_id='private-read'"
+            ).fetchone()[0]
+        self.assertEqual("", stored, "replayed observation must not be retained in the receipt ledger")
+        with self.assertRaisesRegex(ValueError, "different command"):
+            self.engine.act("Ada", "who", action_id="private-read")
+
     def test_observation_action_id_freshens_history_and_who(self):
         self.engine.join("Ada")
         self.assertIn("Ada", self.engine.act("Ada", "who", action_id="who-1"))

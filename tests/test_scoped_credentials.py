@@ -266,8 +266,15 @@ class ScopedCredentialTests(unittest.TestCase):
         self.assertEqual(200, status)
         self.assertTrue(any("Authenticated" in event["text"] for event in feed["events"]))
         self.assertEqual(403, fetch("/api/v1/feed?player=Vera", scoped)[0])
+        # Scene is a room-read capability bound to the bearer actor, and
+        # cannot survive revocation or become a cross-player observation.
+        status, scene = fetch("/api/v1/scene?player=Patrick", scoped)
+        self.assertEqual(200, status)
+        self.assertEqual("atrium", scene["room"]["id"])
+        self.assertEqual(403, fetch("/api/v1/scene?player=Vera", scoped)[0])
         opt_gateway.scoped_credentials.revoke("Patrick")
         self.assertEqual(401, fetch("/api/v1/feed?after=0", scoped)[0])
+        self.assertEqual(401, fetch("/api/v1/scene?player=Patrick", scoped)[0])
         self.assertEqual("Patrick", self.gateway.credentials.authenticate(original))
 
     def test_gateway_feed_only_token_does_not_allow_commands(self):

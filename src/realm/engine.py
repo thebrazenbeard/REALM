@@ -246,6 +246,7 @@ class Engine:
             if player is None:
                 raise ValueError("Join this REALM before issuing commands")
             actor, room_id = player["id"], player["room_id"]
+            receipt = None
             if action_id is not None:
                 receipt = db.execute(
                     "SELECT command,response FROM action_receipts WHERE actor=? AND action_id=?",
@@ -260,17 +261,14 @@ class Engine:
                     if not read_only:
                         return receipt["response"]
             response = self._perform(db, actor, room_id, verb, arg)
-            if action_id is not None:
-                if receipt is not None:
-                    db.execute(
-                        "UPDATE action_receipts SET response=? WHERE actor=? AND action_id=?",
-                        (response, actor, action_id),
-                    )
-                else:
-                    db.execute(
-                        "INSERT INTO action_receipts (actor,action_id,command,response) VALUES (?,?,?,?)",
-                        (actor, action_id, command, response),
-                    )
+            # A read-only action ID binds command identity, not its current
+            # contents. Keep a blank sentinel; never retain private observation
+            # text or update that receipt during later read retries.
+            if action_id is not None and receipt is None:
+                db.execute(
+                    "INSERT INTO action_receipts (actor,action_id,command,response) VALUES (?,?,?,?)",
+                    (actor, action_id, command, "" if read_only else response),
+                )
             return response
 
     @staticmethod

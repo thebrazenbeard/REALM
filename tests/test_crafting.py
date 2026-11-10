@@ -154,5 +154,26 @@ class CraftingTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "different command"):
             self.crafting.perform("Patrick", "resources", action_id="read-nodes")
 
+    def test_read_receipts_keep_empty_payload_while_mutation_receipts_remain_durable(self):
+        readings = (("resources", "read-material"), ("recipes", "read-recipes"),
+                    ("structures", "read-buildings"), ("gather", "read-nodes"))
+        for command, identifier in readings:
+            self.assertIsInstance(self.crafting.perform("Patrick", command, action_id=identifier), str)
+        with closing(sqlite3.connect(self.db_path)) as db, db:
+            db.execute("CREATE TRIGGER reject_material_receipt_update "
+                       "BEFORE UPDATE ON action_receipts "
+                       "WHEN OLD.actor='Patrick' AND OLD.action_id='read-material' "
+                       "BEGIN SELECT RAISE(ABORT, 'read receipt updated'); END")
+        self.assertEqual("You gather stone x3.", self.crafting.perform(
+            "Patrick", "gather stone", action_id="mutating-gather"))
+        self.assertIn("stone x3", self.crafting.perform("Patrick", "resources", action_id="read-material"))
+        with closing(sqlite3.connect(self.db_path)) as db:
+            receipts = dict(db.execute(
+                "SELECT action_id,response FROM action_receipts WHERE actor='Patrick'"
+            ))
+        for _, identifier in readings:
+            self.assertEqual("", receipts[identifier], identifier)
+        self.assertEqual("You gather stone x3.", receipts["mutating-gather"])
+
 if __name__ == "__main__":
     unittest.main()

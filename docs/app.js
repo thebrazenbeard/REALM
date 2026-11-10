@@ -386,13 +386,14 @@
     if (session.commandPending) return;
     const command = ui.commandInput.value.trim();
     if (!command) return;
+    // Acquire the per-session guard before any UI/history setter can reenter.
+    session.commandPending = true;
     session.commandHistory.push(command);
     if (session.commandHistory.length > MAX_COMMAND_HISTORY) session.commandHistory.shift();
     session.historyIndex = null;
     session.commandDraft = "";
     ui.send.disabled = true;
     ui.commandInput.disabled = true;
-    session.commandPending = true;
     const prior = session.pendingCommandRetry;
     const actionId = prior && prior.command === command ? prior.actionId
       : (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function"

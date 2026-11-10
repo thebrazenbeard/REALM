@@ -46,7 +46,7 @@ function worldMap() {
   };
 }
 
-function instantiate({ missingMap = false, mapOnMove = false, rejectUnauthorized = false, fetchImpl = null, mapGate = null, roomGate = null, joinGate = null, healthGate = null, nowMs = null } = {}) {
+function instantiate({ missingMap = false, mapOnMove = false, rejectUnauthorized = false, fetchImpl = null, mapGate = null, roomGate = null, joinGate = null, healthGate = null, commandGate = null, nowMs = null } = {}) {
   const elements = new Map();
   const get = (id) => {
     if (!elements.has(id)) elements.set(id, new Element());
@@ -76,6 +76,7 @@ function instantiate({ missingMap = false, mapOnMove = false, rejectUnauthorized
     if (route === "/api/v1/map" && mapGate) await mapGate();
     if (route === "/api/v1/room" && roomGate) await roomGate();
     if (route === "/api/v1/join" && joinGate) await joinGate();
+    if (route === "/api/v1/command" && commandGate) await commandGate();
     if (rejectUnauthorized && route === "/api/v1/join") {
       return { ok: false, status: 401, json: async () => ({ error: "Player token mismatch" }) };
     }
@@ -138,6 +139,8 @@ test("command history recalls prior commands, restores draft, and clears on disc
   assert.equal(input.value, "who");
   assert.equal(press("ArrowUp"), true);
   assert.equal(input.value, "look");
+  assert.equal(press("ArrowUp"), true, "recalling past the oldest entry stays at the oldest");
+  assert.equal(input.value, "look");
   assert.equal(press("ArrowDown"), true);
   assert.equal(input.value, "who");
   assert.equal(press("ArrowDown"), true);
@@ -171,6 +174,83 @@ test("command history keeps only 50 entries and restarts recall after typing", a
   input.events.keydown({ key: "ArrowDown", preventDefault() {} });
   assert.equal(input.value, "edited draft");
   client.disconnect();
+});
+
+test("rapid duplicate command submits issue only one POST and one action ID", async () => {
+  let reachedCommand, releaseCommand;
+  const enteredCommand = new Promise((resolve) => { reachedCommand = resolve; });
+  const heldCommand = new Promise((resolve) => { releaseCommand = resolve; });
+  const client = instantiate({ commandGate: () => { reachedCommand(); return heldCommand; } });
+  client.get("host-url").value = "http://127.0.0.1:8765";
+  client.get("player-name").value = "Explorer";
+  client.get("access-token").value = "secret-token";
+  await client.connect();
+
+  // A synthetic synchronous reentry during UI disable must see the pending
+  // latch already set; disabled controls alone cannot enforce this invariant.
+  const sendButton = client.get("send-button");
+  let disabled = sendButton.disabled;
+  let reentered = false;
+  const reentrantSends = [];
+  Object.defineProperty(sendButton, "disabled", {
+    configurable: true,
+    get: () => disabled,
+    set(next) {
+      disabled = next;
+      if (next && !reentered) {
+        reentered = true;
+        reentrantSends.push(client.send());
+      }
+    },
+  });
+  client.get("command-input").value = "say This should happen only once";
+  const first = client.send();
+  await enteredCommand;
+  assert.equal(sendButton.disabled, true);
+  const second = client.send();
+  await Promise.resolve();
+  const posts = client.requests.filter(({ url }) => url.endsWith("/api/v1/command"));
+  releaseCommand();
+  await Promise.all([first, second, ...reentrantSends]);
+  assert.equal(posts.length, 1, "synchronous and asynchronous reentry must not duplicate a POST");
+  assert.equal(typeof JSON.parse(posts[0].options.body).action_id, "string");
+  assert.equal(sendButton.disabled, false);
+  assert.equal(client.get("command-input").value, "");
+});
+
+test("an old pending command cannot block or change a reconnected session", async () => {
+  let releaseOldCommand, reachedOldCommand;
+  const enteredOldCommand = new Promise((resolve) => { reachedOldCommand = resolve; });
+  const heldOldCommand = new Promise((resolve) => { releaseOldCommand = resolve; });
+  let commandCount = 0;
+  const client = instantiate({ commandGate: () => {
+    commandCount++;
+    if (commandCount === 1) { reachedOldCommand(); return heldOldCommand; }
+  } });
+  client.get("host-url").value = "http://127.0.0.1:8765";
+  client.get("player-name").value = "Explorer";
+  client.get("access-token").value = "old-token";
+  await client.connect();
+
+  client.get("command-input").value = "say Old command";
+  const oldCommand = client.send();
+  await enteredOldCommand;
+  client.disconnect();
+  client.get("access-token").value = "new-token";
+  await client.connect();
+  client.get("command-input").value = "look";
+  await client.send();
+  assert.equal(commandCount, 2, "new session must not inherit old pending state");
+  assert.equal(client.get("send-button").disabled, false);
+
+  releaseOldCommand();
+  await oldCommand;
+  assert.equal(client.get("connection-status").textContent, "Connected — receiving host state");
+  assert.equal(client.get("command-input").disabled, false);
+  assert.equal(client.get("send-button").disabled, false);
+  const transcript = client.get("feed").children.map((item) => item.children[1].children[0].textContent);
+  assert.ok(transcript.some((label) => label.includes("Explorer / look")));
+  assert.ok(!transcript.some((label) => label.includes("Old command")), "old completion cannot contaminate new feed");
 });
 
 test("a host without map support stays connected to its usable MUD", async () => {
