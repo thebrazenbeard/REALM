@@ -1,7 +1,8 @@
 """Loopback-only Telnet/text transport for REALM's deterministic command core.
 
 This is an experimental LAN-host building block, NOT a public login service.
-Telnet is plaintext and a shared access token does not authenticate a player.
+Telnet is plaintext. The legacy shared access token does not authenticate a
+player; hosts may opt into per-player credentials for local identity.
 The server intentionally binds 127.0.0.1 only, regardless of CLI arguments.
 """
 
@@ -13,10 +14,14 @@ import os
 import secrets
 import socket
 import socketserver
+import sqlite3
 import threading
 from pathlib import Path
+from typing import Callable
 
+from .auth import CredentialStore
 from .engine import Engine
+from .router import CommandRouter
 
 
 IAC = 255
@@ -86,29 +91,71 @@ class LocalTelnetServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
     allow_reuse_address = True
     daemon_threads = True
 
-    def __init__(self, engine: Engine, token: str, port: int = 7777):
-        if not token or len(token) > 256:
+    def __init__(self, engine: Engine, token: str | None, port: int = 7777,
+                 *, player_credentials: bool = False):
+        if type(player_credentials) is not bool:
+            raise ValueError("player_credentials must be a bool")
+        if not player_credentials and (
+                not isinstance(token, str) or not token or len(token) > 256):
             raise ValueError("A nonempty server access token is required (max 256 characters)")
         self.engine = engine
-        self.token = token
+        self.player_credentials = player_credentials
+        self.token = None if player_credentials else token
+        self.credentials = CredentialStore(engine) if player_credentials else None
+        # Lazy shared router; merely starting a Telnet listener must not
+        # implicitly install optional crafting tables.
+        self._router: CommandRouter | None = None
+        self._router_lock = threading.Lock()
         self._slots = threading.BoundedSemaphore(MAX_CONNECTIONS)
         self._join_lock = threading.Lock()
         self._active_names: set[str] = set()
         super().__init__(("127.0.0.1", port), LocalTelnetHandler)
 
-    def join_exclusive(self, name: str) -> str | None:
+    @property
+    def router(self) -> CommandRouter:
+        if self._router is None:
+            with self._router_lock:
+                if self._router is None:
+                    self._router = CommandRouter(self.engine)
+        return self._router
+
+    def join_exclusive(self, name: str, *,
+                       writer_guard: Callable[[sqlite3.Connection], None] | None = None
+                       ) -> str | None:
         """Reserve one *live local socket session* per casefolded player name.
 
-        This is not durable identity/ownership: someone with the shared local
-        access token can still claim the name after its socket disconnects.
+        In legacy mode the shared token permits any valid name. In opt-in
+        credential mode the caller's name is fixed by the host-provisioned
+        credential, and joining is guarded inside the SQLite writer transaction.
         """
         key = name.casefold()
         with self._join_lock:
             if key in self._active_names:
                 return None
-            greeting = self.engine.join(name)
+            greeting = self.engine.join(name, writer_guard=writer_guard)
             self._active_names.add(key)
             return greeting
+
+    def principal_guard(self, name: str, token: str) -> Callable[[sqlite3.Connection], None]:
+        """Validate the credential inside each Engine/Crafting writer transaction.
+
+        The socket precheck alone is insufficient: rotation or revocation
+        can commit between it and the world action.
+        """
+        if not self.player_credentials:
+            raise ValueError("Player writer guard needs player_credentials mode")
+        digest = CredentialStore._digest(token)
+        canonical = name.casefold()
+
+        def guard(db: sqlite3.Connection) -> None:
+            row = db.execute(
+                "SELECT player_name FROM player_credentials WHERE token_digest=?",
+                (digest,),
+            ).fetchone()
+            if row is None or str(row[0]).casefold() != canonical:
+                raise PermissionError("Player credential expired or revoked")
+
+        return guard
 
     def release_name(self, name: str) -> None:
         with self._join_lock:
@@ -201,17 +248,33 @@ class LocalTelnetHandler(socketserver.BaseRequestHandler):
                 self.server.release_name(self._claimed_name)
 
     def _run(self) -> None:
-        self._send("REALM — local terminal prototype\nToken: ")
-        presented = self._line()
-        if presented is None or not hmac.compare_digest(presented, self.server.token):
-            self._send("\nAccess denied.\n")
+        if self.server.player_credentials:
+            self._send("REALM — player-bound local terminal prototype\nPlayer token: ")
+            presented = self._line()
+            name = self.server.credentials.authenticate(presented) if presented is not None else None
+            if name is None:
+                self._send("\nAccess denied.\n")
+                return
+        else:
+            self._send("REALM — local terminal prototype\nToken: ")
+            presented = self._line()
+            if presented is None or not hmac.compare_digest(presented, self.server.token):
+                self._send("\nAccess denied.\n")
+                return
+            self._send("Name: ")
+            name = self._line()
+            if name is None:
+                return
+        if (self.server.player_credentials and
+                self.server.credentials.authenticate(presented) != name):
+            self._send("Access revoked.\n")
             return
-        self._send("Name: ")
-        name = self._line()
-        if name is None:
-            return
+        guard = self.server.principal_guard(name, presented) if self.server.player_credentials else None
         try:
-            greeting = self.server.join_exclusive(name)
+            greeting = self.server.join_exclusive(name, writer_guard=guard)
+        except PermissionError:
+            self._send("Access revoked.\n")
+            return
         except ValueError as error:
             self._send(f"Invalid player name: {error}\n")
             return
@@ -225,11 +288,18 @@ class LocalTelnetHandler(socketserver.BaseRequestHandler):
             if command is None:
                 return
             command = command.strip()
+            if (self.server.player_credentials and
+                    self.server.credentials.authenticate(presented) != name):
+                self._send("Access revoked.\n")
+                return
             if not command:
                 self._send("REALM> ")
                 continue
             try:
-                result = self.server.engine.act(name, command)
+                result = self.server.router.act(name, command, writer_guard=guard)
+            except PermissionError:
+                self._send("Access revoked.\n")
+                return
             except ValueError as error:
                 result = f"Command rejected: {error}"
             self._send(f"{result}\n")
@@ -242,12 +312,22 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="REALM loopback-only Telnet prototype")
     parser.add_argument("--db", type=Path, default=Path("realm.sqlite3"))
     parser.add_argument("--port", type=int, default=7777)
+    parser.add_argument("--player-credentials", action="store_true",
+                        help="Require host-provisioned player tokens, with no client-chosen name")
     args = parser.parse_args(argv)
-    token = os.environ.get("REALM_TELNET_TOKEN") or secrets.token_urlsafe(24)
-    server = LocalTelnetServer(Engine(args.db), token, args.port)
+    token = None if args.player_credentials else (
+        os.environ.get("REALM_TELNET_TOKEN") or secrets.token_urlsafe(24)
+    )
+    server = LocalTelnetServer(
+        Engine(args.db), token, args.port, player_credentials=args.player_credentials,
+    )
     print(f"REALM local Telnet listening on 127.0.0.1:{server.server_address[1]}", flush=True)
     print("Experimental plaintext LOCAL transport. Do NOT port-forward or internet-expose.", flush=True)
-    print(f"Connection token: {token}", flush=True)
+    if args.player_credentials:
+        print("Host-provisioned player tokens required (no network registration).", flush=True)
+    else:
+        print("Legacy shared token is NOT a player identity.", flush=True)
+        print(f"Connection token: {token}", flush=True)
     try:
         server.serve_forever(poll_interval=0.2)
     except KeyboardInterrupt:

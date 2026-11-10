@@ -12,11 +12,11 @@ commands. None of those layers depends on a particular fantasy setting.
 | Persisted multiplayer text world | **Implemented:** SQLite rooms, items, players, movement, speech, event feed, transaction/replay tests | Reliable live online presence, general account sessions |
 | Creator-owned worldpacks | **Implemented:** guarded v1 import and offline room/exit/item builder; isolated DB per world | Live OLC drafts, ACL, quotas, migration and rollback |
 | Original showcase | **Implemented as passive content:** Siltglass Reach worldpack; test import and two Engine clients | NPCs, quests, factions, weather, PK, scripted consequences |
-| Invited remote players | **Not qualified:** HTTP/Telnet gateways bind loopback; per-player HTTP tokens are implemented | TLS/private transport, host identity, abuse limits, remote E2E |
-| Host-authorized NPC principals | **Design/experimental:** model proposes; server validates and commits | Independent identity/permissions, reliable scheduling, runtime E2E |
+| Invited remote players | **Not qualified:** HTTP/Telnet bind loopback; per-player HTTP credentials, opt-in player-bound Telnet credentials, local per-player HTTP quota and bounded socket workers exist | TLS/private transport, absolute header deadlines, unauthenticated flood controls, cross-process quotas, remote E2E |
+| Host-authorized NPC principals | **Experimental code:** bounded host-invoked local HTTP model proposal bridge and controller validation, SQLite replay receipts; fixture verified, no model weights installed | Host-owned private views, scheduling, drives/memory, real model-runtime E2E |
 | Dynamic drives and goals | **Planned:** persistent, versioned state per NPC and deterministic drive updates | Tests for replay/restart, bounded priorities, conflict handling |
 | Deep memory | **Planned:** scoped episodic facts anchored to source events; semantic summaries as derived hints | Retention, trust/provenance, retrieval isolation, hallucination rejection |
-| Real-time evolving world | **Planned:** host-owned ticks and durable simulation transitions | Backfill/cursor safety, restart, pressure limits, event delivery |
+| Real-time evolving world | **Experimental:** explicit host-owned world-clock and durable simulation transitions, tested locally | Production cadence, backfill/cursor safety, pressure limits, event delivery |
 | Android client | **Separate idea lane:** [issue #18](https://github.com/thebrazenbeard/REALM/issues/18) | Native client, remote protocol, Patrick's physical phone tests |
 
 ## Agent action contract

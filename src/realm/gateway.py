@@ -8,10 +8,13 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import re
+import socket
 import sqlite3
 from datetime import datetime, timezone
 import threading
+import time
 from contextlib import closing
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -27,6 +30,12 @@ from .scoped_credentials import CredentialStateError, ScopedCredentialStore
 
 MAX_BODY_BYTES = 4096
 MAX_FEED_EVENTS = 100
+DEFAULT_RATE_REQUESTS_PER_MINUTE = 120
+DEFAULT_RATE_BURST = 60
+DEFAULT_RATE_MAX_PRINCIPALS = 256
+DEFAULT_MAX_ACTIVE_REQUESTS = 32
+DEFAULT_SOCKET_IDLE_TIMEOUT_SECONDS = 15.0
+DEFAULT_BODY_DEADLINE_SECONDS = 10.0
 _WORLD_ID = re.compile(r"^[A-Za-z][A-Za-z0-9_-]{0,63}$")
 _GEOGRAPHY_COLUMNS = {
     "geo_places": frozenset(("id", "name", "kind", "parent_id", "x", "y")),
@@ -446,15 +455,141 @@ class Gateway:
             db.close()
 
 
+class _PrincipalRateLimiter:
+    """Bounded, per-authorized-player in-memory request admission.
+
+    This is not a socket, IP, credential-guessing or multi-process limiter.
+    A full principal table refuses newly seen players rather than evicting
+    active buckets and letting an identity churn reset another's quota.
+    """
+
+    def __init__(
+        self, requests_per_minute: int = DEFAULT_RATE_REQUESTS_PER_MINUTE,
+        burst: int = DEFAULT_RATE_BURST,
+        max_principals: int = DEFAULT_RATE_MAX_PRINCIPALS,
+    ) -> None:
+        if type(requests_per_minute) is not int or not 1 <= requests_per_minute <= 60_000:
+            raise ValueError("rate_limit_requests_per_minute must be an integer in 1..60000")
+        if type(burst) is not int or not 1 <= burst <= 4096:
+            raise ValueError("rate_limit_burst must be an integer in 1..4096")
+        if type(max_principals) is not int or not 1 <= max_principals <= 1024:
+            raise ValueError("rate_limit_max_principals must be an integer in 1..1024")
+        self._burst = burst
+        self._rate_per_second = requests_per_minute / 60.0
+        self._max_principals = max_principals
+        self._stale_after = max(60.0, burst / self._rate_per_second)
+        self._entries: dict[str, tuple[float, float]] = {}
+        self._lock = threading.Lock()
+
+    def allow(self, principal: str) -> tuple[bool, int]:
+        """Return admission and whole-second Retry-After without storing tokens."""
+        key = principal.casefold()
+        with self._lock:
+            now = time.monotonic()
+            old = self._entries.get(key)
+            if old is None:
+                if len(self._entries) >= self._max_principals:
+                    for tracked, (_, last_seen) in tuple(self._entries.items()):
+                        if now - last_seen >= self._stale_after:
+                            del self._entries[tracked]
+                    if len(self._entries) >= self._max_principals:
+                        retry = min(
+                            max(0.0, last_seen + self._stale_after - now)
+                            for _, last_seen in self._entries.values()
+                        )
+                        return False, max(1, math.ceil(retry))
+                tokens = float(self._burst)
+            else:
+                previous_tokens, last_seen = old
+                tokens = min(
+                    float(self._burst),
+                    previous_tokens + max(0.0, now - last_seen) * self._rate_per_second,
+                )
+            if tokens < 1.0:
+                self._entries[key] = (tokens, now)
+                return False, max(1, math.ceil((1.0 - tokens) / self._rate_per_second))
+            self._entries[key] = (tokens - 1.0, now)
+            return True, 0
+
+
 class GatewayServer(ThreadingHTTPServer):
     daemon_threads = True
 
-    def __init__(self, gateway: Gateway, allowed_origins: tuple[str, ...], port: int = 8768):
+    def __init__(
+        self, gateway: Gateway, allowed_origins: tuple[str, ...], port: int = 8768,
+        *, rate_limit_requests_per_minute: int = DEFAULT_RATE_REQUESTS_PER_MINUTE,
+        rate_limit_burst: int = DEFAULT_RATE_BURST,
+        rate_limit_max_principals: int = DEFAULT_RATE_MAX_PRINCIPALS,
+        max_active_requests: int = DEFAULT_MAX_ACTIVE_REQUESTS,
+        socket_idle_timeout_seconds: float = DEFAULT_SOCKET_IDLE_TIMEOUT_SECONDS,
+        body_deadline_seconds: float = DEFAULT_BODY_DEADLINE_SECONDS,
+    ):
         # No process-wide token or 0.0.0.0 bind option: gameplay uses
         # independent per-player credentials provisioned by the host.
         self.gateway = gateway
         self.allowed_origins = frozenset(allowed_origins)
+        self._request_limiter = _PrincipalRateLimiter(
+            rate_limit_requests_per_minute, rate_limit_burst,
+            rate_limit_max_principals,
+        )
+        if type(max_active_requests) is not int or not 1 <= max_active_requests <= 1024:
+            raise ValueError("max_active_requests must be an integer in 1..1024")
+        for value, label in (
+            (socket_idle_timeout_seconds, "socket_idle_timeout_seconds"),
+            (body_deadline_seconds, "body_deadline_seconds"),
+        ):
+            if (type(value) not in (int, float)
+                    or not math.isfinite(value) or not 0 < value <= 120):
+                raise ValueError(f"{label} must be finite in (0, 120] seconds")
+        self.socket_idle_timeout_seconds = float(socket_idle_timeout_seconds)
+        self.body_deadline_seconds = float(body_deadline_seconds)
+        # Bound *all* accepted workers, including unauthenticated requests
+        # and clients that never finish headers. Per-principal buckets alone
+        # cannot protect thread creation and incomplete POST bodies.
+        self._worker_slots = threading.BoundedSemaphore(max_active_requests)
         super().__init__(("127.0.0.1", port), GatewayHandler)
+
+    def get_request(self) -> tuple[socket.socket, tuple]:
+        request, client = super().get_request()
+        try:
+            request.settimeout(self.socket_idle_timeout_seconds)
+        except OSError:
+            request.close()
+            raise
+        return request, client
+
+    def verify_request(self, request: socket.socket, client_address: tuple) -> bool:
+        if not self._worker_slots.acquire(blocking=False):
+            # Small, nonblocking overload response on the accept loop.
+            # No handler thread is allocated and no request body is read.
+            try:
+                request.setblocking(False)
+                request.send(
+                    b"HTTP/1.1 503 Service Unavailable\r\n"
+                    b"Content-Type: application/json\r\n"
+                    b"Content-Length: 34\r\n"
+                    b"Connection: close\r\n"
+                    b"Cache-Control: no-store\r\n\r\n"
+                    b'{"ok":false,"error":"Server busy"}'
+                )
+            except OSError:
+                pass
+            return False
+        return True
+
+    def process_request(self, request: socket.socket, client_address: tuple) -> None:
+        try:
+            super().process_request(request, client_address)
+        except BaseException:
+            # Thread.start can fail after verify_request acquired a slot.
+            self._worker_slots.release()
+            raise
+
+    def process_request_thread(self, request: socket.socket, client_address: tuple) -> None:
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self._worker_slots.release()
 
 
 class GatewayHandler(BaseHTTPRequestHandler):
@@ -484,6 +619,9 @@ class GatewayHandler(BaseHTTPRequestHandler):
         self.send_header("Cache-Control", "no-store")
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("Referrer-Policy", "no-referrer")
+        retry_after = getattr(self, "_rate_retry_after", None)
+        if status == 429 and retry_after is not None:
+            self.send_header("Retry-After", str(retry_after))
         if status >= 400:
             self.send_header("Connection", "close")
         origin = self._origin()
@@ -498,6 +636,29 @@ class GatewayHandler(BaseHTTPRequestHandler):
         data = json.dumps(obj, ensure_ascii=False).encode("utf-8")
         self._headers(status, len(data))
         self.wfile.write(data)
+
+    def _read_post_body(self, length: int) -> bytes:
+        """Read bounded bytes against an absolute deadline, even if trickled."""
+        deadline = time.monotonic() + self.server.body_deadline_seconds
+        parts: list[bytes] = []
+        remaining = length
+        previous_timeout = self.connection.gettimeout()
+        try:
+            while remaining:
+                budget = deadline - time.monotonic()
+                if budget <= 0:
+                    raise TimeoutError("Body read deadline elapsed")
+                self.connection.settimeout(min(self.server.socket_idle_timeout_seconds, budget))
+                # read1 returns once available data arrives, unlike read(n)
+                # which can wait for all n bytes while an attacker drip-feeds.
+                chunk = self.rfile.read1(min(remaining, MAX_BODY_BYTES))
+                if not chunk:
+                    raise ConnectionError("Client closed an incomplete request body")
+                parts.append(chunk)
+                remaining -= len(chunk)
+        finally:
+            self.connection.settimeout(previous_timeout)
+        return b"".join(parts)
 
     def _principal(self) -> str | None:
         auth = self.headers.get("Authorization", "")
@@ -522,6 +683,10 @@ class GatewayHandler(BaseHTTPRequestHandler):
         )
 
     def _gate(self, *, public_health: bool = False) -> str | None:
+        # Request handlers may keep an HTTP/1.1 socket open across requests.
+        # A prior rate response must not leak its retry metadata into a later
+        # response on the same connection.
+        self._rate_retry_after = None
         if not self._origin_ok():
             self._send(403, {"ok": False, "error": "Origin not allowed"})
             return None
@@ -530,6 +695,14 @@ class GatewayHandler(BaseHTTPRequestHandler):
         principal = self._principal()
         if principal is None:
             self._send(401, {"ok": False, "error": "Valid player bearer token required"})
+            return None
+        # Both GET and POST, including derived long-poll handlers, go through
+        # this admission gate. No SQLite transaction is retained here.
+        allowed, retry_after = self.server._request_limiter.allow(principal)
+        if not allowed:
+            self._rate_retry_after = retry_after
+            self._send(429, {"ok": False, "error": "Rate limit exceeded"})
+            return None
         return principal
 
     def _player_matches(self, claimed: object, principal: str) -> bool:
@@ -633,11 +806,24 @@ class GatewayHandler(BaseHTTPRequestHandler):
             self._send(415, {"ok": False, "error": "Content-Type must be application/json"})
             return
         raw_length = self.headers.get("Content-Length", "")
-        if not raw_length.isdecimal() or not 0 <= int(raw_length) <= MAX_BODY_BYTES:
+        if (not raw_length.isascii() or not raw_length.isdecimal()
+                or len(raw_length) > len(str(MAX_BODY_BYTES))
+                or int(raw_length) > MAX_BODY_BYTES):
             self._send(413, {"ok": False, "error": "Invalid request length"})
             return
         try:
-            content = self.rfile.read(int(raw_length))
+            content = self._read_post_body(int(raw_length))
+        except TimeoutError:
+            self.close_connection = True
+            try:
+                self._send(408, {"ok": False, "error": "Request body timed out"})
+            except OSError:
+                pass
+            return
+        except (ConnectionError, OSError):
+            self.close_connection = True
+            return
+        try:
             obj = json.loads(content)
             if not isinstance(obj, dict):
                 raise ValueError("Expected a JSON object")

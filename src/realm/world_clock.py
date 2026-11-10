@@ -88,6 +88,57 @@ class _PolicyPreservingConnection(sqlite3.Connection):
         self._refresh_authorizer()
 
 
+@contextmanager
+def _guard_clock_callback_transaction(db: _PolicyPreservingConnection):
+    """Keep a direct trusted callback inside the clock's one-world transaction.
+
+    The registry dispatcher has its own guard, but callers may use tick()
+    directly.  A callback's COMMIT (also executescript's implicit COMMIT) or
+    ROLLBACK would otherwise make its effects durable without an event receipt.
+    ATTACH/DETACH also violates the single-world SQLite atomicity boundary,
+    especially with an Engine-created WAL database.  Ordinary nested SAVEPOINTs
+    remain available for host adapters.
+
+    This protects accidental misuse by trusted callbacks, not arbitrary
+    Python capable of bypassing sqlite3.Connection's bound authorizer.
+    """
+    denied: list[str] = []
+
+    def reject_escape(action, arg1, arg2, database, source):
+        if action == sqlite3.SQLITE_TRANSACTION:
+            denied.append("transaction")
+            return sqlite3.SQLITE_DENY
+        if action in (sqlite3.SQLITE_ATTACH, sqlite3.SQLITE_DETACH):
+            denied.append("ATTACH/DETACH")
+            return sqlite3.SQLITE_DENY
+        return sqlite3.SQLITE_OK
+
+    db._push_clock_authorizer(reject_escape)
+    try:
+        try:
+            yield
+        except BaseException as exc:
+            if denied:
+                # The registered foreground dispatcher already translates
+                # finalizer write/transaction denials into its established
+                # read-only contract error; keep that specific diagnostic.
+                if (isinstance(exc, RuntimeError)
+                        and str(exc) == "Host UTC finalizers must remain read-only"):
+                    raise
+                raise RuntimeError(
+                    f"World clock callback attempted forbidden {denied[0]} control"
+                ) from exc
+            raise
+        if denied:
+            raise RuntimeError(
+                f"World clock callback attempted forbidden {denied[0]} control"
+            )
+        if not db.in_transaction:
+            raise RuntimeError("World clock callback lost the clock-owned transaction")
+    finally:
+        db._pop_clock_authorizer(reject_escape)
+
+
 def _nonclock_world_state(db: sqlite3.Connection) -> tuple[tuple, dict]:
     """World-local persistent state guarded across scheduler receipt writes.
 
@@ -580,7 +631,8 @@ class WorldClock:
             if prepare is not None:
                 if not callable(prepare):
                     raise TypeError("Host tick preparation must be callable")
-                prepare(db, tuple(_event(row) for row in rows))
+                with _guard_clock_callback_transaction(db):
+                    prepare(db, tuple(_event(row) for row in rows))
             expected_world_state = _nonclock_world_state(db)
             initial_world_schema = expected_world_state[0]
             expected_new_nongather = new_nongather_state()
@@ -614,7 +666,8 @@ class WorldClock:
                     }
                 handler_changes = db.total_changes
                 handler_schema = _schema_versions(db)
-                outcome = handler(db, event)
+                with _guard_clock_callback_transaction(db):
+                    outcome = handler(db, event)
                 ship_custody.after_handler(db, event)
                 # The trusted callback owns its authorized state transition.
                 # Freeze the full main-world nonclock result at this boundary,
@@ -804,7 +857,8 @@ class WorldClock:
             if finalizer is not None:
                 if not callable(finalizer):
                     raise TypeError("Host tick finalizer must be callable")
-                finalizer(db, tuple(processed))
+                with _guard_clock_callback_transaction(db):
+                    finalizer(db, tuple(processed))
             ship_custody.before_commit(db)
             if ((not budget_eligible or db.total_changes != finalizer_changes
                     or _schema_versions(db) != finalizer_schema)
