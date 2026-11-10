@@ -166,6 +166,7 @@ class Crafting:
         verb, arg = verb.lower(), arg.strip()
         if verb not in _COMMANDS:
             return None
+        read_only = verb in {"resources", "recipes", "structures"} or (verb == "gather" and not arg)
         if action_id is not None and (not isinstance(action_id, str) or not 1 <= len(action_id) <= 128):
             raise ValueError("Action IDs must be nonempty strings up to 128 characters")
 
@@ -185,7 +186,8 @@ class Crafting:
                 if receipt:
                     if receipt["command"] != command:
                         raise ValueError("Action ID already used for a different command")
-                    return receipt["response"]
+                    if not read_only:
+                        return receipt["response"]
 
             if verb == "resources":
                 found = db.execute(
@@ -215,10 +217,16 @@ class Crafting:
                 response = self._make(db, actor, room, verb, arg)
 
             if action_id is not None:
-                db.execute(
-                    "INSERT INTO action_receipts (actor,action_id,command,response) VALUES (?,?,?,?)",
-                    (actor, action_id, command, response),
-                )
+                if receipt is not None:
+                    db.execute(
+                        "UPDATE action_receipts SET response=? WHERE actor=? AND action_id=?",
+                        (response, actor, action_id),
+                    )
+                else:
+                    db.execute(
+                        "INSERT INTO action_receipts (actor,action_id,command,response) VALUES (?,?,?,?)",
+                        (actor, action_id, command, response),
+                    )
             return response
 
     def _gather(self, db: sqlite3.Connection, actor: str, room: str, arg: str,

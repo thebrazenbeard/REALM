@@ -30,6 +30,7 @@ from .scoped_credentials import CredentialStateError, ScopedCredentialStore
 
 MAX_BODY_BYTES = 4096
 MAX_FEED_EVENTS = 100
+MAX_SCENE_ENTRIES = 50
 DEFAULT_RATE_REQUESTS_PER_MINUTE = 120
 DEFAULT_RATE_BURST = 60
 DEFAULT_RATE_MAX_PRINCIPALS = 256
@@ -390,6 +391,53 @@ class Gateway:
         if not isinstance(player, str):
             raise ValueError("Player must be a string")
         return {"ok": True, "text": self.engine.act(player, "look"), "cursor": self.cursor()}
+
+    def scene(self, player: str) -> dict:
+        """Read current room facts; saved position does not imply online presence.
+
+        An actor's existence alone cannot establish that they are an NPC or
+        that an interaction action is available. The response is bounded and
+        tied to one SQLite read snapshot, including its event cursor.
+        """
+        if not isinstance(player, str):
+            raise ValueError("Player must be a string")
+        with closing(self._read()) as db:
+            db.execute("BEGIN")
+            subject = db.execute("SELECT id,room_id FROM players WHERE id=?", (player,)).fetchone()
+            if subject is None:
+                raise ValueError("Join this REALM before reading the scene")
+            room_id = subject["room_id"]
+            room = db.execute("SELECT id,name,description FROM rooms WHERE id=?", (room_id,)).fetchone()
+            if room is None:
+                raise ValueError("The saved room does not exist")
+            exits = db.execute(
+                "SELECT direction FROM exits WHERE room_id=? ORDER BY direction LIMIT ?",
+                (room_id, MAX_SCENE_ENTRIES + 1),
+            ).fetchall()
+            items = db.execute(
+                "SELECT id,name FROM items WHERE room_id=? ORDER BY id LIMIT ?",
+                (room_id, MAX_SCENE_ENTRIES + 1),
+            ).fetchall()
+            occupants = db.execute(
+                "SELECT id FROM players WHERE room_id=? AND id<>? COLLATE NOCASE "
+                "ORDER BY id COLLATE NOCASE LIMIT ?",
+                (room_id, subject["id"], MAX_SCENE_ENTRIES + 1),
+            ).fetchall()
+            cursor = int(db.execute("SELECT COALESCE(MAX(id),0) FROM events").fetchone()[0])
+            return {
+                "ok": True,
+                "room": {key: room[key] for key in ("id", "name", "description")},
+                "exits": [r["direction"] for r in exits[:MAX_SCENE_ENTRIES]],
+                "items": [{"id": r["id"], "name": r["name"]} for r in items[:MAX_SCENE_ENTRIES]],
+                "occupants": [{"name": r["id"]} for r in occupants[:MAX_SCENE_ENTRIES]],
+                "presence_semantics": "saved_position_only",
+                "truncated": {
+                    "exits": len(exits) > MAX_SCENE_ENTRIES,
+                    "items": len(items) > MAX_SCENE_ENTRIES,
+                    "occupants": len(occupants) > MAX_SCENE_ENTRIES,
+                },
+                "cursor": cursor,
+            }
 
     def map(self, player: str) -> dict:
         """Map for the joined character's persisted room, if one is authored.
@@ -762,6 +810,7 @@ class GatewayHandler(BaseHTTPRequestHandler):
             "/api/v1/join": "world:join",
             "/api/v1/command": "command:write",
             "/api/v1/room": "room:read",
+            "/api/v1/scene": "room:read",
             "/api/v1/map": "map:read",
             "/api/v1/feed": "feed:read",
             "/api/v1/feed/wait": "feed:read",
@@ -837,6 +886,10 @@ class GatewayHandler(BaseHTTPRequestHandler):
                 if not self._player_matches(params.get("player", [None])[0], principal):
                     return
                 result = self.server.gateway.room(principal)
+            elif path == "/api/v1/scene":
+                if not self._player_matches(params.get("player", [None])[0], principal):
+                    return
+                result = self.server.gateway.scene(principal)
             elif path == "/api/v1/map":
                 if not self._player_matches(params.get("player", [None])[0], principal):
                     return

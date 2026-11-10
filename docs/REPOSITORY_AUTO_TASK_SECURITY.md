@@ -37,7 +37,9 @@ content. It rejects:
   Unicode-escaped JSON config values/keys fail closed pending manual review.
   Multi-root workspace folder paths that escape the inspected checkout or
   traverse a symlink, or `uri` references to remote/unknown folders, also
-  require manual review; the scan never follows them.
+  require manual review; the scan never follows them. Configuration bytes with
+  unsupported encodings or embedded NULs fail closed instead of using Unicode
+  replacement characters that could hide auto-run keys from the scanner.
 - Font-named files under `public/fonts/` whose structure does not match a
   plausible TrueType/OpenType table directory and `head` table. WOFF and WOFF2
   assets fail closed pending an independent structural font parser and manual

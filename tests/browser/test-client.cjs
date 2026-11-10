@@ -46,7 +46,7 @@ function worldMap() {
   };
 }
 
-function instantiate({ missingMap = false, mapOnMove = false, rejectUnauthorized = false, fetchImpl = null, mapGate = null, roomGate = null, joinGate = null, nowMs = null } = {}) {
+function instantiate({ missingMap = false, mapOnMove = false, rejectUnauthorized = false, fetchImpl = null, mapGate = null, roomGate = null, joinGate = null, healthGate = null, nowMs = null } = {}) {
   const elements = new Map();
   const get = (id) => {
     if (!elements.has(id)) elements.set(id, new Element());
@@ -72,6 +72,7 @@ function instantiate({ missingMap = false, mapOnMove = false, rejectUnauthorized
   const mockFetch = async (url, options) => {
     requests.push({ url, options });
     const route = new URL(url).pathname;
+    if (route === "/api/v1/health" && healthGate) await healthGate();
     if (route === "/api/v1/map" && mapGate) await mapGate();
     if (route === "/api/v1/room" && roomGate) await roomGate();
     if (route === "/api/v1/join" && joinGate) await joinGate();
@@ -114,6 +115,62 @@ test("successful join requests authorized map, clears DOM token, and renders hos
   client.disconnect();
   assert.equal(client.get("map-status").textContent, "MAP UNAVAILABLE");
   assert.equal(client.get("world-name").textContent, "Unconnected");
+});
+
+test("command history recalls prior commands, restores draft, and clears on disconnect", async () => {
+  const client = instantiate();
+  client.get("host-url").value = "http://127.0.0.1:8765";
+  client.get("player-name").value = "Explorer";
+  client.get("access-token").value = "secret-token";
+  await client.connect();
+  for (const command of ["look", "who"]) {
+    client.get("command-input").value = command;
+    await client.send();
+  }
+  const input = client.get("command-input");
+  function press(key) {
+    let prevented = false;
+    input.events.keydown({ key, preventDefault() { prevented = true; } });
+    return prevented;
+  }
+  input.value = "unfinished message";
+  assert.equal(press("ArrowUp"), true);
+  assert.equal(input.value, "who");
+  assert.equal(press("ArrowUp"), true);
+  assert.equal(input.value, "look");
+  assert.equal(press("ArrowDown"), true);
+  assert.equal(input.value, "who");
+  assert.equal(press("ArrowDown"), true);
+  assert.equal(input.value, "unfinished message");
+  assert.equal(press("ArrowDown"), false);
+  client.disconnect();
+  client.get("access-token").value = "new-token";
+  await client.connect();
+  input.value = "fresh session";
+  assert.equal(press("ArrowUp"), false);
+  assert.equal(input.value, "fresh session");
+});
+
+test("command history keeps only 50 entries and restarts recall after typing", async () => {
+  const client = instantiate();
+  client.get("host-url").value = "http://127.0.0.1:8765";
+  client.get("player-name").value = "Explorer";
+  client.get("access-token").value = "secret-token";
+  await client.connect();
+  const input = client.get("command-input");
+  for (let i = 0; i < 53; i++) {
+    input.value = "look-" + i;
+    await client.send();
+  }
+  for (let i = 0; i < 55; i++) input.events.keydown({ key: "ArrowUp", preventDefault() {} });
+  assert.equal(input.value, "look-3");
+  input.value = "edited draft";
+  input.events.input({});
+  input.events.keydown({ key: "ArrowUp", preventDefault() {} });
+  assert.equal(input.value, "look-52");
+  input.events.keydown({ key: "ArrowDown", preventDefault() {} });
+  assert.equal(input.value, "edited draft");
+  client.disconnect();
 });
 
 test("a host without map support stays connected to its usable MUD", async () => {
@@ -331,6 +388,7 @@ test("a pending join can be cancelled without reviving a disconnected session", 
   const joining = client.connect();
   await waitingForJoin;
   assert.equal(client.get("disconnect-button").disabled, false, "pending joins must be cancellable");
+  assert.equal(client.get("disconnect-button").textContent, "Cancel", "pending control must describe its purpose");
   assert.equal(client.get("access-token").value, "", "pending joins must not leave a secret in the DOM");
   client.disconnect();
   const joinRequest = client.requests.find(({ url }) => url.includes("/api/v1/join"));
@@ -341,6 +399,27 @@ test("a pending join can be cancelled without reviving a disconnected session", 
   assert.equal(client.get("connection-status").textContent, "Offline — no world connected");
   assert.equal(client.get("connect-button").disabled, false);
   assert.equal(client.timers.length, 0);
+});
+
+test("a pending health check can be cancelled before any join, even if response arrives late", async () => {
+  let releaseHealth, enteredHealth;
+  const waiting = new Promise((resolve) => { enteredHealth = resolve; });
+  const pending = new Promise((resolve) => { releaseHealth = resolve; });
+  const client = instantiate({ healthGate: () => { enteredHealth(); return pending; } });
+  client.get("host-url").value = "http://localhost:8765";
+  client.get("player-name").value = "Explorer";
+  client.get("access-token").value = "secret-token";
+  const connecting = client.connect();
+  await waiting;
+  assert.equal(client.get("disconnect-button").textContent, "Cancel");
+  const healthRequest = client.requests.find(({ url }) => url.endsWith("/api/v1/health"));
+  client.disconnect();
+  assert.equal(healthRequest.options.signal.aborted, true);
+  releaseHealth();
+  await connecting;
+  assert.equal(client.requests.filter(({ url }) => url.endsWith("/api/v1/join")).length, 0);
+  assert.equal(client.get("connection-status").textContent, "Offline — no world connected");
+  assert.equal(client.get("access-token").value, "");
 });
 
 test("a cancelled old join cannot overwrite a newly connected world", async () => {
@@ -583,6 +662,12 @@ test("HTTP 503/408 commands retain the same action ID for explicit manual retry"
   await client.send();
   assert.equal(client.get("command-input").value, "say Hold position");
   assert.equal(actionIds.length, 1, "never automatically replay a possibly committed command");
+  // Recalling the failed command must preserve PR175's same-action-ID
+  // manual-retry contract rather than turning it into a fresh mutation.
+  client.get("command-input").value = "unfinished draft";
+  client.get("command-input").events.input({});
+  client.get("command-input").events.keydown({ key: "ArrowUp", preventDefault() {} });
+  assert.equal(client.get("command-input").value, "say Hold position");
   await client.send();
   assert.equal(client.get("command-input").value, "say Hold position");
   assert.equal(actionIds.length, 2);

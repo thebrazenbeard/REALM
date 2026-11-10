@@ -51,8 +51,8 @@ def preflight_local_host(
     """Inspect a *static* one-world host configuration with zero DB writes.
 
     An existing SQLite file is read with ``immutable=1`` to avoid SQLite
-    sidecars and exclusive writer transitions. A WAL or SHM file makes that
-    inspection potentially stale, so the result is explicitly unverified.
+    sidecars and exclusive writer transitions. WAL, SHM and rollback-journal
+    sidecars make that inspection potentially stale, so it is unverified.
     """
     findings: list[Finding] = []
 
@@ -91,6 +91,24 @@ def preflight_local_host(
             add("fatal", "db_parent_not_writable", "Database parent does not advertise write access")
         if path.is_symlink():
             add("warning", "db_symlink", "Database path follows a symbolic link")
+        # Evaluate recovery evidence *before* classifying an absent DB as a
+        # brand-new world: an orphaned journal is not a clean initial state.
+        def sidecar_present(suffix: str) -> bool:
+            # SQLite may create journal files next to the original filename
+            # supplied by a host, not only its symlink-resolved target.
+            for base in (path, resolved):
+                candidate = base.with_name(base.name + suffix)
+                if candidate.exists() or candidate.is_symlink():
+                    return True
+            return False
+
+        if any(sidecar_present(suffix) for suffix in ("-wal", "-shm")):
+            add("fatal", "db_wal_unverified", "WAL/SHM sidecar exists; immutable read cannot certify live state")
+            return PreflightReport(tuple(findings))
+        if sidecar_present("-journal"):
+            add("fatal", "db_journal_unverified",
+                "Rollback journal sidecar exists; immutable read cannot certify recovered state")
+            return PreflightReport(tuple(findings))
         if not path.exists():
             add("warning", "db_missing", "World database is not initialized; authorized startup must create it")
             return PreflightReport(tuple(findings))
@@ -99,9 +117,6 @@ def preflight_local_host(
             return PreflightReport(tuple(findings))
         if not os.access(path, os.R_OK | os.W_OK):
             add("fatal", "db_permissions", "Database does not advertise read/write access")
-        if any(resolved.with_name(resolved.name + suffix).exists() for suffix in ("-wal", "-shm")):
-            add("fatal", "db_wal_unverified", "WAL/SHM sidecar exists; immutable read cannot certify live state")
-            return PreflightReport(tuple(findings))
         with closing(sqlite3.connect(resolved.as_uri() + "?mode=ro&immutable=1", uri=True)) as db:
             db.execute("PRAGMA query_only=ON")
             observed = _schema_snapshot(db)

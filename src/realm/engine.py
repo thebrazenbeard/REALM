@@ -232,7 +232,10 @@ class Engine:
             verb = "go"
         if action_id is not None and (not isinstance(action_id, str) or not 1 <= len(action_id) <= 128):
             raise ValueError("Action IDs must be nonempty strings up to 128 characters")
-        if verb in {"quit", "exit"}:
+        read_only = verb in {"look", "l", "examine", "x", "where", "location",
+                             "inventory", "inv", "i", "who", "history", "listen",
+                             "help", "?", "quit", "exit"}
+        if verb in {"quit", "exit"} and action_id is None:
             return "Goodbye. Your position is saved."
         with closing(self._connect()) as db, db:
             # Serialize competing actions such as two players taking one object.
@@ -251,11 +254,10 @@ class Engine:
                 if receipt is not None:
                     if receipt["command"] != command:
                         raise ValueError("Action ID already used for a different command")
-                    # Room history is a read whose authorization boundary
-                    # changes on every arrival. A cached old transcript is
-                    # not an idempotent mutation receipt: re-evaluate the
-                    # current room's entry floor even on a retried action ID.
-                    if verb not in {"history", "listen"}:
+                    # A read receipt is never a standing authorization grant.
+                    # Re-evaluate the room, item ownership and speech entry
+                    # floor on each retry; only mutations replay old results.
+                    if not read_only:
                         return receipt["response"]
             response = self._perform(db, actor, room_id, verb, arg)
             if action_id is not None:
@@ -291,8 +293,23 @@ class Engine:
 
     def _perform(self, db: sqlite3.Connection, actor: str, room_id: str, verb: str,
                  arg: str, *, emissions: list[tuple[int, str]] | None = None) -> str:
-            if verb in {"look", "l"}:
+            if verb in {"quit", "exit"}:
+                return "Goodbye. Your position is saved."
+            if verb in {"look", "l"} and (not arg or arg.casefold() in {"around", "here", "room"}):
                 return self._look(db, room_id, actor)
+            if verb in {"look", "l", "examine", "x"}:
+                target = arg[3:] if arg.casefold().startswith("at ") else arg
+                if not target:
+                    return "Examine what?"
+                item = db.execute(
+                    "SELECT name,description FROM items "
+                    "WHERE (room_id=? OR held_by=?) "
+                    "AND (id=? COLLATE NOCASE OR name=? COLLATE NOCASE) "
+                    "ORDER BY CASE WHEN room_id=? THEN 0 ELSE 1 END, id LIMIT 1",
+                    (room_id, actor, target, target, room_id),
+                ).fetchone()
+                return (f"{item['name']}\n{item['description']}" if item is not None
+                        else "You cannot examine that here.")
             if verb in {"where", "location"}:
                 return f"You are in {db.execute('SELECT name FROM rooms WHERE id=?', (room_id,)).fetchone()[0]}."
             if verb == "go":
@@ -380,5 +397,5 @@ class Engine:
                         items.append(f"{event['actor']} {past} {details['item']}")
                 return "\n".join(items) if items else "No recorded activity here yet."
             if verb in {"help", "?"}:
-                return "Commands: look, go <north|south|east|west>, n/s/e/w, take <item>, drop <item>, inventory, say <text>, listen, history [1-50], who, where, help, quit"
+                return "Commands: look [item], examine <item> (x), go <north|south|east|west>, n/s/e/w, take <item>, drop <item>, inventory, say <text>, listen, history [1-50], who, where, help, quit"
             return "Unknown command. Type 'help' for options."

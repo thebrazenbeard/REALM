@@ -106,7 +106,17 @@ class RepositoryAutoRunAssetGuardTests(unittest.TestCase):
             if not config.is_file():
                 offenders.append(f"{label}: not a regular configuration file")
                 continue
-            text = config.read_text(encoding="utf-8-sig", errors="replace")
+            # A replacement decoder can hide executable keys in UTF-16 or
+            # malformed byte sequences. JSONC config must be valid UTF-8 for
+            # this static scan; unknown encodings require manual review.
+            try:
+                text = config.read_text(encoding="utf-8-sig")
+            except (UnicodeError, OSError):
+                offenders.append(f"{label}: unsupported configuration encoding")
+                continue
+            if "\x00" in text:
+                offenders.append(f"{label}: unsupported configuration encoding")
+                continue
             if _AUTORUN.search(text):
                 offenders.append(f"{label}: folderOpen task")
             if _AUTO_APPROVAL.search(text):
@@ -195,6 +205,56 @@ class RepositoryAutoRunAssetGuardTests(unittest.TestCase):
                 self._check_another_tree(
                     root, "test_workspace_does_not_auto_run_repo_controlled_commands",
                 )
+
+    def test_utf16_auto_run_configuration_requires_review(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            vscode = root / ".vscode"
+            vscode.mkdir()
+            (vscode / "tasks.json").write_bytes(
+                '{"tasks":[{"runOptions":{"runOn":"folderOpen"}}]}'.encode("utf-16"),
+            )
+            with self.assertRaisesRegex(AssertionError, "unsupported configuration encoding"):
+                self._check_another_tree(
+                    root, "test_workspace_does_not_auto_run_repo_controlled_commands",
+                )
+
+    def test_utf16_workspace_external_folder_requires_review(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            (root / "External.code-workspace").write_bytes(
+                '{"folders":[{"path":"../outside"}]}'.encode("utf-16"),
+            )
+            with self.assertRaisesRegex(AssertionError, "unsupported configuration encoding"):
+                self._check_another_tree(
+                    root, "test_workspace_does_not_auto_run_repo_controlled_commands",
+                )
+
+    def test_utf16_without_bom_auto_run_requires_review(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            vscode = root / ".vscode"
+            vscode.mkdir()
+            (vscode / "tasks.json").write_bytes(
+                '{"runOn":"folderOpen"}'.encode("utf-16-le"),
+            )
+            with self.assertRaisesRegex(AssertionError, "unsupported configuration encoding"):
+                self._check_another_tree(
+                    root, "test_workspace_does_not_auto_run_repo_controlled_commands",
+                )
+
+    def test_utf8_manual_non_ascii_task_remains_allowed(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            vscode = root / ".vscode"
+            vscode.mkdir()
+            (vscode / "tasks.json").write_text(
+                '{"tasks":[{"label":"caf\u00e9","command":"echo safe"}]}',
+                encoding="utf-8",
+            )
+            self._check_another_tree(
+                root, "test_workspace_does_not_auto_run_repo_controlled_commands",
+            )
 
     def test_root_code_workspace_folder_open_task_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as folder:

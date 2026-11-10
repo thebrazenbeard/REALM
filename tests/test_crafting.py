@@ -118,5 +118,41 @@ class CraftingTests(unittest.TestCase):
             self.crafting.perform("NoSuchPlayer", "gather stone")
 
 
+    def test_resources_read_receipt_reflects_new_holdings_after_gather(self):
+        before = self.crafting.perform("Patrick", "resources", action_id="read-resources")
+        self.assertIn("Materials: none", before)
+        self.crafting.perform("Patrick", "gather stone")
+        after = self.crafting.perform("Patrick", "resources", action_id="read-resources")
+        self.assertIn("stone x3", after)
+        self.assertNotEqual(before, after, "an old read receipt cannot conceal new holdings")
+
+    def test_recipes_read_receipt_reflects_author_registration(self):
+        before = self.crafting.perform("Patrick", "recipes", action_id="read-recipes")
+        self.assertNotIn("signal fire", before)
+        self.crafting.register_recipe("signal fire", kind="build", ingredients={"wood": 2})
+        after = Crafting(self.db_path).perform("Patrick", "recipes", action_id="read-recipes")
+        self.assertIn("signal fire", after)
+        self.assertNotEqual(before, after)
+
+    def test_structures_read_receipt_tracks_current_room(self):
+        before = self.crafting.perform("Patrick", "structures", action_id="read-structures")
+        self.assertEqual("Structures here: none", before)
+        self.crafting.perform("Patrick", "gather stone")
+        self.engine.act("Patrick", "north")
+        self.crafting.perform("Patrick", "gather wood")
+        self.assertEqual("You build supply cache here.", self.crafting.perform("Patrick", "build supply cache"))
+        after = self.crafting.perform("Patrick", "structures", action_id="read-structures")
+        self.assertIn("supply cache (Patrick)", after)
+        self.assertNotEqual(before, after, "room-scoped reads cannot replay the old room")
+
+    def test_gather_without_material_is_a_read_that_tracks_node_stock(self):
+        before = self.crafting.perform("Patrick", "gather", action_id="read-nodes")
+        self.assertIn("stone (20)", before)
+        self.crafting.perform("Vera", "gather stone")
+        after = self.crafting.perform("Patrick", "gather", action_id="read-nodes")
+        self.assertIn("stone (17)", after)
+        with self.assertRaisesRegex(ValueError, "different command"):
+            self.crafting.perform("Patrick", "resources", action_id="read-nodes")
+
 if __name__ == "__main__":
     unittest.main()

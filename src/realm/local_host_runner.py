@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import math
 import socket
+import sys
 import threading
 import time
 from datetime import datetime, timezone
@@ -35,8 +36,24 @@ class _AcceptedSessions:
     def __init__(self, server: GatewayServer | LocalTelnetServer):
         self._condition = threading.Condition()
         self._active: set[socket.socket] = set()
+        self._revoked: set[socket.socket] = set()
+        self._quiescing = threading.Event()
         process_request = server.process_request
         process_request_thread = server.process_request_thread
+        handle_error = server.handle_error
+
+        def tracked_error(request: socket.socket, client_address: tuple) -> None:
+            error = sys.exc_info()[1]
+            with self._condition:
+                deliberately_revoked = request in self._revoked
+            if (self._quiescing.is_set() and deliberately_revoked
+                    and isinstance(error, OSError)
+                    and getattr(error, "winerror", None) in (10038, 10053)):
+                # Only the exact accepted sockets selected for forced closure
+                # may suppress Windows buffered HTTP read/write aborts. A
+                # same-code exception on any other request stays visible.
+                return
+            handle_error(request, client_address)
 
         def tracked_request(request: socket.socket, client_address: tuple) -> None:
             with self._condition:
@@ -54,6 +71,7 @@ class _AcceptedSessions:
                 process_request_thread(request, client_address)
             finally:
                 with self._condition:
+                    self._revoked.discard(request)
                     self._active.discard(request)
                     self._condition.notify_all()
 
@@ -61,10 +79,13 @@ class _AcceptedSessions:
         # the foreground call and are closed in its finally block.
         server.process_request = tracked_request
         server.process_request_thread = tracked_worker
+        server.handle_error = tracked_error
 
     def quiesce(self) -> None:
         with self._condition:
             accepted = tuple(self._active)
+            self._revoked.update(accepted)
+            self._quiescing.set()
         for request in accepted:
             try:
                 request.shutdown(socket.SHUT_RDWR)
@@ -89,6 +110,7 @@ class _AcceptedSessions:
                 # This deliberately waits for truthful quiescence; hosts need
                 # process isolation for a hard shutdown deadline.
                 self._condition.wait()
+            self._revoked.clear()
 
 
 def run_local_host(

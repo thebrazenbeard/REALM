@@ -87,8 +87,16 @@ For browser requests, Origin must exactly match one explicitly configured
 | `POST /api/v1/join` | `{"player":"Patrick"}` | `{"ok":true,"text":"Welcome ...","cursor":1}` |
 | `POST /api/v1/command` | `{"player":"Patrick","command":"look","action_id":"optional-unique-id"}` | `{"ok":true,"text":"...","cursor":1}` |
 | `GET /api/v1/room?player=Patrick` | query | `{"ok":true,"text":"...","cursor":1}` |
+| `GET /api/v1/scene?player=Patrick` | query | Authenticated saved-room facts: `room`, `exits`, `items`, `occupants`, `presence_semantics`, `truncated`, `cursor` |
 | `GET /api/v1/feed?player=Patrick&after=1` | query | `{"ok":true,"events":[...],"cursor":2}` |
 | `GET /api/v1/map?player=Patrick` | query; optional authored geography | `{"ok":true,"space":{...},"origin":{...},"width":3,"height":2,"tiles":[...],"markers":[...],"player":{...},"legend":[...]}` |
+
+The optional `/scene` endpoint reads the authenticated player's room, exits,
+visible items, and actors' saved room positions in one SQLite read snapshot.
+Each collection is capped at 50 entries with a `truncated` flag. The
+`presence_semantics` value is `saved_position_only`: an occupant is not proof
+of a connected human, an NPC classification, an AI agent, or an available
+`talk` action. Unknown inhabitants are never invented by this endpoint.
 
 The map endpoint reads the joined player's **actual persisted room** from
 `players.room_id` and picks the closest authored geography layer containing
@@ -174,6 +182,15 @@ server push. It is filtered to the player's current room, returns up to 100
 events per request, and advances its cursor only for returned events.
 The join response supplies a starting cursor to avoid displaying a room's
 entire previous history as new activity.
+
+Keyed gameplay commands retain mutation idempotency: replaying the same
+`action_id` cannot take, gather, craft, or say twice. Read-only commands,
+including `look`, `examine`, `inventory`, `who`, `history`, `resources`,
+`recipes`, `structures`, and bare `gather`, are evaluated against current
+authorized state on each retry. An old observation receipt cannot grant
+access to an item another actor now holds or to speech from before arrival.
+`examine <item>` (alias `x <item>` or `look at <item>`) only reveals items
+in the caller's room or inventory and writes no world event.
 
 Credentials are bound to one character name, but are long-lived bearer
 capabilities rather than expiring sessions with account recovery. Anyone who
