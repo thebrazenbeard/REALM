@@ -52,6 +52,8 @@ function instantiate({ missingMap = false, mapOnMove = false, rejectUnauthorized
     if (!elements.has(id)) elements.set(id, new Element());
     return elements.get(id);
   };
+  // A host-issued world binding is part of every normal connection fixture.
+  get("expected-world-id").value = "test-world";
   const requests = [];
   const timers = [];
   let mapAvailable = !missingMap;
@@ -98,6 +100,58 @@ function instantiate({ missingMap = false, mapOnMove = false, rejectUnauthorized
     disconnect: () => get("disconnect-button").events.click(),
     send: () => get("command-form").events.submit(event) };
 }
+
+test("expected world ID binds a browser join to the host-reported world", async () => {
+  const client = instantiate();
+  client.get("host-url").value = "http://127.0.0.1:8765";
+  client.get("expected-world-id").value = "test-world";
+  client.get("player-name").value = "Explorer";
+  client.get("access-token").value = "secret-token";
+  await client.connect();
+  assert.equal(client.get("world-name").textContent, "test-world");
+  assert.ok(client.requests.some(({ url }) => url.includes("/api/v1/join")));
+  assert.equal(client.get("expected-world-id").disabled, true);
+  client.disconnect();
+  assert.equal(client.get("expected-world-id").disabled, false);
+});
+
+test("wrong expected world ID refuses the authenticated join before sending bearer token", async () => {
+  const client = instantiate();
+  client.get("host-url").value = "http://127.0.0.1:8765";
+  client.get("expected-world-id").value = "driftspace";
+  client.get("player-name").value = "Explorer";
+  client.get("access-token").value = "secret-token";
+  await client.connect();
+  assert.equal(client.get("world-name").textContent, "Unconnected");
+  assert.equal(client.requests.length, 1, "must only make unauthenticated health request");
+  assert.match(client.requests[0].url, /\/api\/v1\/health$/);
+  assert.equal(client.requests[0].options.headers.Authorization, undefined);
+  assert.equal(client.get("access-token").value, "");
+  assert.match(client.get("connection-note").textContent, /World mismatch: expected driftspace, host reports test-world/);
+});
+
+test("blank expected world ID rejects locally before contacting any endpoint", async () => {
+  const client = instantiate();
+  client.get("host-url").value = "http://127.0.0.1:8765";
+  client.get("expected-world-id").value = "   ";
+  client.get("player-name").value = "Explorer";
+  client.get("access-token").value = "secret-token";
+  await client.connect();
+  assert.equal(client.requests.length, 0, "no health or bearer request is allowed without a pinned world");
+  assert.notEqual(client.get("world-name").textContent, "test-world");
+  assert.match(client.get("connection-note").textContent, /Enter the exact world ID provided by your host/);
+});
+
+test("invalid expected world ID fails locally without sending a credential", async () => {
+  const client = instantiate();
+  client.get("host-url").value = "http://127.0.0.1:8765";
+  client.get("expected-world-id").value = "wrong world";
+  client.get("player-name").value = "Explorer";
+  client.get("access-token").value = "secret-token";
+  await client.connect();
+  assert.equal(client.requests.length, 0);
+  assert.match(client.get("connection-note").textContent, /Expected world ID/);
+});
 
 test("successful join requests authorized map, clears DOM token, and renders host tiles", async () => {
   const client = instantiate();
@@ -325,6 +379,7 @@ test("live Python gateway: browser join, authored map, movement, and token rejec
     headers: { ...options.headers, Origin: "http://127.0.0.1:8000" },
   });
   const client = instantiate({ fetchImpl: liveFetch });
+  client.get("expected-world-id").value = "browser-integration-test";
   client.get("host-url").value = base;
   client.get("player-name").value = "Explorer";
   client.get("access-token").value = ready.playerToken;
@@ -339,6 +394,7 @@ test("live Python gateway: browser join, authored map, movement, and token rejec
   client.disconnect();
   assert.equal(client.get("map-status").textContent, "MAP UNAVAILABLE");
   const intruder = instantiate({ fetchImpl: liveFetch });
+  intruder.get("expected-world-id").value = "browser-integration-test";
   intruder.get("host-url").value = base;
   intruder.get("player-name").value = "Explorer";
   intruder.get("access-token").value = "incorrect-token";
@@ -347,6 +403,7 @@ test("live Python gateway: browser join, authored map, movement, and token rejec
   assert.match(intruder.get("connection-note").textContent, /401/);
   if (ready.mode === "player") {
     const wrongActor = instantiate({ fetchImpl: liveFetch });
+    wrongActor.get("expected-world-id").value = "browser-integration-test";
     wrongActor.get("host-url").value = base;
     wrongActor.get("player-name").value = "Explorer";
     wrongActor.get("access-token").value = ready.otherToken;
