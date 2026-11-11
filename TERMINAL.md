@@ -15,6 +15,21 @@ Set `REALM_TELNET_TOKEN` in the server process environment if you need a stable
 test token. Run two clients to share movement, speech, item ownership and
 history. Use `help`, `look`, `n`, `say hello`, `listen`, `who`, `quit`.
 
+### Optional Mudlet / ANSI presentation
+
+After authentication, enter `color on` to enable colors for **this socket only**.
+Use `palette` (`colors` or `colours`) to preview named swatches; `color off`
+(or `colour off`) restores plain text. New sessions start without ANSI.
+Room titles, exits, items and inventory use distinct colors. Named colors in
+**room descriptions only** are highlighted, including `copper`, `amber`,
+`pink`, `cyan`, and `light grey`; player chat is not semantically recolored.
+No room, player, credential or SQLite data changes when toggling colors.
+
+This generic, opt-in renderer adapts the palette concept from
+[Driftspace's public-safe terminal PR #4](https://github.com/thebrazenbeard/driftspace/pull/4),
+without importing its setting, pilot-only social receipts or AI crew claims.
+It is not automatic Telnet capability negotiation or remote-transport approval.
+
 An **opt-in host-provisioned player-identity mode** accepts a distinct token
 per player and never accepts a network-supplied player name:
 

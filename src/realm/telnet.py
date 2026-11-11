@@ -25,6 +25,7 @@ from .engine import Engine, _pristine_schema, _schema_snapshot
 from .local_presence import LocalPresenceWitness, PresenceDenied, PresenceLease, _WORLD
 from .presence_host_binding import bind_host_engine, unbind_host_engine
 from .router import CommandRouter
+from .terminal_presentation import palette_preview, render_terminal
 
 
 IAC = 255
@@ -254,6 +255,8 @@ class LocalTelnetHandler(socketserver.BaseRequestHandler):
         self._filter = _TelnetFilter()
         self._pending = bytearray()
         self._skip_lf = False
+        # Color is opt-in per socket; no world or account preference is written.
+        self._ansi_enabled = False
 
     def _send(self, message: str) -> None:
         # ASCII Telnet clients conventionally expect CRLF; errors are replaced
@@ -388,6 +391,19 @@ class LocalTelnetHandler(socketserver.BaseRequestHandler):
             if not command:
                 self._send("REALM> ")
                 continue
+            verb, _, args = command.casefold().partition(" ")
+            if verb in {"color", "colour"}:
+                setting = args.strip()
+                if setting in {"on", "off"}:
+                    self._ansi_enabled = setting == "on"
+                    result = "ANSI colors enabled." if self._ansi_enabled else "ANSI colors disabled."
+                else:
+                    result = "Terminal colors: color on | color off | palette"
+                self._send(result + "\nREALM> ")
+                continue
+            if verb in {"palette", "colors", "colours"} and not args.strip():
+                self._send(palette_preview(ansi=self._ansi_enabled) + "\nREALM> ")
+                continue
             channel_revision = (
                 self.server.channel_access_revision(name)
                 if self.server.player_credentials and
@@ -412,6 +428,13 @@ class LocalTelnetHandler(socketserver.BaseRequestHandler):
                     return
                 if channel_revision != self.server.channel_access_revision(name):
                     result = "Channel membership changed; retry command."
+            if verb == "help":
+                result += "\nTerminal colors: color on | color off | palette"
+            room_command = verb in {
+                "look", "l", "go", "north", "south", "east", "west",
+                "up", "down", "n", "s", "e", "w", "u", "d",
+            }
+            result = render_terminal(result, ansi=self._ansi_enabled, room=room_command)
             self._send(f"{result}\n")
             if command.casefold() in {"quit", "exit"}:
                 return
