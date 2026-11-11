@@ -158,6 +158,9 @@
         body: options.body ? JSON.stringify(options.body) : undefined,
         credentials: "omit",
         cache: "no-store",
+        // Redirects can replay a bearer-bearing POST to an unexpected route.
+        // Treat any redirect as a failed request; callers retain retry custody.
+        redirect: "error",
         signal: options.signal || session.abortController.signal,
       });
     } catch {

@@ -3,6 +3,7 @@
 const assert = require("node:assert/strict");
 const { spawn } = require("node:child_process");
 const fs = require("node:fs");
+const http = require("node:http");
 const os = require("node:os");
 const path = require("node:path");
 const test = require("node:test");
@@ -133,6 +134,41 @@ test("wrong expected world ID refuses bearer authentication after an unauthentic
   assert.equal(client.requests[0].options.headers.Authorization, undefined);
   assert.equal(client.get("access-token").value, "");
   assert.match(client.get("connection-note").textContent, /World mismatch/);
+});
+
+test("an authenticated browser join never follows an HTTP redirect with its bearer", async () => {
+  const observed = [];
+  const server = http.createServer((req, res) => {
+    observed.push({ path: req.url, authorization: req.headers.authorization });
+    res.setHeader("Content-Type", "application/json");
+    if (req.url === "/api/v1/health") return res.end(JSON.stringify({ ok: true, world_id: "test-world" }));
+    if (req.url === "/api/v1/join") {
+      res.writeHead(307, { Location: "/unexpected-join-handler" });
+      return res.end();
+    }
+    if (req.url === "/unexpected-join-handler") return res.end(JSON.stringify({ cursor: 0, text: "Redirected join" }));
+    if (req.url.startsWith("/api/v1/room")) return res.end(JSON.stringify({ text: "A room." }));
+    res.writeHead(404);
+    return res.end(JSON.stringify({ error: "Not found" }));
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const client = instantiate({ fetchImpl: fetch });
+  client.get("host-url").value = "http://127.0.0.1:" + server.address().port;
+  client.get("player-name").value = "Explorer";
+  client.get("access-token").value = "secret-token";
+  try {
+    await client.connect();
+    assert.equal(observed[0].path, "/api/v1/health");
+    assert.equal(observed[0].authorization, undefined);
+    assert.equal(observed[1].path, "/api/v1/join");
+    assert.equal(observed[1].authorization, "Bearer secret-token");
+    assert.equal(observed.some((item) => item.path === "/unexpected-join-handler"), false,
+      "The browser may not forward a bearer POST to a redirect target");
+    assert.equal(client.get("world-name").textContent, "Unconnected");
+  } finally {
+    client.disconnect();
+    await new Promise((resolve) => server.close(resolve));
+  }
 });
 
 test("editing the expected world while health is pending cannot redirect an in-flight join", async () => {
