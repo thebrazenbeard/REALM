@@ -11,6 +11,7 @@ from collections import OrderedDict
 import errno
 import json
 import math
+import os
 import re
 import socket
 import sqlite3
@@ -704,6 +705,16 @@ class _PrincipalRateLimiter:
 
 
 class GatewayServer(ThreadingHTTPServer):
+    # On Windows, SO_REUSEADDR lets another listener forcibly claim our
+    # already-bound port. Reserve the local game listener exclusively instead.
+    # Keep the established POSIX quick-restart behavior unchanged.
+    allow_reuse_address = os.name != "nt"
+
+    def server_bind(self) -> None:
+        if os.name == "nt":
+            self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+        super().server_bind()
+
     daemon_threads = True
 
     def __init__(
