@@ -75,8 +75,12 @@ class GatewayHeaderDeadlineTests(unittest.TestCase):
         deadline = time.monotonic() + seconds
         observed = []
         while time.monotonic() < deadline:
-            code = self._status()
-            observed.append(code)
+            # Under worker-slot pressure, Windows can reset an overloaded
+            # connection after receiving its unread GET request. That is an
+            # acceptable *intermediate* denial, not proof that capacity was
+            # restored. Require the actual expected HTTP status by deadline.
+            code = self._status(allow_reset=True)
+            observed.append("reset/closed" if code is None else code)
             if code == wanted:
                 return
             time.sleep(0.02)

@@ -7,6 +7,7 @@
     connectionForm: byId("connection-form"),
     commandForm: byId("command-form"),
     hostUrl: byId("host-url"),
+    expectedWorld: byId("expected-world-id"),
     playerName: byId("player-name"),
     accessToken: byId("access-token"),
     connect: byId("connect-button"),
@@ -35,6 +36,7 @@
 
   const quickActions = [...document.querySelectorAll("[data-command]")];
   const NAME_PATTERN = /^[A-Za-z][A-Za-z0-9_-]{0,23}$/;
+  const WORLD_ID_PATTERN = /^[A-Za-z][A-Za-z0-9_-]{0,63}$/;
   const POLL_DELAY_MS = 2200;
   const MAX_RATE_RETRY_MS = 30000;
   const MAX_FEED_ITEMS = 160;
@@ -65,7 +67,7 @@
     ui.send.disabled = !connected;
     ui.commandHint.textContent = connected ? "Host commands · ↑/↓ recall up to 50 recent entries" : "Connect to issue commands";
     quickActions.forEach((button) => { button.disabled = !connected; });
-    [ui.hostUrl, ui.playerName, ui.accessToken].forEach((input) => { input.disabled = connected; });
+    [ui.hostUrl, ui.expectedWorld, ui.playerName, ui.accessToken].forEach((input) => { input.disabled = connected; });
   }
 
   function appendFeed({ category = "system", label, message, icon = "◇" }) {
@@ -404,8 +406,11 @@
     if (current || connecting) return;
     if (!ui.connectionForm.reportValidity()) return;
     const player = ui.playerName.value.trim();
+    const expectedWorld = ui.expectedWorld.value.trim();
     const token = ui.accessToken.value.trim();
     if (!NAME_PATTERN.test(player)) return setNote("Player names must use letters, digits, underscores, or hyphens, starting with a letter.", true);
+    if (!expectedWorld) return setNote("Enter the exact world ID supplied by your trusted host before connecting.", true);
+    if (!WORLD_ID_PATTERN.test(expectedWorld)) return setNote("Expected world ID must start with a letter and contain only letters, digits, underscores or hyphens (64 characters maximum).", true);
     if (!token) return setNote("Your host access token is required.", true);
     let base;
     try { base = normalizeEndpoint(ui.hostUrl.value); }
@@ -429,6 +434,11 @@
       const health = await request(session, "/api/v1/health", { unauthenticated: true });
       if (connecting !== session) return;
       if (health.ok !== true || typeof health.world_id !== "string") throw new Error("The endpoint is not a compatible REALM gateway.");
+      // The first authenticated request must not go to the wrong world.
+      // This is a world-selection guard, not cryptographic host identity.
+      if (health.world_id !== expectedWorld) {
+        throw new Error("World mismatch: expected " + expectedWorld + ", host reports " + health.world_id + ". No access token was sent.");
+      }
       session.worldId = health.world_id;
       const joined = await request(session, "/api/v1/join", { body: { player } });
       if (connecting !== session) return;

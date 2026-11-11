@@ -46,12 +46,13 @@ function worldMap() {
   };
 }
 
-function instantiate({ missingMap = false, mapOnMove = false, rejectUnauthorized = false, fetchImpl = null, mapGate = null, roomGate = null, joinGate = null, healthGate = null, commandGate = null, quickActionCommands = [], cryptoImpl = require("node:crypto").webcrypto, nowMs = null } = {}) {
+function instantiate({ missingMap = false, mapOnMove = false, rejectUnauthorized = false, fetchImpl = null, mapGate = null, roomGate = null, joinGate = null, healthGate = null, commandGate = null, quickActionCommands = [], cryptoImpl = require("node:crypto").webcrypto, nowMs = null, expectedWorld = "test-world" } = {}) {
   const elements = new Map();
   const get = (id) => {
     if (!elements.has(id)) elements.set(id, new Element());
     return elements.get(id);
   };
+  get("expected-world-id").value = expectedWorld;
   const requests = [];
   const timers = [];
   let mapAvailable = !missingMap;
@@ -105,6 +106,71 @@ function instantiate({ missingMap = false, mapOnMove = false, rejectUnauthorized
     disconnect: () => get("disconnect-button").events.click(),
     send: () => get("command-form").events.submit(event) };
 }
+
+test("expected world ID gates a browser join and stays fixed while connected", async () => {
+  const client = instantiate();
+  client.get("host-url").value = "http://127.0.0.1:8765";
+  client.get("player-name").value = "Explorer";
+  client.get("access-token").value = "secret-token";
+  await client.connect();
+  assert.equal(client.get("world-name").textContent, "test-world");
+  assert.ok(client.requests.some(({ url }) => url.endsWith("/api/v1/join")));
+  assert.equal(client.get("expected-world-id").disabled, true);
+  client.disconnect();
+  assert.equal(client.get("expected-world-id").disabled, false);
+});
+
+test("wrong expected world ID refuses bearer authentication after an unauthenticated health probe", async () => {
+  const client = instantiate();
+  client.get("host-url").value = "http://127.0.0.1:8765";
+  client.get("expected-world-id").value = "wrong-world";
+  client.get("player-name").value = "Explorer";
+  client.get("access-token").value = "secret-token";
+  await client.connect();
+  assert.equal(client.get("world-name").textContent, "Unconnected");
+  assert.equal(client.requests.length, 1);
+  assert.match(client.requests[0].url, /\/api\/v1\/health$/);
+  assert.equal(client.requests[0].options.headers.Authorization, undefined);
+  assert.equal(client.get("access-token").value, "");
+  assert.match(client.get("connection-note").textContent, /World mismatch/);
+});
+
+test("editing the expected world while health is pending cannot redirect an in-flight join", async () => {
+  let releaseHealth;
+  let reachedHealth;
+  const pending = new Promise((resolve) => { releaseHealth = resolve; });
+  const entered = new Promise((resolve) => { reachedHealth = resolve; });
+  const client = instantiate({ expectedWorld: "wrong-world", healthGate: async () => {
+    reachedHealth();
+    await pending;
+  } });
+  client.get("host-url").value = "http://127.0.0.1:8765";
+  client.get("player-name").value = "Explorer";
+  client.get("access-token").value = "secret-token";
+  const attempt = client.connect();
+  await entered;
+  client.get("expected-world-id").value = "test-world";
+  releaseHealth();
+  await attempt;
+  assert.equal(client.requests.length, 1);
+  assert.match(client.requests[0].url, /\/api\/v1\/health$/);
+  assert.equal(client.requests[0].options.headers.Authorization, undefined);
+  assert.match(client.get("connection-note").textContent, /expected wrong-world/);
+  assert.equal(client.get("access-token").value, "");
+});
+
+test("missing or invalid expected world ID rejects locally with no network requests", async () => {
+  for (const expected of ["   ", "a world", "1wrong", "a".repeat(65)]) {
+    const client = instantiate();
+    client.get("host-url").value = "http://127.0.0.1:8765";
+    client.get("expected-world-id").value = expected;
+    client.get("player-name").value = "Explorer";
+    client.get("access-token").value = "secret-token";
+    await client.connect();
+    assert.equal(client.requests.length, 0, "unbound world " + JSON.stringify(expected));
+    assert.notEqual(client.get("world-name").textContent, "test-world");
+  }
+});
 
 test("successful join requests authorized map, clears DOM token, and renders host tiles", async () => {
   const client = instantiate();
@@ -421,7 +487,7 @@ test("a slow periodic map fetch cannot overwrite a post-command position", async
   let playerX = 0;
   let mapCalls = 0;
   const clock = { value: 1000 };
-  const client = instantiate({ nowMs: clock, fetchImpl: async (url) => {
+  const client = instantiate({ expectedWorld: "race-world", nowMs: clock, fetchImpl: async (url) => {
     const route = new URL(url).pathname;
     if (route === "/api/v1/map") {
       const snapshot = playerX;
@@ -462,7 +528,7 @@ test("a slow initial room response cannot overwrite a room reached by a command"
   const oldRoomEntered = new Promise((resolve) => { enterOldRoom = resolve; });
   const pendingOldRoom = new Promise((resolve) => { releaseOldRoom = resolve; });
   let room = "Old Deck", roomCalls = 0;
-  const client = instantiate({ fetchImpl: async (url) => {
+  const client = instantiate({ expectedWorld: "room-race", fetchImpl: async (url) => {
     const route = new URL(url).pathname;
     if (route === "/api/v1/room") {
       const snapshot = room;
@@ -783,7 +849,7 @@ test("late malformed join from cancelled session cannot undo a new valid join", 
   const oldEntered = new Promise((resolve) => { entered = resolve; });
   const oldHeld = new Promise((resolve) => { release = resolve; });
   let joins = 0;
-  const client = instantiate({ fetchImpl: async (url) => {
+  const client = instantiate({ expectedWorld: "new-world", fetchImpl: async (url) => {
     const route = new URL(url).pathname;
     if (route === "/api/v1/join" && ++joins === 1) {
       entered();
@@ -832,7 +898,7 @@ test("feed throttling honors bounded Retry-After without disconnecting the sessi
     "/api/v1/map": worldMap(),
     "/api/v1/feed": { ok: true, cursor: 1, events: [{ id: 1, kind: "say", actor: "Tessa", text: "Ready" }] },
   };
-  const client = instantiate({ nowMs: clock, fetchImpl: async (url) => {
+  const client = instantiate({ expectedWorld: "limited-world", nowMs: clock, fetchImpl: async (url) => {
     const route = new URL(url).pathname;
     assert.ok(route in responses);
     if (route === "/api/v1/feed" && ++feedRequests === 1) {
@@ -868,7 +934,7 @@ test("global PvP death notices render as distinct inert heralds without exposing
       { id: 3, actor: "World", kind: "say", room: "atrium", text: "The wind settles." },
     ] },
   };
-  const client = instantiate({ fetchImpl: async (url) => {
+  const client = instantiate({ expectedWorld: "fantasy-world", fetchImpl: async (url) => {
     const route = new URL(url).pathname;
     assert.ok(route in responses, "unexpected route " + route);
     return { ok: true, status: 200, json: async () => responses[route] };
@@ -891,7 +957,7 @@ test("global PvP death notices render as distinct inert heralds without exposing
 });
 
 test("malformed PvP death event never echoes a private room identifier in its title", async () => {
-  const client = instantiate({ fetchImpl: async (url) => {
+  const client = instantiate({ expectedWorld: "fantasy-world", fetchImpl: async (url) => {
     const route = new URL(url).pathname;
     const payloads = {
       "/api/v1/health": { ok: true, world_id: "fantasy-world" },
@@ -932,7 +998,7 @@ test("emote, OOC, and private group messages render with fixed headings and iner
         group_id: "unpublished-private-membership", role: "FAKE ADMIRAL" },
     ] },
   };
-  const client = instantiate({ fetchImpl: async (url) => {
+  const client = instantiate({ expectedWorld: "fantasy-world", fetchImpl: async (url) => {
     const route = new URL(url).pathname;
     assert.ok(route in responses, "unexpected route " + route);
     return { ok: true, status: 200, json: async () => responses[route] };
@@ -978,7 +1044,7 @@ test("emote, OOC, and private group messages render with fixed headings and iner
 test("feed credential revocation or channel epoch conflict hides private chat immediately", async () => {
   for (const status of [401, 403, 409]) {
     let polls = 0;
-    const client = instantiate({ fetchImpl: async (url) => {
+    const client = instantiate({ expectedWorld: "group-world", fetchImpl: async (url) => {
       const route = new URL(url).pathname;
       if (route === "/api/v1/feed") {
         if (++polls > 1) return { ok: false, status, json: async () => ({ error: "Access changed" }) };
@@ -1013,7 +1079,7 @@ test("authorization loss while crewchat POST is uncertain does not resurrect its
   const held = new Promise((resolve) => { release = resolve; });
   let polls = 0;
   const posts = [];
-  const client = instantiate({ fetchImpl: async (url, options) => {
+  const client = instantiate({ expectedWorld: "group-world", fetchImpl: async (url, options) => {
     const route = new URL(url).pathname;
     if (route === "/api/v1/command") {
       posts.push(JSON.parse(options.body));
@@ -1054,7 +1120,7 @@ test("authorization loss while crewchat POST is uncertain does not resurrect its
 
 test("a changed authenticated channel revision scrubs prior private chat on an otherwise empty feed", async () => {
   let polls = 0;
-  const client = instantiate({ fetchImpl: async (url) => {
+  const client = instantiate({ expectedWorld: "group-world", fetchImpl: async (url) => {
     const route = new URL(url).pathname;
     if (route === "/api/v1/feed") {
       if (++polls === 1) return { ok: true, status: 200, json: async () => ({
@@ -1101,7 +1167,7 @@ test("a private-channel revision change also scrubs command recall and late priv
   const started = new Promise((resolve) => { entered = resolve; });
   const held = new Promise((resolve) => { release = resolve; });
   let polls = 0;
-  const client = instantiate({ fetchImpl: async (url) => {
+  const client = instantiate({ expectedWorld: "group-world", fetchImpl: async (url) => {
     const route = new URL(url).pathname;
     if (route === "/api/v1/command") { entered(); return held; }
     if (route === "/api/v1/feed") return { ok: true, status: 200, json: async () => ({
@@ -1136,7 +1202,7 @@ test("a private-channel revision change also scrubs command recall and late priv
 
 test("a feed dropping an established channel revision cannot reintroduce private events", async () => {
   let polls = 0;
-  const client = instantiate({ fetchImpl: async (url) => {
+  const client = instantiate({ expectedWorld: "group-world", fetchImpl: async (url) => {
     const route = new URL(url).pathname;
     if (route === "/api/v1/feed") {
       if (++polls === 1) return { ok: true, status: 200, json: async () => ({
@@ -1171,7 +1237,7 @@ test("private chat rejection and its room-refresh errors are scrubbed on disconn
   for (const failure of ["command", "room-refresh"]) {
     let roomCalls = 0;
     const reflected = "crewchat Secret council meeting at midnight";
-    const client = instantiate({ fetchImpl: async (url) => {
+    const client = instantiate({ expectedWorld: "group-world", fetchImpl: async (url) => {
       const route = new URL(url).pathname;
       if (route === "/api/v1/command") {
         if (failure === "command") return { ok: false, status: 422,
@@ -1207,7 +1273,7 @@ test("private chat rejection and its room-refresh errors are scrubbed on disconn
 
 test("legacy public feeds stay compatible but unauthenticated crew messages require channel revision", async () => {
   for (const privateEvent of [false, true]) {
-    const client = instantiate({ fetchImpl: async (url) => {
+    const client = instantiate({ expectedWorld: "legacy-world", fetchImpl: async (url) => {
       const route = new URL(url).pathname;
       if (route === "/api/v1/feed") return { ok: true, status: 200, json: async () => ({
         cursor: 4, events: [{ id: 4, actor: "Fenn", kind: privateEvent ? "crewchat" : "say",
@@ -1237,7 +1303,7 @@ test("malformed and excessive retry intervals cannot suspend browser feed indefi
   for (const [header, expectedDelay] of [["invalid", 4400], ["99999", 30000]]) {
     const clock = { value: 100000 };
     let attempts = 0;
-    const client = instantiate({ nowMs: clock, fetchImpl: async (url) => {
+    const client = instantiate({ expectedWorld: "host", nowMs: clock, fetchImpl: async (url) => {
       const route = new URL(url).pathname;
       if (route === "/api/v1/feed") {
         attempts++;
@@ -1267,7 +1333,7 @@ test("malformed and excessive retry intervals cannot suspend browser feed indefi
 test("HTTP 503 and 408 feed failures back off without immediately losing the world", async () => {
   const clock = { value: 100000 };
   let feedCalls = 0;
-  const client = instantiate({ nowMs: clock, fetchImpl: async (url) => {
+  const client = instantiate({ expectedWorld: "busy-world", nowMs: clock, fetchImpl: async (url) => {
     const route = new URL(url).pathname;
     if (route === "/api/v1/feed") {
       feedCalls++;
@@ -1312,7 +1378,7 @@ test("HTTP 503 and 408 feed failures back off without immediately losing the wor
 test("repeated host overload fails closed after a bounded number of poll retries", async () => {
   const clock = { value: 1000 };
   let feedCalls = 0;
-  const client = instantiate({ nowMs: clock, fetchImpl: async (url) => {
+  const client = instantiate({ expectedWorld: "busy-world", nowMs: clock, fetchImpl: async (url) => {
     const route = new URL(url).pathname;
     if (route === "/api/v1/feed") {
       feedCalls++;
@@ -1339,7 +1405,7 @@ test("repeated host overload fails closed after a bounded number of poll retries
 test("a reset feed socket uses bounded transport backoff and recovers without losing the session", async () => {
   const clock = { value: 100000 };
   let feedCalls = 0;
-  const client = instantiate({ nowMs: clock, fetchImpl: async (url) => {
+  const client = instantiate({ expectedWorld: "reset-world", nowMs: clock, fetchImpl: async (url) => {
     const route = new URL(url).pathname;
     if (route === "/api/v1/feed") {
       feedCalls++;
@@ -1374,7 +1440,7 @@ test("a reset feed socket uses bounded transport backoff and recovers without lo
 test("repeated transport resets fail closed after four bounded feed attempts", async () => {
   const clock = { value: 100000 };
   let feedCalls = 0;
-  const client = instantiate({ nowMs: clock, fetchImpl: async (url) => {
+  const client = instantiate({ expectedWorld: "reset-world", nowMs: clock, fetchImpl: async (url) => {
     const route = new URL(url).pathname;
     if (route === "/api/v1/feed") {
       feedCalls++;
@@ -1402,7 +1468,7 @@ test("repeated transport resets fail closed after four bounded feed attempts", a
 test("malformed JSON retries boundedly while forbidden feed access ends immediately", async () => {
   for (const caseName of ["malformed-json", "forbidden"]) {
     let feedCalls = 0;
-    const client = instantiate({ fetchImpl: async (url) => {
+    const client = instantiate({ expectedWorld: "reject-world", fetchImpl: async (url) => {
       const route = new URL(url).pathname;
       if (route === "/api/v1/feed") {
         feedCalls++;
@@ -1430,7 +1496,7 @@ test("malformed JSON retries boundedly while forbidden feed access ends immediat
 
 test("HTTP 503/408 commands retain the same action ID for explicit manual retry", async () => {
   const actionIds = [];
-  const client = instantiate({ fetchImpl: async (url, options) => {
+  const client = instantiate({ expectedWorld: "busy-world", fetchImpl: async (url, options) => {
     const route = new URL(url).pathname;
     if (route === "/api/v1/command") {
       const command = JSON.parse(options.body);
@@ -1477,7 +1543,7 @@ test("an ambiguous committed command needs explicit same-ID retry after reconnec
   const sent = [];
   const commits = new Set();
   let nextId = 0;
-  const client = instantiate({ cryptoImpl: { randomUUID: () => "action-" + (++nextId) },
+  const client = instantiate({ expectedWorld: "world-1", cryptoImpl: { randomUUID: () => "action-" + (++nextId) },
     fetchImpl: async (url, options) => {
       const route = new URL(url).pathname;
       if (route === "/api/v1/command") {
@@ -1519,7 +1585,7 @@ test("uncertain crewchat retains same-actor retry custody without public DOM ret
     let sequence = 0;
     const sent = [];
     const secret = "crewchat The eastern gate is unguarded";
-    const client = instantiate({ cryptoImpl: { randomUUID: () => "chat-action-" + (++sequence) },
+    const client = instantiate({ expectedWorld: "same-world", cryptoImpl: { randomUUID: () => "chat-action-" + (++sequence) },
       fetchImpl: async (url, options) => {
         const route = new URL(url).pathname;
         if (route === "/api/v1/command") {
@@ -1566,7 +1632,7 @@ test("uncertain command identity never crosses host, world, actor, or edited tex
     let world = "world-1";
     let nextId = 0;
     const sent = [];
-    const client = instantiate({ cryptoImpl: { randomUUID: () => "action-" + (++nextId) },
+    const client = instantiate({ expectedWorld: "world-1", cryptoImpl: { randomUUID: () => "action-" + (++nextId) },
       fetchImpl: async (url, options) => {
         const route = new URL(url).pathname;
         if (route === "/api/v1/command") {
@@ -1589,7 +1655,10 @@ test("uncertain command identity never crosses host, world, actor, or edited tex
     await client.send();
     client.disconnect();
     if (changed === "host") client.get("host-url").value = "http://127.0.0.1:8766";
-    if (changed === "world") world = "world-2";
+    if (changed === "world") {
+      world = "world-2";
+      client.get("expected-world-id").value = world;
+    }
     if (changed === "actor") client.get("player-name").value = "Another";
     client.get("access-token").value = "fresh-secret";
     await client.connect();
@@ -1634,7 +1703,7 @@ test("disconnect during in-flight POST retains ID without auto-sending", async (
 test("malformed reconnect join cannot consume an uncertain command receipt", async () => {
   let joinCount = 0;
   let postCount = 0;
-  const client = instantiate({ fetchImpl: async (url) => {
+  const client = instantiate({ expectedWorld: "world-1", fetchImpl: async (url) => {
     const route = new URL(url).pathname;
     if (route === "/api/v1/command") {
       postCount++;
@@ -1666,7 +1735,7 @@ test("malformed reconnect join cannot consume an uncertain command receipt", asy
 
 test("editing a failed command creates a distinct action ID", async () => {
   const sent = [];
-  const client = instantiate({ fetchImpl: async (url, options) => {
+  const client = instantiate({ expectedWorld: "edit-world", fetchImpl: async (url, options) => {
     const route = new URL(url).pathname;
     if (route === "/api/v1/command") {
       const body = JSON.parse(options.body);
@@ -1699,7 +1768,7 @@ test("duplicate Send event while a command is in flight never submits twice", as
   const entered = new Promise((resolve) => { reachedCommand = resolve; });
   const pending = new Promise((resolve) => { releaseCommand = resolve; });
   let sent = 0;
-  const client = instantiate({ fetchImpl: async (url) => {
+  const client = instantiate({ expectedWorld: "busy-world", fetchImpl: async (url) => {
     const route = new URL(url).pathname;
     if (route === "/api/v1/command") {
       sent++;
@@ -1732,7 +1801,7 @@ test("a late 503 response cannot overwrite the reconnect retry intent or transcr
   const waiting = new Promise((resolve) => { reachedOld = resolve; });
   const held = new Promise((resolve) => { releaseOld = resolve; });
   let commands = 0;
-  const client = instantiate({ fetchImpl: async (url) => {
+  const client = instantiate({ expectedWorld: "rejoined-world", fetchImpl: async (url) => {
     const route = new URL(url).pathname;
     if (route === "/api/v1/command") {
       if (++commands === 1) { reachedOld(); await held; }
@@ -1800,7 +1869,7 @@ test("live Python gateway: browser join, authored map, movement, and token rejec
     ...options,
     headers: { ...options.headers, Origin: "http://127.0.0.1:8000" },
   });
-  const client = instantiate({ fetchImpl: liveFetch });
+  const client = instantiate({ expectedWorld: "browser-integration-test", fetchImpl: liveFetch });
   client.get("host-url").value = base;
   client.get("player-name").value = "Explorer";
   client.get("access-token").value = ready.playerToken;
@@ -1814,7 +1883,7 @@ test("live Python gateway: browser join, authored map, movement, and token rejec
   assert.equal(client.get("command-input").value, "");
   client.disconnect();
   assert.equal(client.get("map-status").textContent, "MAP UNAVAILABLE");
-  const intruder = instantiate({ fetchImpl: liveFetch });
+  const intruder = instantiate({ expectedWorld: "browser-integration-test", fetchImpl: liveFetch });
   intruder.get("host-url").value = base;
   intruder.get("player-name").value = "Explorer";
   intruder.get("access-token").value = "incorrect-token";
@@ -1822,7 +1891,7 @@ test("live Python gateway: browser join, authored map, movement, and token rejec
   assert.equal(intruder.get("world-name").textContent, "Unconnected");
   assert.match(intruder.get("connection-note").textContent, /401/);
   if (ready.mode === "player") {
-    const wrongActor = instantiate({ fetchImpl: liveFetch });
+    const wrongActor = instantiate({ expectedWorld: "browser-integration-test", fetchImpl: liveFetch });
     wrongActor.get("host-url").value = base;
     wrongActor.get("player-name").value = "Explorer";
     wrongActor.get("access-token").value = ready.otherToken;
@@ -1882,8 +1951,8 @@ server.serve_forever(poll_interval=0.05)
   const liveFetch = (url, options) => globalThis.fetch(url, {
     ...options, headers: { ...options.headers, Origin: "http://127.0.0.1:8000" },
   });
-  const explorer = instantiate({ fetchImpl: liveFetch });
-  const other = instantiate({ fetchImpl: liveFetch });
+  const explorer = instantiate({ expectedWorld: "browser-pvp-test", fetchImpl: liveFetch });
+  const other = instantiate({ expectedWorld: "browser-pvp-test", fetchImpl: liveFetch });
   for (const [client, name, token] of [
     [explorer, "Explorer", ready.explorerToken], [other, "Other", ready.otherToken],
   ]) {

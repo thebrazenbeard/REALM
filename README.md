@@ -68,7 +68,11 @@ This source tree supports:
   commands, room feeds, and map queries derive the character from the token
   (see `docs/GATEWAY_PROTOCOL.md`).
 - A Pages-compatible static browser client under `docs/`, including a live map
-  display. GitHub Pages does not run the game server.
+  display. Before authentication, the player must enter the exact expected
+  `world_id` supplied by their trusted host; the browser compares it with an
+  unauthenticated health response and refuses to send its bearer token on a
+  mismatch. This is a world-selection check, **not** cryptographic host
+  verification. GitHub Pages does not run the game server.
 - Source-tested host-installed, mutually opted-in local PvP (`pvp on`,
   `pvp off`, `attack`) with writer-verified, credential-bound recent-activity
   witnesses and a room-redacted PK herald. This is **not** qualified for
