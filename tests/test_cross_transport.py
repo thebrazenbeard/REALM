@@ -472,6 +472,44 @@ class CrossTransportTests(unittest.TestCase):
         self.assertEqual(409, status)
         self.assertNotIn("ACK_SECRET", json.dumps(body))
 
+    def test_political_pledges_cross_authenticated_http_and_telnet(self):
+        from realm.political_oaths import WorldPolitics
+        joined = self.api("/api/v1/join", {"player": "Browser"})
+        terminal = self.playerbound_telnet_login("Terminal")
+        politics = WorldPolitics(
+            self.gateway.engine.db_path, world_id="cross-transport-test",
+        )
+        politics.install()
+        politics.create_faction("north", "Northern League")
+        politics.create_faction("south", "Southern Compact")
+
+        oath = self.api("/api/v1/command", {
+            "player": "Browser", "command": "pledge north",
+            "action_id": "browser-oath",
+        })
+        self.assertEqual("Browser pledged allegiance to Northern League.", oath["text"])
+        self.assertIn("Browser pledged allegiance to Northern League.",
+                      self.telnet_command(terminal, "listen"))
+        self.assertIn("Terminal pledged allegiance to Southern Compact.",
+                      self.telnet_command(terminal, "pledge south"))
+
+        feed = self.api("/api/v1/feed?" + parse.urlencode({
+            "player": "Browser", "after": joined["cursor"],
+        }))["events"]
+        self.assertTrue(any(x["kind"] == "political_pledge" and
+                            x["actor"] == "Terminal" for x in feed))
+        self.assertIn("Northern League", self.telnet_command(terminal, "allegiance Browser"))
+        unbound = self.telnet_login("Imposter")
+        self.assertIn("require player-bound credentials",
+                      self.telnet_command(unbound, "pledge north"))
+        self.assertIn("unaﬃliated".replace("ﬃ", "ffi"),
+                      self.telnet_command(unbound, "allegiance"))
+        self.assertEqual("Browser pledged allegiance to Northern League.",
+                         self.api("/api/v1/command", {
+                             "command": "pledge north", "action_id": "browser-oath",
+                         })["text"])
+
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -597,6 +597,10 @@ class Gateway:
                 kind = row["kind"]
                 if kind in {"ooc", "crewchat"}:
                     content = event_text(row["actor"], kind, payload)
+                elif kind in {"political_pledge", "political_break"}:
+                    verb_name = ("pledged allegiance to" if kind == "political_pledge"
+                                 else "broke allegiance to")
+                    content = f"{row['actor']} {verb_name} {payload.get('faction','a faction')}."
                 elif kind == "say":
                     content = f"{row['actor']}: {payload.get('text','')}"
                 elif kind == "emote":
@@ -1360,6 +1364,14 @@ def main(argv: list[str] | None = None) -> int:
     operator.add_argument("--rotate-player", metavar="PLAYER", help="Rotate a player token locally, then exit")
     operator.add_argument("--revoke-player", metavar="PLAYER", help="Revoke a player token locally, then exit")
     operator.add_argument(
+        "--install-politics", action="store_true",
+        help="Host-only offline install of optional political allegiances, then exit",
+    )
+    parser.add_argument(
+        "--political-faction", action="append", default=[], metavar="ID=DISPLAY",
+        help="Host-define a political faction; repeat with --install-politics",
+    )
+    operator.add_argument(
         "--install-pvp-policy", action="store_true",
         help="Host-only one-time default opt-in PvP policy; offline targeting stays forbidden",
     )
@@ -1373,6 +1385,17 @@ def main(argv: list[str] | None = None) -> int:
         help="Host-select one original PK announcement when installing PvP policy",
     )
     args = parser.parse_args(argv)
+    if args.political_faction and not args.install_politics:
+        parser.error("--political-faction requires --install-politics")
+    planned_factions = []
+    if args.install_politics:
+        from .political_oaths import _FACTION_ID, _DISPLAY
+        for spec in args.political_faction:
+            key, sep, display = spec.partition("=")
+            if (not sep or _FACTION_ID.fullmatch(key) is None
+                    or _DISPLAY.fullmatch(display) is None):
+                parser.error("--political-faction must use a valid ID=DISPLAY")
+            planned_factions.append((key, display))
     if args.enable_local_presence and not args.scoped_credentials:
         parser.error("--enable-local-presence requires --scoped-credentials")
     if args.install_pvp_policy and not args.scoped_credentials:
@@ -1400,6 +1423,14 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     if args.revoke_player:
         print("Revoked" if gateway.credentials.revoke(args.revoke_player) else "Not provisioned")
+        return 0
+    if args.install_politics:
+        from .political_oaths import WorldPolitics
+        politics = WorldPolitics(gateway.engine.db_path, world_id=gateway.world_id)
+        politics.install()
+        for key, display in planned_factions:
+            politics.create_faction(key, display)
+        print(f"Installed optional politics with {len(planned_factions)} configured factions.")
         return 0
     if args.install_pvp_policy:
         from .combat import Combat
