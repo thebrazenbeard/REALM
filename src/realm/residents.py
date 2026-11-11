@@ -11,7 +11,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Mapping
 
-from .engine import Engine
+from .engine import ActionReceiptResult, Engine
 
 
 _ENGINE_VERBS = frozenset({
@@ -86,3 +86,20 @@ class ResidentController:
             raise ValueError("Host action ID must contain 1–128 characters")
         accepted = self.validate(proposal)
         return self._engine.act(self._resident, accepted.command, action_id=action_id)
+
+    def commit_with_receipt(
+        self, proposal: Mapping[str, object], *, action_id: str
+    ) -> ActionReceiptResult:
+        """Commit with atomic newly-created versus replayed receipt evidence.
+
+        The engine owns this distinction inside the same SQLite transaction
+        as the action. Unlike a precommit receipt-exists probe, this remains
+        correct when separate host workers submit the same logical action.
+        Existing ``commit`` callers retain their response-string API.
+        """
+        if not isinstance(action_id, str) or not 1 <= len(action_id) <= 128:
+            raise ValueError("Host action ID must contain 1–128 characters")
+        accepted = self.validate(proposal)
+        return self._engine.act_with_receipt(
+            self._resident, accepted.command, action_id=action_id
+        )
