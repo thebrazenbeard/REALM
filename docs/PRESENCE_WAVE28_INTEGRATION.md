@@ -169,8 +169,12 @@ missing/stale evidence.
   or claim a presence lease directly.
 - Preexisting Python/browser suites must still pass on the exact frozen
   integration head, plus focused actual-socket/cross-process tests.
-- Windows exact-head SQLite handle behavior and socket timeout cleanup remain
-  unqualified until actually executed on Lappy with idle resources.
+- The Wave 32 source tree `b9aec2605a81795b6d33c5f4cf4c2c0d07374045`
+  (`f127fbff7f3e4ad5088ce3f177c6d2b35518f359`) passed isolated Lappy
+  Windows Python **906/906** and browser/Node **65/65** on 2026-11-11.
+  Any subsequent integration tree still requires its **own** exact-head
+  qualification. These source tests do not prove a deployed public host,
+  long-lived player-session security, or all production socket conditions.
 
 ## Known engineering tradeoff
 

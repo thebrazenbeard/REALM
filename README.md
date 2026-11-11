@@ -33,13 +33,15 @@ generic worldpack importer exists; a canonical Driftspace worldpack does not.
 
 ## What exists now
 
-> **Source-only development candidate:** This section describes the draft
-> [PR #180](https://github.com/thebrazenbeard/REALM/pull/180), **not** the
-> default `main` branch. Its features are unmerged, uninstalled and not
-> qualified for public hosting; source tests do not substitute for Windows or
-> target-host validation.
+> **Source versus deployment:** This inventory describes capabilities in this
+> checkout's code. It is not evidence that a running world has been upgraded,
+> that players are authenticated beyond the documented local-host contract,
+> or that public hosting is safe. The PvP and channel integration was assembled
+> through [PR #180](https://github.com/thebrazenbeard/REALM/pull/180) and
+> passed source tests on Windows and Linux; installation, deployment, and
+> production multiplayer qualification are separate work.
 
-The current draft integration candidate supports:
+This source tree supports:
 
 - Separate persistent worlds: each SQLite file is a world, seeded with three deliberately **noncanonical demo rooms**. The loopback gateway persists its `world_id` binding and rejects an attempt to relabel an existing database (see `docs/GATEWAY_PROTOCOL.md` for legacy adoption).
 - Player names and persistent positions across restarts. Presence is their **last saved location**, not proof they are currently online.
@@ -51,9 +53,9 @@ The current draft integration candidate supports:
 - Append-only application event records for joins, movement and speech.
 - API-level optional action IDs for replay-safe mutation retries; duplicate IDs for different commands are rejected.
 - Local terminal clients using the same database path, with stdlib-only
-  runtime dependencies. CLI `--player` is a chosen name, **not** an exclusive
-  authenticated player session; distinct local users should choose distinct
-  names. The player-bound gateway credentials are a separate mechanism.
+  runtime dependencies. The CLI `--player` argument is a chosen name, **not**
+  an exclusive authenticated session; separate local users should choose
+  different names. Player-bound gateway credentials are a separate mechanism.
 - Versioned worldpack validation/import with a generic shore example; existing
   played worlds cannot be silently replaced (see `WORLDPACKS.md`).
 - An offline worldpack authoring CLI (`python -m realm.builder`) to create rooms,
