@@ -78,6 +78,10 @@ development servers to the public internet.**
 The model-free [`ResidentController`](docs/RESIDENT_PROPOSALS.md) now gives a
 host one validation boundary for future NPC **action proposals**, but does
 not generate actions or provide resident drives, memories, or autonomous ticks.
+An opt-in [`ActorMemory`](docs/ACTOR_MEMORY.md) adapter can persist recent,
+host-issued event-observation grants and revocations per resident; this is
+**not** deep memory, live-presence proof, or a retrofit of the existing
+`listen`/HTTP feed privacy behavior.
 Small local NPC-model options, including Patrick's Hugging Face `character` and
 `npc` searches, are tracked as **research candidates** in
 [`docs/NPC_MODEL_CANDIDATES.md`](docs/NPC_MODEL_CANDIDATES.md) and the offline
