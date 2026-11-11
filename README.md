@@ -33,7 +33,14 @@ generic worldpack importer exists; a canonical Driftspace worldpack does not.
 
 ## What exists now
 
-The current integration candidate supports:
+> **Release boundary:** This section describes the source on the default
+> `main` branch. [Draft PR #180](https://github.com/thebrazenbeard/REALM/pull/180)
+> combines further source-tested local PvP, emote, OOC, crew channels and
+> authenticated presence on a separate stacked development branch. It is
+> **not merged into `main`, installed, deployed or approved for public hosting**.
+> Do not confuse an open PR or passing prototype tests with a shipped feature.
+
+The current `main` branch supports:
 
 - Separate persistent worlds: each SQLite file is a world, seeded with three deliberately **noncanonical demo rooms**. The loopback gateway persists its `world_id` binding and rejects an attempt to relabel an existing database (see `docs/GATEWAY_PROTOCOL.md` for legacy adoption).
 - Player names and persistent positions across restarts. Presence is their **last saved location**, not proof they are currently online.
@@ -41,7 +48,10 @@ The current integration candidate supports:
 - Durable player speech, readable by others with `listen`/`history`.
 - Append-only application event records for joins, movement and speech.
 - API-level optional action IDs for replay-safe mutation retries; duplicate IDs for different commands are rejected.
-- One terminal client per player, using the same database path, with stdlib-only runtime dependencies.
+- Local terminal clients using the same database path, with stdlib-only
+  runtime dependencies. The CLI `--player` argument is a chosen name, **not**
+  an exclusive authenticated session; separate local users should choose
+  different names. Player-bound gateway credentials are a separate mechanism.
 - Versioned worldpack validation/import with a generic shore example; existing
   played worlds cannot be silently replaced (see `WORLDPACKS.md`).
 - An offline worldpack authoring CLI (`python -m realm.builder`) to create rooms,
