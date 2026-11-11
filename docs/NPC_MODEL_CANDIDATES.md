@@ -1,10 +1,13 @@
 # Small local model candidates for REALM residents
 
-**Status: research only — 2026-11-06.** The links and model-card claims below
-were inspected from public Hugging Face pages. No weights were downloaded,
-installed, run, timed, or qualified by this review. No model is currently
-connected to REALM's `ResidentController`, and no neural resident is alive
-in a running world merely because a candidate appears here.
+**Status: source research plus two bounded Lappy inference checks — 2026-11-06.**
+The links and model-card claims below were inspected from public Hugging Face
+pages. Subsequent host work downloaded and SHA-256-verified exactly two GGUF
+artifacts **outside Git**, and executed one or more real CPU-only inferences
+from each. These are **not** evidence of working autonomous NPCs, sustained
+benchmark performance, deep memory, or real-player deployment. A separate,
+opt-in local duet runner and demo CLI are described in
+[NPC_CONVERSATIONS.md](NPC_CONVERSATIONS.md).
 
 REALM's goal is many different persistent characters sharing an optional
 **local inference runtime**. Their identities, room access, durable events,
@@ -39,8 +42,11 @@ an independently measured quality ranking or an automatic model selection.
 | **D — extremely small dialogue research** | [Felladrin/LittleLamb-293M-RP](https://huggingface.co/Felladrin/LittleLamb-293M-RP), **293M**, GGUF-only, Apache-2.0 model tag; Q4_0 **212 MB**, Q8_0 **318 MB**. | Fits tiny runtime experiments. Crucially, **the author says character separation and long-turn consistency are weak**. Their license section says the exact non-PIPPA corpus composition was lost and commercial rights cannot be fully enumerated. **Rights-hold** for product use; research reference only. |
 | **D-control — compact general instruct** | [ramankrishna10/npc-nano-0.5b-sft-gguf](https://huggingface.co/ramankrishna10/npc-nano-0.5b-sft-gguf), ~502M Llama-style model, Apache-2.0 tag; GGUF Q4_K_M **333 MB**, Q5_K_M **379 MB**. | Despite its name, the [underlying SFT card](https://huggingface.co/ramankrishna10/npc-nano-0.5b-sft) documents a mixed general-instruction/math/code/identity corpus, **not fantasy NPC training**. A 2,048-token context and modest reasoning make it a budget/identity **control**, not an assumed fantasy actor. |
 
-All numbers in the table are **publisher/model-card statements**, not measured
-installation footprint, GPU VRAM use, generation speed or accuracy on Lappy.
+The shortlist's published sizes and author-reported scores are
+**publisher/model-card statements**, not measured quality or accuracy on Lappy.
+The two downloaded file byte counts and hashes below were independently
+verified on the host. Generation times below reflect only one bounded local
+invocation, not a benchmark distribution.
 Quantized weight file size omits process memory, runtime buffers, KV cache,
 multiple active contexts and model-server overhead. An Apache-2.0 repository
 tag is not a complete independent audit of training-data rights.
@@ -51,7 +57,23 @@ tag is not a complete independent audit of training-data rights.
 > player, or fabricate memories. REALM should measure those errors directly,
 > never infer correctness from its roleplay style or a model-card score.
 
-## Proposed deployment architecture — not implemented
+## Two local artifacts verified on Lappy
+
+The host used its existing `llama-cli` (`b11026-b49650adb`), with two CPU
+threads and **zero GPU layers**. It did not spend money, download weights into
+the repository, or create any remote inference endpoint.
+
+| Model | HF source revision | GGUF verified bytes / SHA-256 | Observed single-run result |
+| --- | --- | --- | --- |
+| [stealth-rifle](https://huggingface.co/cloudunity/stealth-rifle) Q4_K_M | `bfa42cffea8a98f50f9951452088caf76b76f4e6` | `397807424` / `2f33d93535cac345df47cd02928a74175fe437b8f3ec20cfdfe4822322e6ca32` | A ChatML character prompt generated dialogue in ~7.1 seconds. It guessed a debated crossing was probably open; this was **not** host-confirmed. |
+| [npc-voice-soup06](https://huggingface.co/walter-bd/npc-voice-soup06) Q5_K_M | `c50dd33ef5331b69ce024789f4cfff2a5416f9da` | `444415232` / `1854a099349767b6e66cd940ae81e76dd139d2a32f8adb79778e7a66fbf84d75` | Default raw prompting leaked `[Start thinking]` without dialogue at 80 tokens. With `--reasoning off`, a new raw TONE/FACT/OUT test produced clean speech. Separate probes demonstrated invented obligations, so **no factuality qualification**. |
+
+These checks establish **artifact verification and actual local inference**.
+Neither alone proves a model-owned proposal reached REALM's persistent SQLite
+ledger. The opt-in demo exercises that next boundary, with host-only speech
+authorization, a fresh user-selected world database, and readback receipts.
+
+## Proposed longer-term deployment architecture — not implemented
 
 1. The **host** chooses one approved, locally available and hash-verified
    model artifact. Store weights in the operator's own cache (for Patrick,
@@ -75,10 +97,20 @@ tag is not a complete independent audit of training-data rights.
    boundary. Model absence/failure degrades to deterministic simulation,
    never a corrupted SQLite world.
 
-This design is compatible in principle with KoboldCPP/llama.cpp and a local
-GGUF, but **no runtime/backend interoperability test has been executed here**.
-The same tool API should accommodate later providers without coupling the
-engine to Hugging Face, Qwen or one fantasy setting.
+The two local artifacts are demonstrably compatible with the existing
+`llama-cli` executable for bounded text generation. A default prompt is not
+necessarily correct for every model; soup06 requires `--reasoning off` and its
+documented raw format. A production service, multi-NPC scheduling, substantive
+memory, cross-model benchmarks, and KoboldCPP interoperability remain untested.
+
+For the **ledger-connected duet**, use an ephemeral loopback-only
+`llama-server.exe` `/completion` JSON protocol rather than trying to scrape
+interactive `llama-cli` banners, prompt echo and performance footers. The
+non-interactive `llama-completion.exe` gives cleaner stdout but may terminate
+at a token limit without an explicit content-finish signal. The local server
+exposes stop metadata; the demo rejects incomplete/overlong speech and always
+terminates the inference listener. Neither transport makes generated claims
+world authority.
 
 ## Reproducible selection gate
 
@@ -108,9 +140,10 @@ Run the **same** scripted test corpus for all candidates:
 8. Content/rights checks for unsolicited adult/violent output, protected
    third-party fictional characters, training-data provenance and host policy.
 
-Only upgrade status **source-inspected → artifact-verified → host-benchmarked
-→ integration-qualified** on evidence. None of these six candidates has yet
-reached the last three statuses in REALM.
+Only upgrade status **source-inspected → artifact-verified → single inference
+observed → benchmarked → integration-qualified** on evidence. Two artifacts
+reached the first three stages; neither is independently benchmarked or
+qualified for real players. The other four remain research-only.
 
 See [Resident action proposals](RESIDENT_PROPOSALS.md) and
 [autonomous resident issue #20](https://github.com/thebrazenbeard/REALM/issues/20)

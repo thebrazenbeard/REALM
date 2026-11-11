@@ -167,6 +167,18 @@ class Engine:
         with closing(self._connect()) as db, db:
             # Serialize first-time joins so two clients cannot race on one name.
             db.execute("BEGIN IMMEDIATE")
+            # NPC identities are reserved for host-owned resident controllers.
+            # Enforce this at the Engine boundary so HTTP, Telnet, and future
+            # player transports cannot adopt an existing NPC name. Looking up
+            # the reservation under the writer lock closes the registration
+            # versus network-join race.
+            registry = db.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='npc_actor_registry'"
+            ).fetchone()
+            if registry is not None and db.execute(
+                "SELECT 1 FROM npc_actor_registry WHERE actor=? COLLATE NOCASE", (name,)
+            ).fetchone():
+                raise ValueError("NPC identity is reserved for the host")
             player = db.execute("SELECT id,room_id FROM players WHERE id=?", (name,)).fetchone()
             if player is None:
                 configured = db.execute("SELECT value FROM world_meta WHERE key='start_room'").fetchone()
@@ -188,11 +200,17 @@ class Engine:
             parts.append("Items: " + ", ".join(item[0] for item in items))
         return "\n".join(parts)
 
-    def act(self, name: str, raw_command: str, *, action_id: str | None = None) -> str:
+    def act(
+        self, name: str, raw_command: str, *, action_id: str | None = None,
+        expected_room: str | None = None, required_roommate: str | None = None,
+    ) -> str:
         """Perform one action atomically; optional keys make retries idempotent.
 
         Action IDs are scoped to an actor and MUST be unique per logical command.
         This is local action deduplication, not network authentication.
+        Host-only room guards are checked after the writer lock and before
+        mutation; they protect asynchronous resident proposals from movement
+        between prompt construction and action commit.
         """
         command = raw_command.strip()
         if not command:
@@ -209,6 +227,13 @@ class Engine:
             verb = "go"
         if action_id is not None and (not isinstance(action_id, str) or not 1 <= len(action_id) <= 128):
             raise ValueError("Action IDs must be nonempty strings up to 128 characters")
+        if expected_room is not None and (not isinstance(expected_room, str) or not expected_room):
+            raise ValueError("Expected room must be a nonempty room ID")
+        if required_roommate is not None and (
+            expected_room is None or not isinstance(required_roommate, str)
+            or not _PLAYER_RE.fullmatch(required_roommate)
+        ):
+            raise ValueError("Roommate guard requires a valid peer and room")
         if verb in {"quit", "exit"}:
             return "Goodbye. Your position is saved."
         with closing(self._connect()) as db, db:
@@ -227,6 +252,15 @@ class Engine:
                     if receipt["command"] != command:
                         raise ValueError("Action ID already used for a different command")
                     return receipt["response"]
+            if expected_room is not None:
+                if room_id != expected_room:
+                    raise ValueError("Actor moved before guarded action commit")
+                if required_roommate is not None:
+                    peer = db.execute(
+                        "SELECT room_id FROM players WHERE id=?", (required_roommate,)
+                    ).fetchone()
+                    if peer is None or peer["room_id"] != expected_room:
+                        raise ValueError("Required conversation partner moved before guarded action commit")
             response = self._perform(db, actor, room_id, verb, arg)
             if action_id is not None:
                 db.execute(
