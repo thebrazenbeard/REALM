@@ -289,6 +289,16 @@ class Engine:
                     # Re-evaluate the room, item ownership and speech entry
                     # floor on each retry; only mutations replay old results.
                     if not read_only:
+                        if verb == "pvp" and arg.casefold() in {"on", "off"}:
+                            from .combat import Combat
+                            policy = Combat._policy(db)
+                            _, currently_enabled = Combat._status(db, actor, int(policy["max_hp"]))
+                            if currently_enabled != (arg.casefold() == "on"):
+                                # Consent can change after an earlier success.
+                                # Never reapply a stale opt-in, or acknowledge
+                                # a stale opt-out as if protection were active.
+                                state = "ON" if currently_enabled else "OFF"
+                                return f"Previous PvP command superseded; PvP is currently {state}."
                         return receipt["response"]
             # Preserve the existing four-argument interpreter seam for trusted
             # adapters and injected transaction/error probes. Only combat

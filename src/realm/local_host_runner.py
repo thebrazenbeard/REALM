@@ -80,6 +80,15 @@ class _AcceptedSessions:
         server.process_request = tracked_request
         server.process_request_thread = tracked_worker
         server.handle_error = tracked_error
+        if isinstance(server, GatewayServer):
+            # The HTTP response transport can consult this narrow predicate.
+            # socketserver's broad error hook must still report application
+            # errors, even if they raise the same errno as a revoked socket.
+            server._realm_local_host_revoked = self._is_revoked_during_quiescence
+
+    def _is_revoked_during_quiescence(self, request: socket.socket) -> bool:
+        with self._condition:
+            return self._quiescing.is_set() and request in self._revoked
 
     def quiesce(self) -> None:
         with self._condition:

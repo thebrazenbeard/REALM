@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 from collections import OrderedDict
+import errno
 import json
 import math
 import re
@@ -599,6 +600,14 @@ class Gateway:
                     content = f"{row['actor']}: {payload.get('text','')}"
                 elif kind == "emote":
                     content = f"{row['actor']} {payload.get('text','')}"
+                elif kind == "pvp_hit":
+                    victim = payload.get("victim")
+                    damage = payload.get("damage")
+                    if (isinstance(victim, str) and victim
+                            and type(damage) is int and damage > 0):
+                        content = f"{row['actor']} strikes {victim} for {damage} damage."
+                    else:
+                        content = f"{row['actor']} attacked."
                 elif kind == "join":
                     content = f"{row['actor']} entered the world."
                 elif kind == "move":
@@ -979,8 +988,19 @@ class GatewayHandler(BaseHTTPRequestHandler):
 
     def _send(self, status: int, obj: dict) -> None:
         data = json.dumps(obj, ensure_ascii=False).encode("utf-8")
-        self._headers(status, len(data))
-        self.wfile.write(data)
+        try:
+            self._headers(status, len(data))
+            self.wfile.write(data)
+        except OSError as error:
+            # Local-host quiescence detaches selected accepted sockets to wake
+            # buffered keep-alive readers. A completed world write may then
+            # encounter EBADF while delivering only its HTTP response.
+            # Never suppress application errors or errors on other sockets.
+            revoked = getattr(self.server, "_realm_local_host_revoked", None)
+            if (error.errno != errno.EBADF or not callable(revoked)
+                    or not revoked(self.connection)):
+                raise
+            self.close_connection = True
 
     def _read_post_body(self, length: int) -> bytes:
         """Read bounded bytes against an absolute deadline, even if trickled."""
@@ -1324,11 +1344,22 @@ def main(argv: list[str] | None = None) -> int:
         "--install-pvp-policy", action="store_true",
         help="Host-only one-time default opt-in PvP policy; offline targeting stays forbidden",
     )
+    from .combat import _TEMPLATES
+    parser.add_argument(
+        "--pvp-safe-room", action="append", default=[], metavar="ROOM",
+        help="Protect a named existing room from PvP; repeat with --install-pvp-policy",
+    )
+    parser.add_argument(
+        "--pvp-announcement-style", choices=sorted(_TEMPLATES), default=None,
+        help="Host-select one original PK announcement when installing PvP policy",
+    )
     args = parser.parse_args(argv)
     if args.enable_local_presence and not args.scoped_credentials:
         parser.error("--enable-local-presence requires --scoped-credentials")
     if args.install_pvp_policy and not args.scoped_credentials:
         parser.error("--install-pvp-policy requires --scoped-credentials")
+    if (args.pvp_safe_room or args.pvp_announcement_style is not None) and not args.install_pvp_policy:
+        parser.error("PvP safe-room and announcement options require --install-pvp-policy")
     if args.scoped_credentials and (args.provision_player or args.rotate_player or args.revoke_player):
         parser.error("legacy credential operator commands are unavailable in scoped mode")
     if args.provision_scoped_player and not args.scoped_credentials:
@@ -1353,7 +1384,11 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     if args.install_pvp_policy:
         from .combat import Combat
-        Combat.configure(gateway.engine, allow_offline_targets=False)
+        Combat.configure(
+            gateway.engine, safe_rooms=tuple(args.pvp_safe_room),
+            announcement_style=args.pvp_announcement_style or "herald",
+            allow_offline_targets=False,
+        )
         print("Installed one-time opt-in PvP policy; offline attacks remain forbidden.")
         return 0
     if args.demo_crafting:

@@ -1,6 +1,7 @@
 """Real loopback clients sharing a bounded opt-in host UTC runner."""
 from __future__ import annotations
 
+import errno
 import json
 from http.client import HTTPConnection, HTTPException
 import socket
@@ -13,12 +14,13 @@ import unittest
 from contextlib import ExitStack, closing
 from datetime import datetime, timezone
 from pathlib import Path
+from unittest.mock import Mock
 from urllib import request
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from realm.engine import Engine
-from realm.gateway import Gateway, GatewayServer
+from realm.gateway import Gateway, GatewayHandler, GatewayServer
 from realm.telnet import LocalTelnetServer
 from realm.world_clock import WorldClock
 from realm.local_host_runner import _AcceptedSessions, run_local_host
@@ -110,7 +112,8 @@ class LocalHostRunnerTests(unittest.TestCase):
             self.assertEqual(3, len(reported), "Unrelated socket abort must still be reported")
             deliver(winerror(10054), chosen)
             deliver(RuntimeError("unexpected worker failure"), chosen)
-            self.assertEqual(5, len(reported), "Unexpected socket and code errors remain visible")
+            deliver(OSError(errno.EBADF, "application bad file descriptor"), chosen)
+            self.assertEqual(6, len(reported), "Unexpected application errors remain visible")
         finally:
             with custody._condition:
                 custody._active.discard(chosen)
@@ -118,7 +121,47 @@ class LocalHostRunnerTests(unittest.TestCase):
             stopper.join(timeout=2)
         self.assertFalse(stopper.is_alive(), "Quiesce did not finish")
         deliver(winerror(10053), chosen)
-        self.assertEqual(6, len(reported), "Revoked-socket suppression must end with quiescence")
+        self.assertEqual(7, len(reported), "Revoked-socket suppression must end with quiescence")
+
+    def test_posix_response_write_bad_fd_requires_exact_revoked_socket(self):
+        """Only the selected HTTP transport write failure is suppressible."""
+        http, _ = self.servers()
+        custody = _AcceptedSessions(http)
+        selected, peer = socket.socketpair()
+        unrelated = socket.socket()
+        self.addCleanup(selected.close)
+        self.addCleanup(peer.close)
+        self.addCleanup(unrelated.close)
+
+        handler = object.__new__(GatewayHandler)
+        handler.server = http
+        handler.connection = selected
+        handler._headers = Mock(side_effect=OSError(errno.EBADF, "closed response descriptor"))
+        with self.assertRaises(OSError, msg="Normal HTTP response failures stay visible"):
+            GatewayHandler._send(handler, 200, {"ok": True})
+
+        with custody._condition:
+            custody._active.add(selected)
+        stopper = threading.Thread(target=custody.quiesce)
+        stopper.start()
+        try:
+            self.assertTrue(custody._quiescing.wait(2))
+            handler.close_connection = False
+            GatewayHandler._send(handler, 200, {"ok": True})
+            self.assertTrue(handler.close_connection)
+
+            handler.connection = unrelated
+            with self.assertRaises(OSError, msg="Unrelated connection failure must propagate"):
+                GatewayHandler._send(handler, 200, {"ok": True})
+        finally:
+            with custody._condition:
+                custody._active.discard(selected)
+                custody._condition.notify_all()
+            stopper.join(timeout=2)
+        self.assertFalse(stopper.is_alive())
+        handler.connection = selected
+        with self.assertRaises(OSError, msg="Suppression must end after quiescence"):
+            GatewayHandler._send(handler, 200, {"ok": True})
 
     def test_two_live_clients_receive_one_trusted_utc_event_and_stop_closes_ports(self):
         http, telnet = self.servers()
@@ -296,6 +339,8 @@ class LocalHostRunnerTests(unittest.TestCase):
     def test_noninterruptible_trusted_http_action_must_finish_before_host_returns(self):
         """A failed shutdown timeout cannot leave a live durable writer behind."""
         http, telnet = self.servers()
+        unhandled_http_errors = []
+        http.handle_error = lambda request, address: unhandled_http_errors.append(sys.exc_info()[1])
         token = self.gateway.credentials.provision("Captain")
         stop = threading.Event()
         entered = threading.Event()
@@ -376,11 +421,98 @@ class LocalHostRunnerTests(unittest.TestCase):
                     "SELECT payload_json FROM events WHERE kind='say' AND actor='Captain'"
                 ).fetchall()
             self.assertEqual([{"text": "late host action"}], [json.loads(row[0]) for row in rows])
+            self.assertEqual([], unhandled_http_errors,
+                             "Expected revoked-socket response failure must not escape to socketserver")
         finally:
             release.set()
             if sender is not None:
                 sender.join(timeout=3)
             stop.set()
+            host_thread.join(timeout=3)
+            conn.close()
+
+    def test_application_bad_fd_stays_reported_on_revoked_http_socket(self):
+        """A trusted command's EBADF is not an ignorable response transport error."""
+        http, telnet = self.servers()
+        token = self.gateway.credentials.provision("Captain")
+        stop = threading.Event()
+        entered = threading.Event()
+        release = threading.Event()
+        errors = []
+        outcomes = []
+        http.handle_error = lambda request, address: errors.append(sys.exc_info()[1])
+
+        def broken_application_command(*args, **kwargs):
+            entered.set()
+            if not release.wait(timeout=8):
+                raise RuntimeError("Application test was never released")
+            raise OSError(errno.EBADF, "application opened an invalid descriptor")
+
+        self.gateway.command = broken_application_command
+
+        def foreground():
+            try:
+                outcomes.append(run_local_host(
+                    http, telnet, self.clock, {"unused": lambda db, event: None},
+                    pulses=100, interval_seconds=0.05, now=lambda: UTC,
+                    stop_event=stop,
+                ))
+            except BaseException as error:
+                outcomes.append(error)
+
+        host_thread = threading.Thread(target=foreground)
+        host_thread.start()
+        sender = None
+        conn = HTTPConnection("127.0.0.1", http.server_port, timeout=2)
+        try:
+            for _ in range(100):
+                try:
+                    self.http_json(http, "/api/v1/health")
+                    break
+                except OSError:
+                    time.sleep(0.01)
+            else:
+                self.fail("HTTP host did not begin serving")
+            headers = {"Authorization": "Bearer " + token,
+                       "Content-Type": "application/json"}
+            conn.request("POST", "/api/v1/join", json.dumps({"player": "Captain"}), headers)
+            reply = conn.getresponse()
+            self.assertEqual(200, reply.status)
+            reply.read()
+
+            def issue_command():
+                try:
+                    conn.request("POST", "/api/v1/command", json.dumps({
+                        "player": "Captain", "command": "say must not commit"
+                    }), headers)
+                    conn.getresponse().read()
+                except (OSError, HTTPException):
+                    pass
+
+            sender = threading.Thread(target=issue_command)
+            sender.start()
+            self.assertTrue(entered.wait(timeout=2), "Trusted command never entered")
+            stop.set()
+            revoked = getattr(http, "_realm_local_host_revoked", None)
+            self.assertIsNotNone(revoked)
+            self.assertTrue(revoked.__self__._quiescing.wait(timeout=3),
+                            "Socket not selected for host quiescence")
+            release.set()
+            host_thread.join(timeout=3)
+            self.assertFalse(host_thread.is_alive())
+            self.assertEqual("stopped", outcomes[0].reason)
+            self.assertEqual(1, len(errors), errors)
+            self.assertIsInstance(errors[0], OSError)
+            self.assertEqual(errno.EBADF, errors[0].errno)
+            with closing(sqlite3.connect(self.db_path)) as db:
+                self.assertEqual(0, db.execute(
+                    "SELECT COUNT(*) FROM events WHERE kind='say' AND actor='Captain'"
+                ).fetchone()[0])
+        finally:
+            release.set()
+            stop.set()
+            if sender is not None:
+                sender.join(timeout=3)
             host_thread.join(timeout=3)
             conn.close()
 

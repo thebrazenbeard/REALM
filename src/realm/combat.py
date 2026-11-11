@@ -23,6 +23,12 @@ _TEMPLATES = {
                "Hear the iron bell: {victim} has fallen before {killer}. The realm bears witness."),
     "stark": ("realm-original-stark-v1",
               "The record stands: {killer} defeated {victim}."),
+    "black_bell": ("realm-original-black-bell-v1",
+                   "The black bells toll: {victim} has fallen to {killer}."),
+    "omen": ("realm-original-omen-v1",
+             "A shadow crosses the realm: {killer} has laid {victim} low."),
+    "taunt": ("realm-original-taunt-v1",
+              "Somewhere a bard revises the tale. {killer} has bested {victim}."),
 }
 
 _SCHEMA = (
@@ -132,7 +138,8 @@ class Combat:
             setting = arg.casefold()
             if setting == "status":
                 hp, enabled = cls._status(db, actor, max_hp)
-                online = "offline targeting allowed" if policy["allow_offline_targets"] else "online presence unverified; attacks blocked"
+                online = ("offline targeting allowed" if policy["allow_offline_targets"]
+                          else "attacks require recent authenticated presence")
                 return f"PvP {'ON' if enabled else 'OFF'} | HP {hp}/{max_hp} | {online}."
             if setting == "news":
                 announcements = db.execute(

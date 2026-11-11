@@ -12,6 +12,10 @@ host activation**; the equivalent trusted Python injection remains available:
 # deliberately refuses a second installation and never enables offline attacks.
 PYTHONPATH=src python -m realm.gateway --db realm.sqlite3 --world-id demo --scoped-credentials --install-pvp-policy
 
+# OR, on a new world without an installed combat policy, protect an existing
+# spawn room and select a host-controlled original PK announcement style:
+PYTHONPATH=src python -m realm.gateway --db realm.sqlite3 --world-id demo --scoped-credentials --install-pvp-policy --pvp-safe-room atrium --pvp-announcement-style black_bell
+
 # Issue scoped player credentials through trusted local CLI stdout. Keep the
 # resulting bearer strings private; each player must opt in with `pvp on`.
 PYTHONPATH=src python -m realm.gateway --db realm.sqlite3 --world-id demo --scoped-credentials --provision-scoped-player Ada
@@ -21,14 +25,34 @@ PYTHONPATH=src python -m realm.gateway --db realm.sqlite3 --world-id demo --scop
 PYTHONPATH=src python -m realm.gateway --db realm.sqlite3 --world-id demo --scoped-credentials --enable-local-presence --port 8768
 ```
 
-**Important:** This one-time policy uses the host `Combat.configure` defaults,
-including **no protected/safe rooms**; the starter atrium is *not* a safe
-spawn. A host needing protected spawn zones must install a chosen policy
-through trusted Python configuration (supplying `safe_rooms` from its actual
-worldpack) **instead of** the one-time CLI shortcut. The shortcut never
-overwrites that prior installation. New/returning characters still need to
+**Important:** Without `--pvp-safe-room`, the one-time policy uses no protected
+rooms; the starter atrium is *not* automatically a safe spawn. A host can
+repeat `--pvp-safe-room ROOM` for existing room IDs during the one-time CLI
+install, or use trusted Python `Combat.configure` with explicit worldpack room
+IDs. Unknown/duplicate rooms reject the entire policy transaction. The
+shortcut never overwrites a prior installation. New/returning characters still need to
 join and explicitly consent (`pvp on`); merely hosting the listener does not
 silently opt anyone in. None of these commands makes a public HTTPS service.
+
+Host-owned `Combat.configure(..., announcement_style=...)` also selects one
+original REALM PK broadcast style when installing the policy: `herald`
+(default), `stark`, `black_bell`, `omen`, or `taunt`. The CLI shortcut defaults
+to `herald` but accepts `--pvp-announcement-style`; players cannot choose or
+inject announcement text. Every style
+uses only the server-verified killer and victim names, stores its immutable
+template ID on the fatal event, and broadcasts without the fight room. The
+additional styles are new REALM writing, **not verified quotations from
+Melmoth**. A historical world retains the exact text emitted at death even
+if future source templates change.
+
+Nonlethal hits appear as room-local combat messages to participants in the
+current room; they do not expose action IDs or private remaining HP. Only
+fatal PK announcements go to the redacted global feed.
+
+Idempotent `pvp on/off` receipt replays never reapply a superseded decision.
+When current consent differs from the original command, the response says
+the old command was superseded and reports the present ON/OFF state, rather
+than falsely acknowledging an old opt-out as active protection.
 
 Optional separately launched player-bound local Telnet:
 

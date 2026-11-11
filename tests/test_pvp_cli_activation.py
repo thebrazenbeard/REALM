@@ -40,6 +40,15 @@ class HostOptInCliTests(unittest.TestCase):
                     "--install-pvp-policy",
                 ])
             self.assertEqual(2, ex.exception.code)
+            for extra in (
+                ["--scoped-credentials", "--pvp-safe-room", "atrium"],
+                ["--scoped-credentials", "--pvp-announcement-style", "black_bell"],
+                ["--scoped-credentials", "--install-pvp-policy",
+                 "--pvp-announcement-style", "unknown-style"],
+            ):
+                with self.subTest(extra=extra), self.assertRaises(SystemExit) as error:
+                    gateway_main(["--db", str(path), "--world-id", "cli", *extra])
+                self.assertEqual(2, error.exception.code)
             self.assertFalse(path.exists(), "Invalid flags cannot mutate the world")
             with self.assertRaises(SystemExit) as ex:
                 telnet_main([
@@ -49,6 +58,50 @@ class HostOptInCliTests(unittest.TestCase):
             self.assertEqual(2, ex.exception.code)
             self.assertFalse(path.exists(),
                              "Unbound player-token presence cannot create an implicit world")
+
+    def test_host_selected_safe_room_and_announcement_are_one_time_policy(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "world.sqlite3"
+            setup = Gateway(path, world_id="pvp_safe", scoped_credentials=True)
+            args = ["--db", str(path), "--world-id", "pvp_safe",
+                    "--scoped-credentials", "--install-pvp-policy"]
+            with self.assertRaisesRegex(ValueError, "Safe room"):
+                gateway_main([*args, "--pvp-safe-room", "not-a-real-room"])
+            with self.assertRaisesRegex(ValueError, "distinct room"):
+                gateway_main([*args, "--pvp-safe-room", "atrium",
+                              "--pvp-safe-room", "atrium"])
+            with closing(sqlite3.connect(path)) as db:
+                self.assertIsNone(db.execute(
+                    "SELECT name FROM sqlite_master WHERE name='combat_policy'"
+                ).fetchone(), "Rejected policy must not leave combat tables")
+
+            self.assertEqual(0, gateway_main([
+                *args, "--pvp-safe-room", "atrium",
+                "--pvp-announcement-style", "black_bell",
+            ]))
+            with closing(sqlite3.connect(path)) as db:
+                policy = db.execute(
+                    "SELECT safe_rooms_json,announcement_style,allow_offline_targets "
+                    "FROM combat_policy"
+                ).fetchone()
+            self.assertEqual((json.dumps(["atrium"]), "black_bell", 0), policy)
+            with self.assertRaisesRegex(ValueError, "already installed"):
+                gateway_main([*args, "--pvp-safe-room", "atrium"])
+
+            for player in ("Ada", "Bob"):
+                setup.engine.join(player)
+            tokens = {player: setup.scoped_credentials.provision(player)
+                      for player in ("Ada", "Bob")}
+            def act(player, command, action_id):
+                return setup.command_remote(player, command, action_id, tokens[player])["text"]
+            act("Ada", "pvp on", "a-on")
+            act("Bob", "pvp on", "b-on")
+            with self.assertRaisesRegex(ValueError, "safe zone"):
+                act("Ada", "attack Bob", "safe-denied")
+            act("Ada", "north", "a-north")
+            act("Bob", "north", "b-north")
+            with self.assertRaisesRegex(ValueError, "presence"):
+                act("Ada", "attack Bob", "no-online-witness")
 
     def test_stock_player_bound_telnet_cli_installs_socket_witness_only_when_opted_in(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -145,6 +198,7 @@ class HostOptInCliTests(unittest.TestCase):
             policy_args = [
                 "--db", str(path), "--world-id", "cli_live",
                 "--scoped-credentials", "--install-pvp-policy",
+                "--pvp-safe-room", "atrium",
             ]
             self.assertEqual(0, gateway_main(policy_args))
             with self.assertRaisesRegex(ValueError, "already installed"):
@@ -209,6 +263,11 @@ class HostOptInCliTests(unittest.TestCase):
 
                     self.assertEqual(200, command("Ada", "pvp on", "a-on")[0])
                     self.assertEqual(200, command("Bob", "pvp on", "b-on")[0])
+                    status, denied = command("Ada", "attack Bob", "safe-spawn")
+                    self.assertEqual(400, status)
+                    self.assertIn("safe zone", denied["error"])
+                    self.assertEqual(200, command("Ada", "north", "a-north")[0])
+                    self.assertEqual(200, command("Bob", "north", "b-north")[0])
                     self.assertEqual(200, command("Ada", "attack Bob", "actual-pvp")[0])
                     with closing(sqlite3.connect(path)) as db:
                         self.assertEqual(8, db.execute(

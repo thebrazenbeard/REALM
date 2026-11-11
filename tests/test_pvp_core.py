@@ -115,6 +115,76 @@ class PvPCombatTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "target"):
             self.act("Bob", "attack Outside", action_id="other-world")
 
+    def test_nonlethal_hit_is_visible_in_victim_room_but_not_elsewhere(self):
+        """A victim needs legible combat; remote spectators get no location leak."""
+        from realm.combat import Combat
+        Combat.configure(self.engine, max_hp=8, damage=3,
+                         safe_rooms=(), allow_offline_targets=True)
+        self.engine.join("Cora")
+        self.tokens["Cora"] = self.gateway.scoped_credentials.provision("Cora")
+        self.act("Ada", "pvp on")
+        self.act("Bob", "pvp on")
+        self.act("Ada", "north")
+        self.act("Bob", "north")
+        self.act("Ada", "attack Bob", action_id="private-hit-receipt")
+
+        victim_feed = self.gateway.feed("Bob", 0)
+        hits = [e for e in victim_feed["events"] if e["kind"] == "pvp_hit"]
+        self.assertEqual(1, len(hits))
+        self.assertIn("Ada", hits[0]["text"])
+        self.assertIn("Bob", hits[0]["text"])
+        self.assertIn("3 damage", hits[0]["text"])
+        self.assertNotIn("acted", hits[0]["text"])
+        self.assertNotIn("private-hit-receipt", str(hits[0]))
+        self.assertNotIn("remaining_hp", str(hits[0]))
+
+        other_room_feed = self.gateway.feed("Cora", 0)
+        self.assertFalse(any(e["kind"] == "pvp_hit" for e in other_room_feed["events"]))
+
+    def test_stale_pvp_consent_receipts_do_not_misreport_current_choice(self):
+        from realm.combat import Combat
+        Combat.configure(self.engine, allow_offline_targets=True)
+        self.assertIn("now ON", self.act("Ada", "pvp on", action_id="consent-on-1"))
+        self.assertIn("now OFF", self.act("Ada", "pvp off", action_id="consent-off-1"))
+        self.assertIn("now ON", self.act("Ada", "pvp on", action_id="consent-on-2"))
+
+        stale_off = self.act("Ada", "pvp off", action_id="consent-off-1")
+        self.assertIn("superseded", stale_off)
+        self.assertIn("currently ON", stale_off)
+        self.assertIn("PvP ON", self.act("Ada", "pvp status"))
+
+        self.assertIn("now OFF", self.act("Ada", "pvp off", action_id="consent-off-2"))
+        stale_on = self.act("Ada", "pvp on", action_id="consent-on-2")
+        self.assertIn("superseded", stale_on)
+        self.assertIn("currently OFF", stale_on)
+        self.assertIn("PvP OFF", self.act("Ada", "pvp status"))
+        combatants, events = self.state()
+        self.assertEqual((12, 0), combatants["Ada"])
+        self.assertEqual([], events)
+
+    def test_presence_required_status_does_not_claim_witness_is_absent(self):
+        from realm.combat import Combat
+        Combat.configure(self.engine, allow_offline_targets=False)
+        status = self.act("Ada", "pvp status")
+        self.assertIn("attacks require recent authenticated presence", status)
+        self.assertNotIn("online presence unverified; attacks blocked", status)
+
+    def test_stale_opt_in_receipt_cannot_override_host_revival_opt_out(self):
+        from realm.combat import Combat
+        Combat.configure(self.engine, max_hp=4, damage=4, allow_offline_targets=True)
+        self.act("Ada", "pvp on", action_id="ada-before-death")
+        self.act("Bob", "pvp on", action_id="bob-consent")
+        self.act("Bob", "attack Ada", action_id="fatal-hit")
+        Combat.revive(self.engine, "Ada")
+
+        stale = self.act("Ada", "pvp on", action_id="ada-before-death")
+        self.assertIn("superseded", stale)
+        self.assertIn("currently OFF", stale)
+        self.assertIn("PvP OFF", self.act("Ada", "pvp status"))
+        combatants, events = self.state()
+        self.assertEqual((4, 0), combatants["Ada"])
+        self.assertEqual(["pvp_hit", "pvp_death"], [e["kind"] for e in events])
+
     def test_global_death_announcement_is_minimal_and_room_safe(self):
         from realm.combat import Combat
         Combat.configure(self.engine, max_hp=4, damage=4, safe_rooms=(),
@@ -140,6 +210,52 @@ class PvPCombatTests(unittest.TestCase):
         self.assertEqual("global", notice["room"], "Global feed must not expose the hidden fight room")
         self.assertIn("Ada defeated Bob", notice["text"])
         self.assertNotIn("corridor", str(notice).lower())
+
+    def test_original_host_selected_pk_styles_are_durable_and_room_private(self):
+        from realm.combat import Combat
+        styles = {
+            "black_bell": ("realm-original-black-bell-v1",
+                           "The black bells toll: Bob has fallen to Ada."),
+            "omen": ("realm-original-omen-v1",
+                     "A shadow crosses the realm: Ada has laid Bob low."),
+            "taunt": ("realm-original-taunt-v1",
+                      "Somewhere a bard revises the tale. Ada has bested Bob."),
+        }
+        for style, (template_id, announcement) in styles.items():
+            with self.subTest(style=style), tempfile.TemporaryDirectory() as temp:
+                root = Path(temp)
+                gateway = Gateway(root / "world.sqlite3", world_id="style_world",
+                                  scoped_credentials=True,
+                                  scoped_guard_path=root / "scope.json")
+                for player in ("Ada", "Bob", "Cora"):
+                    gateway.engine.join(player)
+                tokens = {
+                    player: gateway.scoped_credentials.provision(player)
+                    for player in ("Ada", "Bob")
+                }
+                Combat.configure(gateway.engine, max_hp=4, damage=4,
+                                 announcement_style=style, allow_offline_targets=True)
+                def act(player, command, action_id):
+                    return gateway.command_remote(player, command, action_id,
+                                                  tokens[player])["text"]
+                act("Ada", "pvp on", "ada-on")
+                act("Bob", "pvp on", "bob-on")
+                act("Ada", "north", "ada-north")
+                act("Bob", "north", "bob-north")
+                first = act("Ada", "attack Bob", "fatal-1")
+                self.assertIn("has fallen", first)
+                self.assertEqual(first, act("Ada", "attack Bob", "fatal-1"))
+                death_events = [e for e in gateway.feed("Cora", 0)["events"]
+                                if e["kind"] == "pvp_death"]
+                self.assertEqual(1, len(death_events))
+                self.assertEqual("global", death_events[0]["room"])
+                self.assertEqual(announcement, death_events[0]["text"])
+                self.assertNotIn("corridor", str(death_events).lower())
+                with closing(sqlite3.connect(root / "world.sqlite3")) as db:
+                    rows = db.execute(
+                        "SELECT template_id,message FROM combat_announcements"
+                    ).fetchall()
+                self.assertEqual([(template_id, announcement)], rows)
 
 
 if __name__ == "__main__":
