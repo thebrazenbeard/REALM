@@ -34,7 +34,7 @@ class FlagshipWorldpackTests(unittest.TestCase):
         self.assertEqual(self.pack["world_id"], "siltglass-reach")
         self.assertEqual(self.pack["start_room"], "tidegate")
         self.assertEqual(24, len(self.rooms))
-        self.assertEqual(8, len(self.pack["items"]))
+        self.assertEqual(14, len(self.pack["items"]))
         self.assertEqual(64, len(self.digest))
         for room in self.rooms.values():
             with self.subTest(room=room["id"]):
