@@ -947,6 +947,14 @@ class GatewayHandler(BaseHTTPRequestHandler):
         self._header_guard_timer.start()
         try:
             super().handle_one_request()
+        except (ConnectionAbortedError, ConnectionResetError):
+            # Peer reset during stdlib's request-line/header reads is not an
+            # application failure. Keep post-parse exceptions observable.
+            with self._header_guard_lock:
+                parsing = self._header_guard_pending or self._header_guard_timed_out
+            if not parsing:
+                raise
+            self.close_connection = True
         finally:
             self._finish_header_guard()
 
