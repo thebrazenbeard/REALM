@@ -64,7 +64,7 @@ The current source of truth is [`docs/GATEWAY_PROTOCOL.md`](GATEWAY_PROTOCOL.md)
 | World identity | One SQLite file per instance; gateway reports configured `world_id`. | Host profile includes verified endpoint, world ID, player identity; never share cache/credentials across profiles. |
 | Player credential | Host-provisioned, player-bound bearer token; digest stored server-side; rotation/revocation supported. | Secret entry and protected per-profile storage; token only in `Authorization` header. |
 | Commands | Provisional `/api/v1/join`, `/command`, `/room`, `/feed`, `/map`; optional `action_id` on commands. | Typed, cancellable HTTP adapter for v1 **only after safe endpoint exists**; plan explicit `/api/v2` handshake/versioning. |
-| Events | Room-scoped polling (up to 100 per response), not server push. | Poll by cursor while active, deduplicate event IDs, detect gaps; don't claim exhaustive world history. |
+| Events | Personal event-time-delivery polling (up to 100 per response), not server push. | Poll by the authenticated actor's delivery cursor while active, deduplicate delivered IDs, detect gaps; don't claim exhaustive world history. |
 | Online presence | Persisted last location is not an online/offline signal. | Show connection state accurately; do not infer other players are online from `who`. |
 | Remote transport | HTTP and Telnet bind `127.0.0.1` on **the host**; neither is qualified for public/LAN exposure. | Block real remote connection testing until a separately qualified TLS gateway, host identity, limits and authorization exist. |
 | NPCs / deep memory / real-time simulation | Future goals, not shipped neural NPCs or push streams. | Render server-committed events when available; no local model/world authority. |

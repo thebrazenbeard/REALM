@@ -54,7 +54,7 @@ class EntrypointCraftingTests(unittest.TestCase):
     def test_http_gather_craft_and_visible_feed(self):
         self.assertEqual(200, self._http("/api/v1/join", {"player": "Patrick"})[0])
         self.assertEqual(200, self._http("/api/v1/join", {"player": "Vera"}, as_player="Vera")[0])
-        _, before = self._http("/api/v1/room?player=Vera", as_player="Vera")
+        _, before = self._http("/api/v1/feed?player=Vera&after=0", as_player="Vera")
         after = before["cursor"]
         request_body = {"player": "Patrick", "command": "gather stone 2", "action_id": "gather-http-1"}
         status, gathered = self._http("/api/v1/command", request_body)

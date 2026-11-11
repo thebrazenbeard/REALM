@@ -67,7 +67,7 @@ function instantiate({ missingMap = false, mapOnMove = false, rejectUnauthorized
     "/api/v1/room": { text: "You are in a field by water." },
     "/api/v1/map": worldMap(),
     "/api/v1/feed": { cursor: 0, events: [] },
-    "/api/v1/command": { text: "You move north", cursor: 0 },
+    "/api/v1/command": { text: "You move north" },
   };
   const mockFetch = async (url, options) => {
     requests.push({ url, options });
