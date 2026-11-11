@@ -33,15 +33,27 @@ generic worldpack importer exists; a canonical Driftspace worldpack does not.
 
 ## What exists now
 
-The current integration candidate supports:
+> **Source-only development candidate:** This section describes the draft
+> [PR #180](https://github.com/thebrazenbeard/REALM/pull/180), **not** the
+> default `main` branch. Its features are unmerged, uninstalled and not
+> qualified for public hosting; source tests do not substitute for Windows or
+> target-host validation.
+
+The current draft integration candidate supports:
 
 - Separate persistent worlds: each SQLite file is a world, seeded with three deliberately **noncanonical demo rooms**. The loopback gateway persists its `world_id` binding and rejects an attempt to relabel an existing database (see `docs/GATEWAY_PROTOCOL.md` for legacy adoption).
 - Player names and persistent positions across restarts. Presence is their **last saved location**, not proof they are currently online.
 - Room descriptions and exits; movement; item take/drop/inventory (with transaction-level contention); player presence and shared room history.
 - Durable player speech, readable by others with `listen`/`history`.
+- Room-local `emote`, world OOC (`ooc`), and host-granted, membership-filtered
+  faction or crew conversation (`crewchat`); unrelated players do not receive
+  private crew messages.
 - Append-only application event records for joins, movement and speech.
 - API-level optional action IDs for replay-safe mutation retries; duplicate IDs for different commands are rejected.
-- One terminal client per player, using the same database path, with stdlib-only runtime dependencies.
+- Local terminal clients using the same database path, with stdlib-only
+  runtime dependencies. CLI `--player` is a chosen name, **not** an exclusive
+  authenticated player session; distinct local users should choose distinct
+  names. The player-bound gateway credentials are a separate mechanism.
 - Versioned worldpack validation/import with a generic shore example; existing
   played worlds cannot be silently replaced (see `WORLDPACKS.md`).
 - An offline worldpack authoring CLI (`python -m realm.builder`) to create rooms,
@@ -55,6 +67,10 @@ The current integration candidate supports:
   (see `docs/GATEWAY_PROTOCOL.md`).
 - A Pages-compatible static browser client under `docs/`, including a live map
   display. GitHub Pages does not run the game server.
+- Source-tested host-installed, mutually opted-in local PvP (`pvp on`,
+  `pvp off`, `attack`) with writer-verified, credential-bound recent-activity
+  witnesses and a room-redacted PK herald. This is **not** qualified for
+  untrusted multiplayer hosting ([presence contract](docs/PRESENCE_WAVE28_INTEGRATION.md)).
 - A separately gated loopback-only Telnet adapter (`TERMINAL.md`). Legacy
   shared-token/player-chosen-name mode remains for compatibility; an opt-in
   host-provisioned player-credential mode enforces identity at the writer
@@ -62,12 +78,16 @@ The current integration candidate supports:
 - A host-local per-player gateway request limiter and browser retries for
   `429 Retry-After`, plus a bounded socket-worker pool and absolute POST body
   deadline ([abuse controls](docs/GATEWAY_ABUSE_CONTROLS.md),
-  [worker bounds](docs/GATEWAY_SLOW_BODY.md)).
+  [worker bounds](docs/GATEWAY_SLOW_BODY.md)). Its scoped loopback HTTP server
+  also enforces an incomplete-header deadline.
 - An explicitly invoked, bounded local-model proposal bridge for NPCs, with
   host-owned identities, allowed actions, and SQLite receipts
   ([model transport](docs/NPC_LOCAL_MODEL_BRIDGE.md),
   [turn execution](docs/NPC_TURNS.md)). Model weights and scheduling are not
   included.
+- A host-authorized, privacy-scoped NPC scene snapshot builder for supplying
+  bounded context to a local model; this is not autonomous NPC behavior
+  (`src/realm/npc_scene.py`).
 - A read-only host preflight for SQLite/world-path and local-runtime suitability
   ([host preflight](docs/HOST_PREFLIGHT.md)).
 - A direct world-clock callback guard that prevents accidental COMMIT,
@@ -79,9 +99,9 @@ The current integration candidate supports:
   ([title policy](docs/TITLE_FLAGS.md)).
 
 **Not implemented or qualified:** public TLS hosting, full unauthenticated
-flood protection and header deadlines, cross-process rate quotas, public account registration,
-expiring sessions, fog of war, autonomous AI/NPC co-player scheduling, a
-privacy-scoped NPC scene builder, inter-world portals, combat, moderation,
+flood protection, cross-process rate quotas, public account registration,
+expiring login sessions, fog of war, autonomous AI/NPC co-player scheduling,
+inter-world portals, production-safe or balanced PvP, moderation,
 distributed state, or the canonical Driftspace setting. CLI names and legacy
 Telnet names are not durable authenticated account identities. **Do not expose
 these development servers to the public internet.**
@@ -97,8 +117,9 @@ Small local NPC-model options, including Patrick's Hugging Face `character` and
 [`research/npc-model-candidates.v1.json`](research/npc-model-candidates.v1.json).
 No weights are bundled, installed or benchmarked by this registry.
 
-The browser uses HTTP polling, not push notifications. Presence still means
-saved room position, not reliable online/offline status.
+The browser uses HTTP polling, not push notifications. Ordinary player lists
+show saved room position, not a reliable online/offline roster. The separate
+host-controlled, short-lived witness serves only scoped local PvP eligibility.
 
 ## Play locally (Python 3.11+)
 
