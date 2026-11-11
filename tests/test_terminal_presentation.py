@@ -51,6 +51,41 @@ class TerminalPaletteTests(unittest.TestCase):
         self.assertNotIn("\x1b[31m", colored)
         self.assertEqual(1, colored.count("\x1b[1;36m"))
 
+    def test_material_phrases_highlight_only_grounded_objects(self):
+        view = ("The Workshop\n"
+                "A wooden table stands by a steel rack and a bare table. "
+                "A table of steel supports a crate made of oak.\nExits: south")
+        shown = render_terminal(view, ansi=True, room=True)
+        self.assertIn("\x1b[38;2;159;103;58mwooden table\x1b[0m", shown)
+        self.assertIn("\x1b[38;2;157;173;185msteel rack\x1b[0m", shown)
+        self.assertIn("\x1b[38;2;157;173;185mtable of steel\x1b[0m", shown)
+        self.assertIn("\x1b[38;2;159;103;58mcrate made of oak\x1b[0m", shown)
+        self.assertIn("a bare table", shown)
+        self.assertNotIn("\x1b[38;2;159;103;58mbare table", shown)
+
+    def test_lighting_cues_and_scope_are_grounded(self):
+        view = ("Observation Deck\n"
+                "Faint floor lights illuminate the path. Bright overhead lights "
+                "shine near a brilliant white beacon; one lamp is off.\n"
+                "Exits: west\nYou say: faint floor lights")
+        shown = render_terminal(view, ansi=True, room=True)
+        self.assertIn("\x1b[38;2;154;129;54mFaint floor lights\x1b[0m", shown)
+        self.assertIn("\x1b[38;2;255;248;215mBright overhead lights\x1b[0m", shown)
+        self.assertIn("\x1b[38;2;255;248;215mbrilliant white beacon\x1b[0m", shown)
+        self.assertIn("one lamp is off", shown)
+        self.assertIn("\x1b[1;35mfaint floor lights\x1b[0m", shown)
+        self.assertNotIn("\x1b[38;2;154;129;54mfaint floor lights", shown)
+
+    def test_ambiguous_disjunction_does_not_choose_material_or_light(self):
+        view = ("The Lobby\n"
+                "A wooden or steel table is rumored to be here. Its bulbs might "
+                "be dim or bright lights depending on the hour.\nExits: north")
+        shown = render_terminal(view, ansi=True, room=True)
+        self.assertIn("wooden or steel table", shown)
+        self.assertIn("dim or bright lights", shown)
+        self.assertNotIn("\x1b[38;2;157;173;185msteel table", shown)
+        self.assertNotIn("\x1b[38;2;255;248;215mbright lights", shown)
+
     def test_palette_preview_is_opt_in_and_reset_delimited(self):
         self.assertIn("Classic:", palette_preview(ansi=False))
         self.assertNotIn("\x1b[", palette_preview(ansi=False))

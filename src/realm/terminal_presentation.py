@@ -101,11 +101,102 @@ def _paint(value: str, sgr: str) -> str:
     return "\x1b[" + sgr + "m" + value + "\x1b[0m"
 
 
+# Contextual spans are deliberately bounded to explicit scene cues.
+# A bare "table" has no known material; only specified wood/metal gets color.
+_MATERIAL_COLOR = {
+    "wooden": "38;2;159;103;58",
+    "wood": "38;2;159;103;58",
+    "oak": "38;2;159;103;58",
+    "pine": "38;2;159;103;58",
+    "mahogany": "38;2;159;103;58",
+    "steel": "38;2;157;173;185",
+    "iron": "38;2;157;173;185",
+    "metal": "38;2;157;173;185",
+    "aluminum": "38;2;157;173;185",
+    "aluminium": "38;2;157;173;185",
+    "titanium": "38;2;157;173;185",
+}
+_MATERIAL = "|".join(_MATERIAL_COLOR)
+_FURNISHING = (
+    r"tables?|desks?|benches?|chairs?|doors?|panels?|crates?|"
+    r"shelves?|lockers?|bulkheads?|edges?|racks?|frames?|stools?"
+)
+# Match material->furnishing and furnishing->material, but not ambiguous nouns.
+_MATERIAL_BEFORE = re.compile(
+    rf"\b(?:weathered\s+|polished\s+|rusted\s+)?(?P<material>{_MATERIAL})"
+    rf"\s+(?:{_FURNISHING})\b", re.IGNORECASE,
+)
+_MATERIAL_AFTER = re.compile(
+    rf"\b(?:{_FURNISHING})\s+(?:(?:made|built|crafted)\s+(?:of|from)\s+|of\s+)"
+    rf"(?P<material>{_MATERIAL})\b", re.IGNORECASE,
+)
+_LIGHTING = re.compile(
+    r"\b(?P<level>faint|dim|weak|low|flickering|bright|brilliant|blinding|harsh)"
+    r"\s+(?:white\s+|amber\s+|yellow\s+|blue\s+|orange\s+)?"
+    r"(?:floor\s+|overhead\s+|ceiling\s+|warning\s+|status\s+|work\s+|emergency\s+)?"
+    r"(?:lights?|lamps?|beacons?|glows?|bulbs?)\b",
+    re.IGNORECASE,
+)
+_DIM_LIGHT = frozenset({"faint", "dim", "weak", "low", "flickering"})
+
+
+# A disjunction like "wooden or steel table" is NOT evidence of steel.
+_AMBIGUOUS_MATERIAL_PREFIX = re.compile(
+    rf"\b(?:{_MATERIAL})\s+or\s+$", re.IGNORECASE,
+)
+_AMBIGUOUS_LIGHT_PREFIX = re.compile(
+    r"\b(?:faint|dim|weak|low|bright|brilliant|blinding|harsh)"
+    r"\s+or\s+$", re.IGNORECASE,
+)
+
+
+def _semantic_prose_spans(line: str) -> list[tuple[int, int, str]]:
+    """Prioritize grounded lighting/material phrases over individual color words.
+
+    Return non-overlapping spans; no inferred material for unspecified objects.
+    Every ANSI sequence resets before the next literal character.
+    """
+    proposals = []
+    for pattern in (_MATERIAL_BEFORE, _MATERIAL_AFTER):
+        for match in pattern.finditer(line):
+            if _AMBIGUOUS_MATERIAL_PREFIX.search(line[max(0, match.start() - 36):match.start()]):
+                continue
+            color = _MATERIAL_COLOR[match.group("material").casefold()]
+            proposals.append((match.start(), match.end(), color))
+    for match in _LIGHTING.finditer(line):
+        if _AMBIGUOUS_LIGHT_PREFIX.search(line[max(0, match.start() - 36):match.start()]):
+            continue
+        dim = match.group("level").casefold() in _DIM_LIGHT
+        proposals.append((
+            match.start(), match.end(),
+            "38;2;154;129;54" if dim else "38;2;255;248;215",
+        ))
+    for match in _PROSE_WORD.finditer(line):
+        proposals.append((
+            match.start(), match.end(),
+            PROSE_COLORS[match.group(0).casefold()],
+        ))
+    # Earlier cue wins; for tied start prefer the full phrase over a color word.
+    proposals.sort(key=lambda span: (span[0], -(span[1] - span[0])))
+    chosen = []
+    stop = 0
+    for start, end, color in proposals:
+        if start >= stop:
+            chosen.append((start, end, color))
+            stop = end
+    return chosen
+
+
 def _highlight_room_description(line: str) -> str:
-    return _PROSE_WORD.sub(
-        lambda hit: _paint(hit.group(0), PROSE_COLORS[hit.group(0).casefold()]),
-        line,
-    )
+    pieces = []
+    previous = 0
+    for start, end, ansi in _semantic_prose_spans(line):
+        pieces.append(line[previous:start])
+        pieces.append("\x1b[" + ansi + "m" + line[start:end] + "\x1b[0m")
+        previous = end
+    pieces.append(line[previous:])
+    return "".join(pieces)
+
 
 
 def _color_label(line: str) -> str:

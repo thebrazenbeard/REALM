@@ -22,7 +22,11 @@ Use `palette` (`colors` or `colours`) to preview named swatches; `color off`
 (or `colour off`) restores plain text. New sessions start without ANSI.
 Room titles, exits, items and inventory use distinct colors. Named colors in
 **room descriptions only** are highlighted, including `copper`, `amber`,
-`pink`, `cyan`, and `light grey`; player chat is not semantically recolored.
+`pink`, `cyan`, and `light grey`; explicitly described materials such as
+`wooden table` and `steel panel`, plus grounded lighting phrases such as
+`faint floor lights` and `bright overhead lamps`, have distinct cues. Bare
+objects and ambiguous descriptions are never assigned inferred materials or
+light intensity. Player chat is not semantically recolored.
 No room, player, credential or SQLite data changes when toggling colors.
 
 This generic, opt-in renderer adapts the palette concept from
