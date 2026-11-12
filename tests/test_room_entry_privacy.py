@@ -1,5 +1,6 @@
 """REALM actor/room entry floor: real Engine and Gateway, disposable SQLite."""
 from pathlib import Path
+from contextlib import closing
 from tempfile import TemporaryDirectory
 import sqlite3
 import unittest
@@ -49,7 +50,7 @@ class RoomEntryPrivacyTests(unittest.TestCase):
     def test_missing_entry_ledger_fails_closed_without_secret_exposure(self):
         self.host.join("Visitor")
         self.host.command("Visitor", "say PREEXISTING SECRET", None)
-        with sqlite3.connect(self.db) as db:
+        with closing(sqlite3.connect(self.db)) as db, db:
             db.execute(
                 "INSERT INTO players(id,room_id,created_at) VALUES(?,?,?)",
                 ("Legacy", "atrium", "2026-11-11T00:00:00+00:00"),
@@ -92,7 +93,7 @@ class RoomEntryPrivacyTests(unittest.TestCase):
     def test_legacy_actor_can_resume_after_new_real_room_entry(self):
         self.host.join("Visitor")
         self.host.command("Visitor", "say OLD NOT VISIBLE", None)
-        with sqlite3.connect(self.db) as db:
+        with closing(sqlite3.connect(self.db)) as db, db:
             db.execute(
                 "INSERT INTO players(id,room_id,created_at) VALUES(?,?,?)",
                 ("Legacy", "atrium", "2026-11-11T00:00:00+00:00"),
