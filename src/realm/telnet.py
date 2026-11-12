@@ -417,6 +417,13 @@ class LocalTelnetHandler(socketserver.BaseRequestHandler):
                 self._send("REALM> ")
                 continue
             verb, _, args = command.casefold().partition(" ")
+            # Reservation writer guards are NOT proof of player identity.
+            # Shared-token callers remain ineligible for authenticated combat,
+            # even though their mutations now carry a reserved-role guard.
+            if (not self.server.player_credentials and
+                    (verb == "attack" or (verb == "pvp" and args.strip() != "news"))):
+                self._send("Access revoked.\n")
+                return
             if verb in {"color", "colour"}:
                 setting = args.strip()
                 if setting in {"on", "off"}:
