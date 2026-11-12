@@ -50,6 +50,36 @@ class RoomEntryPrivacyTests(unittest.TestCase):
         self.assertTrue(any(e["actor"] == "Rylok" and e["kind"] == "move" for e in entries))
         self.assertFalse(any(e["room"] != "corridor" for e in entries))
 
+    def test_returning_login_does_not_read_messages_while_disconnected(self):
+        """An authenticated rejoin must establish a fresh room visibility floor."""
+        self.host.join("Visitor")
+        self.host.join("Rylok")
+        self.host.command("Visitor", "say SECRET WHILE RYLOK DISCONNECTED", None)
+        result = self.host.join("Rylok")
+        self.assertIn("Welcome back, Rylok.", result["text"])
+        self.assertNotIn(
+            "SECRET WHILE RYLOK DISCONNECTED",
+            self.host.command("Rylok", "history 50", None)["text"],
+        )
+        self.assertFalse(any(
+            "SECRET WHILE RYLOK DISCONNECTED" in e["text"]
+            for e in self.host.feed("Rylok", 0)["events"]
+        ))
+        self.host.command("Visitor", "say POST RECONNECT", None)
+        self.assertIn("POST RECONNECT", self.host.command("Rylok", "history 50", None)["text"])
+
+    def test_reconnect_records_new_entry_without_resetting_position_or_inventory(self):
+        self.host.join("Rylok")
+        self.host.command("Rylok", "take token", None)
+        self.host.command("Rylok", "north", None)
+        self.host.join("Rylok")
+        self.assertIn("The Corridor", self.host.command("Rylok", "look", None)["text"])
+        self.assertIn("Brass token", self.host.command("Rylok", "inventory", None)["text"])
+        self.assertTrue(any(
+            e["actor"] == "Rylok" and e["kind"] == "join"
+            for e in self.host.feed("Rylok", 0)["events"]
+        ))
+
     def test_inconsistent_player_room_and_latest_entry_fails_closed(self):
         """A missing host entry event must not resurrect an older room's history."""
         self.host.join("Visitor")

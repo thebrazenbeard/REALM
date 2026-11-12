@@ -190,6 +190,10 @@ class Engine:
                 db.execute("INSERT INTO players VALUES (?,?,?)", (name, start_room, self._now()))
                 self._event(db, name, start_room, "join", {})
                 return f"Welcome, {name}.\n{self._look(db, start_room, name)}"
+            # A returning player begins a new room-observation session.
+            # The gateway must authenticate the caller before invoking join.
+            # Preserve position/inventory, not prior-session room history.
+            self._event(db, player["id"], player["room_id"], "join", {})
             return f"Welcome back, {player['id']}.\n{self._look(db, player['room_id'], player['id'])}"
 
     def _look(self, db: sqlite3.Connection, room_id: str, name: str) -> str:
