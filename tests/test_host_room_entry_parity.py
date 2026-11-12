@@ -264,7 +264,49 @@ class RoomEntryPrivacyTests(unittest.TestCase):
         self.assertIsInstance(result["room_entry_cursor"], int)
         self.assertLessEqual(result["room_entry_cursor"], result["cursor"],
                              "Browser must never receive a future room floor")
+        with closing(sqlite3.connect(self.db)) as db:
+            joins = [row[0] for row in db.execute(
+                "SELECT id FROM events WHERE actor='Newcomer' AND kind='join' ORDER BY id"
+            )]
+        self.assertEqual(3, len(joins))
+        self.assertEqual(joins[-2], result["room_entry_cursor"],
+                         "Join result must represent its own entry, not a later session")
 
+
+
+    def test_suppressed_join_event_cannot_acknowledge_new_player(self):
+        with closing(sqlite3.connect(self.db)) as db, db:
+            db.execute(
+                "CREATE TRIGGER ignore_join_event BEFORE INSERT ON events "
+                "WHEN NEW.kind='join' AND NEW.actor='Newcomer' "
+                "BEGIN SELECT RAISE(IGNORE); END"
+            )
+        with self.assertRaises((RuntimeError, ValueError)):
+            self.host.join("Newcomer")
+        with closing(sqlite3.connect(self.db)) as db:
+            self.assertIsNone(db.execute(
+                "SELECT id FROM players WHERE id='Newcomer'"
+            ).fetchone())
+
+    def test_deleted_join_event_rolls_back_rejoin_and_keeps_old_floor(self):
+        self.host.join("Newcomer")
+        with closing(sqlite3.connect(self.db)) as db:
+            before = db.execute(
+                "SELECT COUNT(*) FROM events WHERE actor='Newcomer' AND kind='join'"
+            ).fetchone()[0]
+        with closing(sqlite3.connect(self.db)) as db, db:
+            db.execute(
+                "CREATE TRIGGER delete_join_event AFTER INSERT ON events "
+                "WHEN NEW.kind='join' AND NEW.actor='Newcomer' "
+                "BEGIN DELETE FROM events WHERE id=NEW.id; END"
+            )
+        with self.assertRaises(RuntimeError):
+            self.host.join("Newcomer")
+        with closing(sqlite3.connect(self.db)) as db:
+            after = db.execute(
+                "SELECT COUNT(*) FROM events WHERE actor='Newcomer' AND kind='join'"
+            ).fetchone()[0]
+        self.assertEqual(before, after)
 
 if __name__ == "__main__":
     unittest.main()

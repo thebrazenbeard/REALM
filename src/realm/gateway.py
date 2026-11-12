@@ -175,8 +175,12 @@ class Gateway:
         if not isinstance(player, str):
             raise ValueError("Player must be a string")
         guard = self._scoped_writer_guard(player, token, "world:join")
-        text = self.engine.join(player, writer_guard=guard)
-        return {"ok": True, "text": text, **self._response_cursors(player)}
+        join_emissions: list[tuple[int, str]] = []
+        text = self.engine.join(player, writer_guard=guard, emissions=join_emissions)
+        if len(join_emissions) != 1:
+            raise RuntimeError("Host did not attest the join entry")
+        return {"ok": True, "text": text,
+                **self._response_cursors(player, entry_hint=join_emissions[0][0])}
 
     def command_remote(self, player: str, command: str, action_id: str | None,
                        token: str) -> dict:
@@ -434,15 +438,15 @@ class Gateway:
             except ValueError:
                 return None
 
-    def _response_cursors(self, player: str) -> dict:
-        """Consistent numeric ordering even when another session rejoins.
+    def _response_cursors(self, player: str, *, entry_hint: int | None = None) -> dict:
+        """Keep the caller's committed join entry distinct from later rejoins.
 
         A global head sampled before a competing, authenticated room entry
         may be smaller than its host-recorded entry ID. Return a head at
         least as recent as the entry cursor; feed still revalidates access.
         """
         head = self.cursor()
-        entry = self._room_entry_cursor(player)
+        entry = entry_hint if entry_hint is not None else self._room_entry_cursor(player)
         return {"cursor":max(head, entry if entry is not None else 0),
                 "room_entry_cursor":entry}
 
@@ -457,11 +461,16 @@ class Gateway:
         if not isinstance(player, str):
             raise ValueError("Player must be a string")
         # The underlying join() validates syntax and preserves the current world.
+        join_emissions: list[tuple[int, str]] = []
         if writer_guard is None:
-            text = self.engine.join(player)
+            text = self.engine.join(player, emissions=join_emissions)
         else:
-            text = self.engine.join(player, writer_guard=writer_guard)
-        return {"ok": True, "text": text, **self._response_cursors(player)}
+            text = self.engine.join(player, writer_guard=writer_guard,
+                                    emissions=join_emissions)
+        if len(join_emissions) != 1:
+            raise RuntimeError("Host did not attest the join entry")
+        return {"ok": True, "text": text,
+                **self._response_cursors(player, entry_hint=join_emissions[0][0])}
 
     def command(self, player: str, command: str, action_id: str | None, *,
                 writer_guard: Callable[[sqlite3.Connection], None] | None = None) -> dict:

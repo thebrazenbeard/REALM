@@ -92,8 +92,14 @@ For browser requests, Origin must exactly match one explicitly configured
 | `GET /api/v1/map?player=Patrick` | query; optional authored geography | `{"ok":true,"space":{...},"origin":{...},"width":3,"height":2,"tiles":[...],"markers":[...],"player":{...},"legend":[...]}` |
 
 The room_entry_cursor returned by join and command (including scoped
-player-bound HTTP paths) is the actor's last **host-recorded entry ID** into
-their current room, not the overall world event head. A new actor's join,
+player-bound HTTP paths) identifies host-recorded room arrival, not the
+overall world event head. A join response uses the exact event ID emitted
+inside **that join's own committed writer transaction**, even if a second
+session for the same character rejoins before response assembly. The join
+writer reads back its exact event and saved room before COMMIT; a silently
+suppressed or deleted join event rolls the transaction back. A command
+reports the latest verified current-room entry at its response read.
+A new actor's join,
 returning authenticated join, or movement generates an entry event. A
 different player's message can arrive after that entry but before the global
 cursor is sampled; starting a feed at the later global cursor would silently

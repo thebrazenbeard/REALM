@@ -172,9 +172,41 @@ class Engine:
                 raise ValueError("Event emitter did not return its inserted row")
             emissions.append((emitted[0], emitted[1]))
 
-    def join(self, name: str, *, writer_guard: Callable[[sqlite3.Connection], None] | None = None) -> str:
+    @staticmethod
+    def _verify_join_entry(
+        db: sqlite3.Connection, receipts: list[tuple[int, str]],
+        actor: str, room_id: str,
+    ) -> None:
+        """Reject a join event suppressed or rewritten by a SQLite trigger.
+
+        The row returned by INSERT ... RETURNING proves that the statement
+        produced an ID, not that an AFTER trigger left its event in the world.
+        Read back the exact event and actor location before COMMIT.
+        """
+        if len(receipts) != 1:
+            raise RuntimeError("Join must emit exactly one host entry event")
+        event_id, occurred_at = receipts[0]
+        row = db.execute(
+            "SELECT actor,room_id,kind,occurred_at FROM main.events WHERE id=?",
+            (event_id,),
+        ).fetchone()
+        player = db.execute(
+            "SELECT room_id FROM main.players WHERE id=? COLLATE NOCASE",
+            (actor,),
+        ).fetchone()
+        if (row is None or row["actor"] != actor
+                or row["room_id"] != room_id or row["kind"] != "join"
+                or row["occurred_at"] != occurred_at or player is None
+                or player["room_id"] != room_id):
+            raise RuntimeError("Join entry event or actor room failed readback")
+
+    def join(self, name: str, *, writer_guard: Callable[[sqlite3.Connection], None] | None = None,
+             emissions: list[tuple[int, str]] | None = None) -> str:
         if not _PLAYER_RE.fullmatch(name):
             raise ValueError("Player name must start with a letter, use only letters, digits, '_' or '-', and be <=24 characters")
+        if emissions is not None and emissions:
+            raise ValueError("Join entry receipt list must be empty")
+        join_receipts = emissions if emissions is not None else []
         with closing(self._connect()) as db, db:
             # Serialize first-time joins so two clients cannot race on one name.
             db.execute("BEGIN IMMEDIATE")
@@ -185,12 +217,14 @@ class Engine:
                 configured = db.execute("SELECT value FROM world_meta WHERE key='start_room'").fetchone()
                 start_room = configured[0] if configured is not None else "atrium"
                 db.execute("INSERT INTO players VALUES (?,?,?)", (name, start_room, self._now()))
-                self._event(db, name, start_room, "join", {})
+                self._event(db, name, start_room, "join", {}, emissions=join_receipts)
+                self._verify_join_entry(db, join_receipts, name, start_room)
                 return f"Welcome, {name}.\n{self._look(db, start_room, name)}"
             # Authenticated returning joins establish a new observation floor,
             # preserving saved location and inventory but not prior-session
             # room history. Writer guard has already validated this principal.
-            self._event(db, player["id"], player["room_id"], "join", {})
+            self._event(db, player["id"], player["room_id"], "join", {}, emissions=join_receipts)
+            self._verify_join_entry(db, join_receipts, player["id"], player["room_id"])
             return f"Welcome back, {player['id']}.\n{self._look(db, player['room_id'], player['id'])}"
 
     def _look(self, db: sqlite3.Connection, room_id: str, name: str) -> str:
