@@ -454,7 +454,18 @@
           (Object.prototype.hasOwnProperty.call(joined, "ok") && joined.ok !== true)) {
         throw new Error("Host join response lacks a valid success cursor.");
       }
-      session.cursor = joined.cursor;
+      // The global head may already include post-entry room speech from
+      // another actor. Start listening at the host's authenticated room
+      // entry rather than silently skipping those legitimate events.
+      // Older hosts omit the field; malformed new-host fields fail closed.
+      if (Object.prototype.hasOwnProperty.call(joined, "room_entry_cursor") &&
+          (!Number.isSafeInteger(joined.room_entry_cursor) ||
+           joined.room_entry_cursor < 0 ||
+           joined.room_entry_cursor > joined.cursor)) {
+        throw new Error("Host returned an invalid room-entry cursor.");
+      }
+      session.cursor = Object.prototype.hasOwnProperty.call(joined, "room_entry_cursor")
+        ? joined.room_entry_cursor : joined.cursor;
       current = session;
       resetFeed();
       setConnectionState(true);

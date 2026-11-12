@@ -84,12 +84,30 @@ For browser requests, Origin must exactly match one explicitly configured
 | Request | Body/query | Response |
 | --- | --- | --- |
 | `GET /api/v1/health` | none | `{ "ok": true, "world_id": "demo" }` |
-| `POST /api/v1/join` | `{"player":"Patrick"}` | `{"ok":true,"text":"Welcome ...","cursor":1}` |
-| `POST /api/v1/command` | `{"player":"Patrick","command":"look","action_id":"optional-unique-id"}` | `{"ok":true,"text":"...","cursor":1}` |
+| `POST /api/v1/join` | `{"player":"Patrick"}` | `{"ok":true,"text":"Welcome ...","cursor":1,"room_entry_cursor":1}` |
+| `POST /api/v1/command` | `{"player":"Patrick","command":"look","action_id":"optional-unique-id"}` | `{"ok":true,"text":"...","cursor":1,"room_entry_cursor":1}` |
 | `GET /api/v1/room?player=Patrick` | query | `{"ok":true,"text":"...","cursor":1}` |
 | `GET /api/v1/scene?player=Patrick` | query | Authenticated saved-room facts: `room`, `exits`, `items`, `occupants`, `presence_semantics`, `truncated`, `cursor` |
 | `GET /api/v1/feed?player=Patrick&after=1` | query | `{"ok":true,"events":[...],"cursor":2}` |
 | `GET /api/v1/map?player=Patrick` | query; optional authored geography | `{"ok":true,"space":{...},"origin":{...},"width":3,"height":2,"tiles":[...],"markers":[...],"player":{...},"legend":[...]}` |
+
+The room_entry_cursor returned by join and command (including scoped
+player-bound HTTP paths) is the actor's last **host-recorded entry ID** into
+their current room, not the overall world event head. A new actor's join,
+returning authenticated join, or movement generates an entry event. A
+different player's message can arrive after that entry but before the global
+cursor is sampled; starting a feed at the later global cursor would silently
+drop that legitimate message. Poll /api/v1/feed with after=room_entry_cursor
+to capture subsequent room activity. The global cursor is still returned
+for compatibility and is numerically at least room_entry_cursor whenever
+the latter is a valid integer. This hint is **not** a permission token:
+every feed request separately enforces actor credentials, current room,
+latest trusted join/move/leave evidence and channel permissions. Missing
+historical entry proof yields null and the authoritative feed fails closed.
+Older gateway versions omit this field. Clients should fall back to the
+global cursor only when the entry field is absent, not malformed. The
+static browser validates both. This is not a guarantee of complete history
+or a contract for competing same-actor sessions.
 
 The optional `/scene` endpoint reads the authenticated player's room, exits,
 visible items, and actors' saved room positions in one SQLite read snapshot.

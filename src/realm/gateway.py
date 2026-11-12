@@ -176,7 +176,7 @@ class Gateway:
             raise ValueError("Player must be a string")
         guard = self._scoped_writer_guard(player, token, "world:join")
         text = self.engine.join(player, writer_guard=guard)
-        return {"ok": True, "text": text, "cursor": self.cursor()}
+        return {"ok": True, "text": text, **self._response_cursors(player)}
 
     def command_remote(self, player: str, command: str, action_id: str | None,
                        token: str) -> dict:
@@ -187,7 +187,7 @@ class Gateway:
             raise ValueError("Command is too long")
         guard = self._scoped_writer_guard(player, token, "command:write")
         text = self.router.act(player, command, action_id=action_id, writer_guard=guard)
-        return {"ok": True, "text": text, "cursor": self.cursor()}
+        return {"ok": True, "text": text, **self._response_cursors(player)}
 
     def ship_depart_remote(
         self, token: str, ship_id: str, destination: str, action_id: str,
@@ -412,6 +412,40 @@ class Gateway:
         finally:
             db.close()
 
+    def _room_entry_cursor(self, player: str) -> int | None:
+        """Advisory player-room entry cursor; feed still enforces authorization.
+
+        Never infer entry from the global head. Read the current player and
+        host-recorded latest arrival inside one SQLite snapshot. A malformed
+        legacy ledger yields no hint rather than inventing room knowledge.
+        """
+        with closing(self._read()) as db:
+            db.execute("BEGIN")
+            subject = db.execute(
+                "SELECT id,room_id FROM main.players WHERE id=? COLLATE NOCASE",
+                (player,),
+            ).fetchone()
+            if subject is None:
+                return None
+            try:
+                return self.engine._room_entry_floor(
+                    db, subject["id"], subject["room_id"]
+                )
+            except ValueError:
+                return None
+
+    def _response_cursors(self, player: str) -> dict:
+        """Consistent numeric ordering even when another session rejoins.
+
+        A global head sampled before a competing, authenticated room entry
+        may be smaller than its host-recorded entry ID. Return a head at
+        least as recent as the entry cursor; feed still revalidates access.
+        """
+        head = self.cursor()
+        entry = self._room_entry_cursor(player)
+        return {"cursor":max(head, entry if entry is not None else 0),
+                "room_entry_cursor":entry}
+
     def channel_access_revision(self, player: str) -> int:
         """Current host channel permission watermark for response-time checks."""
         from .channel_roster import channel_access_revision
@@ -427,7 +461,7 @@ class Gateway:
             text = self.engine.join(player)
         else:
             text = self.engine.join(player, writer_guard=writer_guard)
-        return {"ok": True, "text": text, "cursor": self.cursor()}
+        return {"ok": True, "text": text, **self._response_cursors(player)}
 
     def command(self, player: str, command: str, action_id: str | None, *,
                 writer_guard: Callable[[sqlite3.Connection], None] | None = None) -> dict:
@@ -441,7 +475,7 @@ class Gateway:
             text = self.router.act(
                 player, command, action_id=action_id, writer_guard=writer_guard,
             )
-        return {"ok": True, "text": text, "cursor": self.cursor()}
+        return {"ok": True, "text": text, **self._response_cursors(player)}
 
     def room(self, player: str) -> dict:
         if not isinstance(player, str):

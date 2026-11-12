@@ -152,5 +152,119 @@ class RoomEntryPrivacyTests(unittest.TestCase):
         ))
 
 
+    def test_join_entry_cursor_preserves_message_interleaved_before_global_cursor(self):
+        from unittest.mock import patch
+        self.host.join("Visitor")
+        original_cursor = self.host.cursor
+
+        def speak_before_global_cursor():
+            self.engine.act("Visitor", "say MESSAGE AFTER ENTRY BEFORE CURSOR")
+            return original_cursor()
+
+        with patch.object(self.host, "cursor", side_effect=speak_before_global_cursor):
+            result = self.host.join("Newcomer")
+        self.assertIsInstance(result["room_entry_cursor"], int)
+        self.assertLess(result["room_entry_cursor"], result["cursor"])
+        feed = self.host.feed("Newcomer", result["room_entry_cursor"])["events"]
+        self.assertTrue(any("MESSAGE AFTER ENTRY BEFORE CURSOR" in x["text"]
+                            for x in feed))
+
+    def test_move_entry_cursor_preserves_message_interleaved_before_global_cursor(self):
+        from unittest.mock import patch
+        self.host.join("Visitor")
+        self.host.command("Visitor", "north", None)
+        self.host.join("Newcomer")
+        original_cursor = self.host.cursor
+
+        def speak_before_global_cursor():
+            self.engine.act("Visitor", "say CORRIDOR MESSAGE BEFORE CURSOR")
+            return original_cursor()
+
+        with patch.object(self.host, "cursor", side_effect=speak_before_global_cursor):
+            moved = self.host.command("Newcomer", "north", None)
+        self.assertIsInstance(moved["room_entry_cursor"], int)
+        self.assertLess(moved["room_entry_cursor"], moved["cursor"])
+        self.assertTrue(any(
+            "CORRIDOR MESSAGE BEFORE CURSOR" in e["text"]
+            for e in self.host.feed("Newcomer", moved["room_entry_cursor"])["events"]
+        ))
+
+    def test_scoped_remote_join_and_command_include_entry_cursor(self):
+        from realm.gateway import Gateway
+        scoped = Gateway(self.db, world_id="privacy-probe",
+                         scoped_credentials=True)
+        scoped.join("Newcomer")
+        token = scoped.scoped_credentials.provision(
+            "Newcomer",
+            capabilities=("world:join", "command:write", "feed:read"),
+        )
+        result = scoped.join_remote("Newcomer", token)
+        self.assertIsInstance(result["room_entry_cursor"], int)
+        self.assertLessEqual(result["room_entry_cursor"], result["cursor"])
+        moved = scoped.command_remote("Newcomer", "north", "cursor-move", token)
+        self.assertIsInstance(moved["room_entry_cursor"], int)
+        self.assertGreater(moved["room_entry_cursor"],
+                           result["room_entry_cursor"])
+        self.assertLessEqual(moved["room_entry_cursor"], moved["cursor"])
+
+    def test_authenticated_http_join_and_move_publish_entry_cursor(self):
+        import json
+        from threading import Thread
+        from urllib.request import Request, urlopen
+        from realm.gateway import GatewayServer
+
+        token = self.host.credentials.provision("Newcomer")
+        server = GatewayServer(self.host, (), 0)
+        thread = Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            def send(path, payload):
+                req = Request(
+                    f"http://127.0.0.1:{server.server_port}{path}",
+                    data=json.dumps(payload).encode("utf-8"),
+                    headers={
+                        "Authorization": "Bearer " + token,
+                        "Content-Type": "application/json",
+                    },
+                    method="POST",
+                )
+                with urlopen(req, timeout=4) as response:
+                    return json.load(response)
+
+            joined = send("/api/v1/join", {"player": "Newcomer"})
+            self.assertIsInstance(joined["room_entry_cursor"], int)
+            self.assertLessEqual(joined["room_entry_cursor"], joined["cursor"])
+            moved = send("/api/v1/command", {
+                "player": "Newcomer", "command": "north",
+            })
+            self.assertIsInstance(moved["room_entry_cursor"], int)
+            self.assertGreater(moved["room_entry_cursor"], joined["room_entry_cursor"])
+            self.assertLessEqual(moved["room_entry_cursor"], moved["cursor"])
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(4)
+            self.assertFalse(thread.is_alive())
+
+
+    def test_actor_rejoin_between_cursor_reads_cannot_emit_future_room_floor(self):
+        from unittest.mock import patch
+        self.host.join("Newcomer")
+        original_head = self.host.cursor
+
+        def global_head_before_competing_rejoin():
+            head = original_head()
+            # Another authenticated session refreshes the same player entry
+            # after the head sample but before the room-entry proof.
+            self.engine.join("Newcomer")
+            return head
+
+        with patch.object(self.host, "cursor", side_effect=global_head_before_competing_rejoin):
+            result = self.host.join("Newcomer")
+        self.assertIsInstance(result["room_entry_cursor"], int)
+        self.assertLessEqual(result["room_entry_cursor"], result["cursor"],
+                             "Browser must never receive a future room floor")
+
+
 if __name__ == "__main__":
     unittest.main()

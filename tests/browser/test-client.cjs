@@ -47,7 +47,7 @@ function worldMap() {
   };
 }
 
-function instantiate({ missingMap = false, mapOnMove = false, rejectUnauthorized = false, fetchImpl = null, mapGate = null, roomGate = null, joinGate = null, healthGate = null, commandGate = null, quickActionCommands = [], cryptoImpl = require("node:crypto").webcrypto, nowMs = null, expectedWorld = "test-world" } = {}) {
+function instantiate({ missingMap = false, mapOnMove = false, rejectUnauthorized = false, fetchImpl = null, mapGate = null, roomGate = null, joinGate = null, healthGate = null, commandGate = null, quickActionCommands = [], cryptoImpl = require("node:crypto").webcrypto, nowMs = null, expectedWorld = "test-world", joinResponse = null } = {}) {
   const elements = new Map();
   const get = (id) => {
     if (!elements.has(id)) elements.set(id, new Element());
@@ -69,7 +69,7 @@ function instantiate({ missingMap = false, mapOnMove = false, rejectUnauthorized
   };
   const responses = {
     "/api/v1/health": { ok: true, world_id: "test-world" },
-    "/api/v1/join": { text: "Welcome", cursor: 0 },
+    "/api/v1/join": joinResponse || { text: "Welcome", cursor: 0 },
     "/api/v1/room": { text: "You are in a field by water." },
     "/api/v1/map": worldMap(),
     "/api/v1/feed": { cursor: 0, events: [] },
@@ -205,6 +205,48 @@ test("missing or invalid expected world ID rejects locally with no network reque
     await client.connect();
     assert.equal(client.requests.length, 0, "unbound world " + JSON.stringify(expected));
     assert.notEqual(client.get("world-name").textContent, "test-world");
+  }
+});
+
+
+test("browser uses host room-entry cursor instead of later global join head", async () => {
+  const client = instantiate({ joinResponse: {
+    ok: true, text: "Welcome", cursor: 11, room_entry_cursor: 6,
+  } });
+  client.get("host-url").value = "http://127.0.0.1:8765";
+  client.get("player-name").value = "Explorer";
+  client.get("access-token").value = "secret-token";
+  await client.connect();
+  assert.equal(client.timers.length, 1);
+  await client.timers[0].fn();
+  const feed = client.requests.find(({ url }) => url.includes("/api/v1/feed?"));
+  assert.ok(feed, "browser must fetch room feed");
+  assert.equal(new URL(feed.url).searchParams.get("after"), "6",
+    "global cursor 11 would lose valid post-entry speech");
+});
+
+test("browser falls back to global cursor only for legacy host omission", async () => {
+  const client = instantiate({ joinResponse: { text: "Old host", cursor: 11 } });
+  client.get("host-url").value = "http://127.0.0.1:8765";
+  client.get("player-name").value = "Explorer";
+  client.get("access-token").value = "secret-token";
+  await client.connect();
+  await client.timers[0].fn();
+  const feed = client.requests.find(({ url }) => url.includes("/api/v1/feed?"));
+  assert.equal(new URL(feed.url).searchParams.get("after"), "11");
+});
+
+test("browser rejects malformed or future room-entry cursors rather than trusting them", async () => {
+  for (const cursor of [-1, 12, "6", null, 1.25]) {
+    const client = instantiate({ joinResponse: {
+      ok: true, text: "Invalid host", cursor: 11, room_entry_cursor: cursor,
+    } });
+    client.get("host-url").value = "http://127.0.0.1:8765";
+    client.get("player-name").value = "Explorer";
+    client.get("access-token").value = "secret-token";
+    await client.connect();
+    assert.equal(client.get("world-name").textContent, "Unconnected");
+    assert.match(client.get("connection-note").textContent, /room.entry cursor/i);
   }
 });
 
