@@ -61,7 +61,8 @@ while time.monotonic() < deadline:
         break
     time.sleep(.025)
 print(json.dumps({"joined": joined[0], "said": said[0], "denied": denied[0],
-                  "events": seen}))
+                  "events": seen,
+                  "prejoin_leak": any("PRIVATE BEFORE REJOIN" in e for e in seen)}))
 '''
 
 TELNET_CLIENT = r'''
@@ -94,6 +95,9 @@ class TwoIndependentProcessForegroundTests(unittest.TestCase):
             db_path = Path(tmp) / "world.sqlite3"
             gateway = Gateway(db_path, world_id="two_process", scoped_credentials=True)
             gateway.join("Captain")
+            # This historical message must not leak through the next
+            # authenticated join. The later clock/Telnet events must remain.
+            gateway.command("Captain", "say PRIVATE BEFORE REJOIN", None)
             token = gateway.scoped_credentials.provision(
                 "Captain", capabilities=("world:join", "feed:read", "command:write")
             )
@@ -175,6 +179,7 @@ class TwoIndependentProcessForegroundTests(unittest.TestCase):
                 self.assertEqual(200, http_result["said"])
                 self.assertEqual(401, http_result["denied"])
                 self.assertTrue(telnet_result["said"])
+                self.assertFalse(http_result["prejoin_leak"], http_result)
                 self.assertEqual(1, http_result["events"].count(
                     "Navigator: Telnet process online"))
                 self.assertEqual(1, http_result["events"].count(
