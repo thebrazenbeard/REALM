@@ -118,5 +118,39 @@ class RoomEntryPrivacyTests(unittest.TestCase):
         self.host.command("Visitor", "say POST ENTRY", None)
         self.assertIn("POST ENTRY", self.host.command("Legacy", "history 50", None)["text"])
 
+    def test_returning_login_cannot_read_messages_from_prior_session(self):
+        self.host.join("Visitor")
+        self.host.join("Newcomer")
+        self.host.command("Visitor", "say SECRET BEFORE RETURN", None)
+        returned = self.host.join("Newcomer")
+        self.assertIn("Welcome back, Newcomer.", returned["text"])
+        self.assertNotIn("SECRET BEFORE RETURN", self.host.command(
+            "Newcomer", "history 50", None,
+        )["text"])
+        self.assertFalse(any("SECRET BEFORE RETURN" in e["text"]
+                             for e in self.host.feed("Newcomer", 0)["events"]))
+        self.host.command("Visitor", "say POST RETURN", None)
+        self.assertIn("POST RETURN", self.host.command(
+            "Newcomer", "history 50", None,
+        )["text"])
+
+    def test_returning_login_preserves_room_position_and_owned_inventory(self):
+        self.host.join("Newcomer")
+        self.host.command("Newcomer", "take token", None)
+        self.host.command("Newcomer", "north", None)
+        returned = self.host.join("Newcomer")
+        self.assertIn("Welcome back, Newcomer.", returned["text"])
+        self.assertIn("The Corridor", self.host.command(
+            "Newcomer", "look", None,
+        )["text"])
+        self.assertIn("Brass token", self.host.command(
+            "Newcomer", "inventory", None,
+        )["text"])
+        self.assertTrue(any(
+            e["actor"] == "Newcomer" and e["kind"] == "join"
+            for e in self.host.feed("Newcomer", 0)["events"]
+        ))
+
+
 if __name__ == "__main__":
     unittest.main()
