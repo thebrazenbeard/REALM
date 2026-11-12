@@ -31,6 +31,7 @@ from .local_presence import LocalPresenceWitness, PresenceDenied, PresenceLease
 from .presence_host_binding import bind_host_engine, unbind_host_engine
 from .router import CommandRouter
 from .scoped_credentials import CredentialStateError, ScopedCredentialStore
+from .principal_roles import is_reserved_npc
 
 
 MAX_BODY_BYTES = 4096
@@ -153,7 +154,8 @@ class Gateway:
                 "SELECT player_name FROM main.player_credentials WHERE token_digest=?",
                 (digest,),
             ).fetchone()
-            if row is None or row[0].casefold() != principal.casefold():
+            if (row is None or row[0].casefold() != principal.casefold()
+                    or is_reserved_npc(db, row[0])):
                 raise PermissionError("Active player bearer required")
 
         return check

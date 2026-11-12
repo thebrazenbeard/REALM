@@ -24,6 +24,7 @@ from .auth import CredentialStore
 from .engine import Engine, _pristine_schema, _schema_snapshot
 from .local_presence import LocalPresenceWitness, PresenceDenied, PresenceLease, _WORLD
 from .presence_host_binding import bind_host_engine, unbind_host_engine
+from .principal_roles import is_reserved_npc
 from .router import CommandRouter
 from .terminal_presentation import palette_preview, render_terminal
 
@@ -144,26 +145,40 @@ class LocalTelnetServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
                        ) -> str | None:
         """Reserve one *live local socket session* per casefolded player name.
 
-        In legacy mode the shared token permits any valid name. In opt-in
-        credential mode the caller's name is fixed by the host-provisioned
-        credential, and joining is guarded inside the SQLite writer transaction.
+        In legacy mode the shared token permits any unreserved valid name.
+        In opt-in credential mode the caller's name is fixed by the
+        host-provisioned credential. Both modes deny host-reserved NPC names
+        inside the same SQLite writer transaction.
         """
         key = name.casefold()
         with self._join_lock:
             if key in self._active_names:
                 return None
-            greeting = self.engine.join(name, writer_guard=writer_guard)
+            def role_guard(db: sqlite3.Connection) -> None:
+                if is_reserved_npc(db, name):
+                    raise PermissionError("Reserved NPC cannot join via Telnet")
+                if writer_guard is not None:
+                    writer_guard(db)
+
+            greeting = self.engine.join(name, writer_guard=role_guard)
             self._active_names.add(key)
             return greeting
 
     def principal_guard(self, name: str, token: str) -> Callable[[sqlite3.Connection], None]:
-        """Validate the credential inside each Engine/Crafting writer transaction.
+        """Deny reserved roles and validate bound credentials at the writer.
 
-        The socket precheck alone is insufficient: rotation or revocation
-        can commit between it and the world action.
+        Legacy shared-token mode cannot claim a reserved NPC either. The
+        socket precheck alone is insufficient: rotation, reservation or
+        revocation may commit between it and the world action.
         """
         if not self.player_credentials:
-            raise ValueError("Player writer guard needs player_credentials mode")
+            # Legacy shared-token Telnet permits user-chosen names, but an
+            # explicitly reserved host NPC is never a selectable client actor.
+            def reservation_guard(db: sqlite3.Connection) -> None:
+                if is_reserved_npc(db, name):
+                    raise PermissionError("Reserved NPC cannot act via Telnet")
+            return reservation_guard
+
         digest = CredentialStore._digest(token)
         canonical = name.casefold()
 
@@ -172,7 +187,8 @@ class LocalTelnetServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
                 "SELECT player_name FROM player_credentials WHERE token_digest=?",
                 (digest,),
             ).fetchone()
-            if row is None or str(row[0]).casefold() != canonical:
+            if (row is None or str(row[0]).casefold() != canonical
+                    or is_reserved_npc(db, str(row[0]))):
                 raise PermissionError("Player credential expired or revoked")
 
         return guard
@@ -187,7 +203,9 @@ class LocalTelnetServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
                 "SELECT player_name FROM main.player_credentials WHERE token_digest=?",
                 (digest,),
             ).fetchone()
-            return str(row[0]) if row is not None else None
+            if row is None or is_reserved_npc(db, str(row[0])):
+                return None
+            return str(row[0])
         lease = witness.admit(
             name, protocol="telnet-player-credential", resolve_principal=resolver,
         )
@@ -220,6 +238,12 @@ class LocalTelnetServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
         from .channel_roster import channel_access_revision
         with closing(sqlite3.connect(str(self.engine.db_path), timeout=10)) as db:
             return channel_access_revision(db, player)
+
+    def is_reserved_name(self, name: str) -> bool:
+        """Read-only early denial, including read-only commands and palette."""
+        with closing(self.engine._connect()) as db:
+            db.execute("BEGIN")
+            return is_reserved_npc(db, name)
 
     def release_name(self, name: str) -> None:
         with self._join_lock:
@@ -348,7 +372,7 @@ class LocalTelnetHandler(socketserver.BaseRequestHandler):
                 self.server.credentials.authenticate(presented) != name):
             self._send("Access revoked.\n")
             return
-        guard = self.server.principal_guard(name, presented) if self.server.player_credentials else None
+        guard = self.server.principal_guard(name, presented)
         try:
             greeting = self.server.join_exclusive(name, writer_guard=guard)
         except PermissionError:
@@ -384,14 +408,22 @@ class LocalTelnetHandler(socketserver.BaseRequestHandler):
                     self._send("Access revoked.\n")
                     return
             command = command.strip()
-            if (self.server.player_credentials and
-                    self.server.credentials.authenticate(presented) != name):
+            if ((self.server.player_credentials and
+                    self.server.credentials.authenticate(presented) != name)
+                    or self.server.is_reserved_name(name)):
                 self._send("Access revoked.\n")
                 return
             if not command:
                 self._send("REALM> ")
                 continue
             verb, _, args = command.casefold().partition(" ")
+            # Reservation writer guards are NOT proof of player identity.
+            # Shared-token callers remain ineligible for authenticated combat,
+            # even though their mutations now carry a reserved-role guard.
+            if (not self.server.player_credentials and
+                    (verb == "attack" or (verb == "pvp" and args.strip() != "news"))):
+                self._send("Access revoked.\n")
+                return
             if verb in {"color", "colour"}:
                 setting = args.strip()
                 if setting in {"on", "off"}:

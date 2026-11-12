@@ -51,7 +51,7 @@ This source tree supports:
   faction or crew conversation (`crewchat`); unrelated players do not receive
   private crew messages.
 - Append-only application event records for joins, movement and speech.
-- **Draft-only optional political oaths and contested sites:** trusted-host
+- **Optional source-tested political oaths and contested sites:** trusted-host
   factions and public oath history; separately enabled resource-backed site
   contests where actual inventory items are spent for durable faction support.
   No faction-chat permissions or ruling powers are inherited
@@ -97,6 +97,11 @@ This source tree supports:
   ([model transport](docs/NPC_LOCAL_MODEL_BRIDGE.md),
   [turn execution](docs/NPC_TURNS.md)). Model weights and scheduling are not
   included.
+- An **opt-in host-only NPC principal reservation**. A trusted host can reserve
+  an existing world character and block normal/scoped player bearer issuance,
+  rotation, and admission for that name, including pre-issued tokens. It is
+  neither an autonomous actor nor a public registration API
+  ([reservation boundary](docs/NPC_PRINCIPAL_RESERVATION.md)).
 - A host-authorized, privacy-scoped NPC scene snapshot builder for supplying
   bounded context to a local model; this is not autonomous NPC behavior
   (`src/realm/npc_scene.py`).
