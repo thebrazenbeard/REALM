@@ -597,6 +597,13 @@ class Gateway:
                 kind = row["kind"]
                 if kind in {"ooc", "crewchat"}:
                     content = event_text(row["actor"], kind, payload)
+                elif kind == "political_offer":
+                    content = (
+                        f"{row['actor']} offered {payload.get('item','an item')} "
+                        f"to {payload.get('faction','a faction')} at "
+                        f"{payload.get('site','a site')} "
+                        f"({payload.get('points',0)} influence)."
+                    )
                 elif kind in {"political_pledge", "political_break"}:
                     verb_name = ("pledged allegiance to" if kind == "political_pledge"
                                  else "broke allegiance to")
@@ -1367,9 +1374,21 @@ def main(argv: list[str] | None = None) -> int:
         "--install-politics", action="store_true",
         help="Host-only offline install of optional political allegiances, then exit",
     )
+    operator.add_argument(
+        "--install-leverage", action="store_true",
+        help="Host-only offline political sites and approved resources; requires political oaths",
+    )
     parser.add_argument(
         "--political-faction", action="append", default=[], metavar="ID=DISPLAY",
         help="Host-define a political faction; repeat with --install-politics",
+    )
+    parser.add_argument(
+        "--political-site", action="append", default=[], metavar="ID@ROOM=DISPLAY",
+        help="Add a political site with --install-leverage (repeatable)",
+    )
+    parser.add_argument(
+        "--political-resource", action="append", default=[], metavar="ITEM=POINTS",
+        help="Designate an existing scarce item with --install-leverage (1-5 points)",
     )
     operator.add_argument(
         "--install-pvp-policy", action="store_true",
@@ -1387,6 +1406,28 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     if args.political_faction and not args.install_politics:
         parser.error("--political-faction requires --install-politics")
+    if (args.political_site or args.political_resource) and not args.install_leverage:
+        parser.error("--political-site and --political-resource require --install-leverage")
+    planned_sites = []
+    planned_resources = []
+    if args.install_leverage:
+        from .political_leverage import _ITEM_ID
+        from .political_oaths import _FACTION_ID, _DISPLAY
+        for spec in args.political_site:
+            ident_room, sep, display = spec.partition("=")
+            ident, at, room = ident_room.partition("@")
+            if (not sep or not at or _FACTION_ID.fullmatch(ident) is None
+                    or _ITEM_ID.fullmatch(room) is None
+                    or _DISPLAY.fullmatch(display) is None):
+                parser.error("--political-site requires ID@ROOM=DISPLAY")
+            planned_sites.append((ident, display, room))
+        for spec in args.political_resource:
+            ident, sep, score = spec.partition("=")
+            if (not sep or _ITEM_ID.fullmatch(ident) is None
+                    or not score.isascii() or not score.isdigit()
+                    or int(score) not in range(1, 6)):
+                parser.error("--political-resource requires ITEM=POINTS (1..5)")
+            planned_resources.append((ident, int(score)))
     planned_factions = []
     if args.install_politics:
         from .political_oaths import _FACTION_ID, _DISPLAY
@@ -1423,6 +1464,14 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     if args.revoke_player:
         print("Revoked" if gateway.credentials.revoke(args.revoke_player) else "Not provisioned")
+        return 0
+    if args.install_leverage:
+        from .political_leverage import WorldLeverage
+        leverage = WorldLeverage(gateway.engine.db_path, world_id=gateway.world_id)
+        leverage.install()
+        leverage.configure_batch(sites=planned_sites, resources=planned_resources)
+        print(f"Configured {len(planned_sites)} political sites and "
+              f"{len(planned_resources)} approved resources.")
         return 0
     if args.install_politics:
         from .political_oaths import WorldPolitics

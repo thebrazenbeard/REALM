@@ -510,6 +510,49 @@ class CrossTransportTests(unittest.TestCase):
                          })["text"])
 
 
+    def test_contested_site_influence_crosses_auth_http_and_bound_telnet(self):
+        from realm.political_oaths import WorldPolitics
+        from realm.political_leverage import WorldLeverage
+        joined = self.api("/api/v1/join", {"player": "Browser"})
+        terminal = self.playerbound_telnet_login("Terminal")
+        politics = WorldPolitics(self.gateway.engine.db_path, world_id="cross-transport-test")
+        politics.install()
+        politics.create_faction("north", "Northern League")
+        politics.create_faction("south", "Southern Compact")
+        leverage = WorldLeverage(self.gateway.engine.db_path, world_id="cross-transport-test")
+        leverage.install()
+        leverage.define_site("council", "Council Chamber", room_id="atrium")
+        leverage.authorize_resource("token", points=1)
+        leverage.authorize_resource("wrench", points=1)
+        self.assertIn("pledged allegiance", self.api("/api/v1/command", {
+            "player": "Browser", "command": "pledge north",
+        })["text"])
+        self.assertIn("pledged allegiance", self.telnet_command(terminal, "pledge south"))
+        self.api("/api/v1/command", {"command": "take token"})
+        first = self.api("/api/v1/command", {
+            "command": "offer token to council", "action_id": "resource-1",
+        })["text"]
+        self.assertIn("offered Brass token", first)
+        self.assertIn("Controlled by Northern League", self.telnet_command(terminal, "control council"))
+        for cmd in ("north", "east", "take wrench", "west", "south"):
+            self.telnet_command(terminal, cmd)
+        self.assertIn("offered Worn wrench", self.telnet_command(terminal, "offer wrench to council"))
+        self.assertIn("Contested", self.api("/api/v1/command", {
+            "command": "control council",
+        })["text"])
+        feed = self.api("/api/v1/feed?" + parse.urlencode({
+            "player": "Browser", "after": joined["cursor"],
+        }))["events"]
+        self.assertTrue(any(x["kind"] == "political_offer" and x["actor"] == "Terminal"
+                            and "Worn wrench" in x["text"] for x in feed))
+        anonymous = self.telnet_login("Unbound")
+        self.assertIn("require player-bound credentials",
+                      self.telnet_command(anonymous, "offer token to council"))
+        self.assertEqual(first, self.api("/api/v1/command", {
+            "command": "offer token to council", "action_id": "resource-1",
+        })["text"])
+
+
 
 if __name__ == "__main__":
     unittest.main()

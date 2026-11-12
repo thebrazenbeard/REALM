@@ -47,6 +47,10 @@ No model owns the ledger, and no autonomous NPC political mind is claimed.
 Privileged malicious SQLite triggers are not fully qualified against
 counterfeit post-receipt effects. No external listener/TLS deployment follows.
 
+A separate optional [political sites extension](POLITICAL_SITES.md)
+now implements resource-backed contests for publicly named sites.
+Those scores are not leadership, private-chat grants, taxes or territory rules.
+
 The future objective from REALM issue #185 is emergent conflict:
 leverage, rival alliances, consequential treaties, difficult loyalties
 and contested succession grounded in actual game events—not cosmetic

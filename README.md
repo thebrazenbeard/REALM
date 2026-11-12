@@ -51,10 +51,12 @@ This source tree supports:
   faction or crew conversation (`crewchat`); unrelated players do not receive
   private crew messages.
 - Append-only application event records for joins, movement and speech.
-- **Draft-only optional political oaths:** trusted-host configured factions,
-  public player pledge/break history and cross-client readback. No faction-chat
-  permissions, succession or political influence are inferred from an oath
-  ([development contract](docs/POLITICAL_OATHS.md)).
+- **Draft-only optional political oaths and contested sites:** trusted-host
+  factions and public oath history; separately enabled resource-backed site
+  contests where actual inventory items are spent for durable faction support.
+  No faction-chat permissions or ruling powers are inherited
+  ([oath contract](docs/POLITICAL_OATHS.md),
+  [site contest contract](docs/POLITICAL_SITES.md)).
 - API-level optional action IDs for replay-safe mutation retries; duplicate IDs for different commands are rejected.
 - Local terminal clients using the same database path, with stdlib-only
   runtime dependencies. The CLI `--player` argument is a chosen name, **not**

@@ -235,7 +235,7 @@ class Engine:
             raise ValueError("Action IDs must be nonempty strings up to 128 characters")
         read_only = verb in {"look", "l", "examine", "x", "where", "location",
                              "inventory", "inv", "i", "who", "history", "listen",
-                             "help", "?", "quit", "exit", "allegiance", "factions"} or (
+                             "help", "?", "quit", "exit", "allegiance", "factions", "sites", "control"} or (
                                  verb == "pvp" and arg.casefold() in {"status", "news"})
         if (verb == "attack" or (verb == "pvp" and arg.casefold() != "news")) and writer_guard is None:
             # A shared-token terminal can claim another player's name. Combat
@@ -254,7 +254,7 @@ class Engine:
                 raise ValueError("Join this REALM before issuing commands")
             actor, room_id = player["id"], player["room_id"]
             receipt_command = command
-            if verb in {"pledge", "renounce"} and not private_channels:
+            if verb in {"pledge", "renounce", "offer"} and not private_channels:
                 return "Political pledges require player-bound credentials."
             if verb in {"emote", "ooc", "crewchat"} and not private_channels:
                 # A shared-token terminal has no authenticated actor. Its
@@ -362,17 +362,20 @@ class Engine:
             if verb not in {"quit", "exit", "look", "l", "examine", "x", "where",
                             "location", "inventory", "inv", "i", "who",
                             "history", "listen", "help", "?", "say",
-                            "emote", "ooc", "crewchat", "allegiance", "factions"}:
+                            "emote", "ooc", "crewchat", "allegiance", "factions", "sites", "control"}:
                 from .combat import Combat
                 # This is the connection-aware guard for trusted adapters
                 # invoking _perform directly rather than Engine.act.
                 Combat.require_living_for_mutation(db, actor)
             if verb in {"quit", "exit"}:
                 return "Goodbye. Your position is saved."
-            if verb in {"pledge", "renounce"} and not private_channels:
+            if verb in {"pledge", "renounce", "offer"} and not private_channels:
                 return "Political pledges require player-bound credentials."
             if verb in {"allegiance", "factions", "pledge", "renounce"}:
                 from .political_oaths import perform
+                return perform(db, actor, room_id, verb, arg, self._event)
+            if verb in {"sites", "control", "offer"}:
+                from .political_leverage import perform
                 return perform(db, actor, room_id, verb, arg, self._event)
             if verb in {"look", "l"} and (not arg or arg.casefold() in {"around", "here", "room"}):
                 return self._look(db, room_id, actor)
@@ -546,6 +549,13 @@ class Engine:
                     details = json.loads(event["payload_json"])
                     if event["kind"] in {"ooc", "crewchat"}:
                         items.append(event_text(event["actor"], event["kind"], details))
+                    elif event["kind"] == "political_offer":
+                        items.append(
+                            f"{event['actor']} offered {details.get('item','an item')} "
+                            f"to {details.get('faction','a faction')} at "
+                            f"{details.get('site','a site')} "
+                            f"({details.get('points',0)} influence)."
+                        )
                     elif event["kind"] in {"political_pledge", "political_break"}:
                         verb_name = ("pledged allegiance to"
                                      if event["kind"] == "political_pledge"
@@ -568,5 +578,5 @@ class Engine:
                         items.append(f"{event['actor']} gave {details['item']} to {details['to']}")
                 return "\n".join(items) if items else "No recorded activity here yet."
             if verb in {"help", "?"}:
-                return "Commands: look [item], examine <item> (x), go <north|south|east|west>, n/s/e/w, take <item>, drop <item>, give <item> to <player>, inventory, say <text>, emote <text>, ooc <text>, crewchat <text> (host-granted group), listen, history [1-50], who, where, help, quit. Optional host politics: factions, allegiance, pledge <faction>, renounce. Optional host-enabled PvP: pvp status|news|on|off, attack <player>."
+                return "Commands: look [item], examine <item> (x), go <north|south|east|west>, n/s/e/w, take <item>, drop <item>, give <item> to <player>, inventory, say <text>, emote <text>, ooc <text>, crewchat <text> (host-granted group), listen, history [1-50], who, where, help, quit. Optional host politics: factions, allegiance, pledge <faction>, renounce; optional contested sites: sites, control <site>, offer <item> to <site>. Optional host-enabled PvP: pvp status|news|on|off, attack <player>."
             return "Unknown command. Type 'help' for options."
