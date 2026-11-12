@@ -161,6 +161,22 @@ class Engine:
             (self._now(), actor, room, kind, json.dumps(payload, sort_keys=True)),
         )
 
+    @staticmethod
+    def _room_entry_floor(db: sqlite3.Connection, actor: str, room_id: str) -> int | None:
+        """Latest trusted entry event if it agrees with the actor's current room.
+
+        An older join/move into this room does not establish occupancy when
+        a later entry event places the actor elsewhere. This catches stale
+        player rows changed without a matching host-recorded room entry.
+        Legacy actors without a trustworthy entry event fail closed.
+        """
+        row = db.execute(
+            "SELECT id,room_id FROM events WHERE actor=? COLLATE NOCASE "
+            "AND kind IN ('join','move') ORDER BY id DESC LIMIT 1",
+            (actor,),
+        ).fetchone()
+        return row["id"] if row is not None and row["room_id"] == room_id else None
+
     def join(self, name: str) -> str:
         if not _PLAYER_RE.fullmatch(name):
             raise ValueError("Player name must start with a letter, use only letters, digits, '_' or '-', and be <=24 characters")
@@ -174,6 +190,10 @@ class Engine:
                 db.execute("INSERT INTO players VALUES (?,?,?)", (name, start_room, self._now()))
                 self._event(db, name, start_room, "join", {})
                 return f"Welcome, {name}.\n{self._look(db, start_room, name)}"
+            # A returning player begins a new room-observation session.
+            # The gateway must authenticate the caller before invoking join.
+            # Preserve position/inventory, not prior-session room history.
+            self._event(db, player["id"], player["room_id"], "join", {})
             return f"Welcome back, {player['id']}.\n{self._look(db, player['room_id'], player['id'])}"
 
     def _look(self, db: sqlite3.Connection, room_id: str, name: str) -> str:
@@ -298,9 +318,13 @@ class Engine:
                 if arg and (not arg.isdigit() or not 1 <= int(arg) <= 50):
                     return "Use 'history' or 'history N' (1–50)."
                 limit = int(arg) if arg else 10
+                floor = self._room_entry_floor(db, actor, room_id)
+                if floor is None:
+                    return "No recorded activity here yet."
                 events = db.execute(
-                    "SELECT actor,kind,payload_json FROM events WHERE room_id=? ORDER BY id DESC LIMIT ?",
-                    (room_id, limit),
+                    "SELECT actor,kind,payload_json FROM events "
+                    "WHERE room_id=? AND id>=? ORDER BY id DESC LIMIT ?",
+                    (room_id, floor, limit),
                 ).fetchall()
                 items = []
                 for event in reversed(events):
