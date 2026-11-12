@@ -1,9 +1,12 @@
 """REALM actor/room entry floor: real Engine and Gateway, disposable SQLite."""
 from pathlib import Path
+import sys
 from contextlib import closing
 from tempfile import TemporaryDirectory
 import sqlite3
 import unittest
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from realm.engine import Engine
 from realm.gateway import Gateway
