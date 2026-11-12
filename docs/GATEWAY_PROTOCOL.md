@@ -96,8 +96,12 @@ player-bound HTTP paths) identifies host-recorded room arrival, not the
 overall world event head. A join response uses the exact event ID emitted
 inside **that join's own committed writer transaction**, even if a second
 session for the same character rejoins before response assembly. The join
-writer reads back its exact event and saved room before COMMIT; a silently
-suppressed or deleted join event rolls the transaction back. A command
+writer reads back its exact event, canonical empty payload, latest
+entry position and actor room before COMMIT; tested in-transaction
+suppression, deletion/replacement and extra-entry triggers roll back.
+Caller-visible receipt IDs are populated only after a successful commit.
+This does not protect against a privileged database administrator changing
+events after commit. A command
 reports the latest verified current-room entry at its response read.
 A new actor's join,
 returning authenticated join, or movement generates an entry event. A

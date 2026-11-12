@@ -308,5 +308,50 @@ class RoomEntryPrivacyTests(unittest.TestCase):
             ).fetchone()[0]
         self.assertEqual(before, after)
 
+
+    def test_replaced_join_event_with_forged_payload_fails_transaction(self):
+        with closing(sqlite3.connect(self.db)) as db, db:
+            db.execute(
+                "CREATE TRIGGER replace_join AFTER INSERT ON events "
+                "WHEN NEW.kind='join' AND NEW.actor='Newcomer' "
+                "BEGIN DELETE FROM events WHERE id=NEW.id; "
+                "INSERT INTO events(id,occurred_at,actor,room_id,kind,payload_json) "
+                "VALUES(NEW.id,NEW.occurred_at,NEW.actor,NEW.room_id,NEW.kind,"
+                "'{\\\"forged\\\":true}'); END"
+            )
+        with self.assertRaises(RuntimeError):
+            self.host.join("Newcomer")
+        with closing(sqlite3.connect(self.db)) as db:
+            self.assertEqual(0, db.execute(
+                "SELECT COUNT(*) FROM players WHERE id='Newcomer'"
+            ).fetchone()[0])
+
+    def test_trigger_inserting_extra_room_entry_cannot_shift_visibility_floor(self):
+        with closing(sqlite3.connect(self.db)) as db, db:
+            db.execute(
+                "CREATE TRIGGER duplicate_join AFTER INSERT ON events "
+                "WHEN NEW.kind='join' AND NEW.actor='Newcomer' "
+                "BEGIN INSERT INTO events(occurred_at,actor,room_id,kind,payload_json) "
+                "VALUES(NEW.occurred_at,NEW.actor,NEW.room_id,'join','{}'); END"
+            )
+        with self.assertRaises(RuntimeError):
+            self.host.join("Newcomer")
+        with closing(sqlite3.connect(self.db)) as db:
+            self.assertEqual(0, db.execute(
+                "SELECT COUNT(*) FROM events WHERE actor='Newcomer'"
+            ).fetchone()[0])
+
+    def test_failed_join_never_leaks_an_uncommitted_emission_to_caller(self):
+        with closing(sqlite3.connect(self.db)) as db, db:
+            db.execute(
+                "CREATE TRIGGER erase_join AFTER INSERT ON events "
+                "WHEN NEW.kind='join' AND NEW.actor='Newcomer' "
+                "BEGIN DELETE FROM events WHERE id=NEW.id; END"
+            )
+        receipts = []
+        with self.assertRaises(RuntimeError):
+            self.engine.join("Newcomer", emissions=receipts)
+        self.assertEqual([], receipts)
+
 if __name__ == "__main__":
     unittest.main()

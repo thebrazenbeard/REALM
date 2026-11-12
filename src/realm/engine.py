@@ -187,17 +187,25 @@ class Engine:
             raise RuntimeError("Join must emit exactly one host entry event")
         event_id, occurred_at = receipts[0]
         row = db.execute(
-            "SELECT actor,room_id,kind,occurred_at FROM main.events WHERE id=?",
-            (event_id,),
+            "SELECT actor,room_id,kind,occurred_at,payload_json "
+            "FROM main.events WHERE id=?", (event_id,),
         ).fetchone()
         player = db.execute(
-            "SELECT room_id FROM main.players WHERE id=? COLLATE NOCASE",
+            "SELECT id,room_id FROM main.players WHERE id=? COLLATE NOCASE",
+            (actor,),
+        ).fetchone()
+        latest = db.execute(
+            "SELECT id FROM main.events WHERE actor=? COLLATE NOCASE "
+            "AND kind IN ('join','move','leave') ORDER BY id DESC LIMIT 1",
             (actor,),
         ).fetchone()
         if (row is None or row["actor"] != actor
                 or row["room_id"] != room_id or row["kind"] != "join"
-                or row["occurred_at"] != occurred_at or player is None
-                or player["room_id"] != room_id):
+                or row["occurred_at"] != occurred_at
+                or row["payload_json"] != "{}"
+                or player is None or player["id"] != actor
+                or player["room_id"] != room_id
+                or latest is None or latest["id"] != event_id):
             raise RuntimeError("Join entry event or actor room failed readback")
 
     def join(self, name: str, *, writer_guard: Callable[[sqlite3.Connection], None] | None = None,
@@ -206,7 +214,9 @@ class Engine:
             raise ValueError("Player name must start with a letter, use only letters, digits, '_' or '-', and be <=24 characters")
         if emissions is not None and emissions:
             raise ValueError("Join entry receipt list must be empty")
-        join_receipts = emissions if emissions is not None else []
+        # Never expose a provisional INSERT...RETURNING receipt to callers.
+        # An AFTER trigger, room rendering or deferred COMMIT can still fail.
+        committed_entry: list[tuple[int, str]] = []
         with closing(self._connect()) as db, db:
             # Serialize first-time joins so two clients cannot race on one name.
             db.execute("BEGIN IMMEDIATE")
@@ -217,15 +227,22 @@ class Engine:
                 configured = db.execute("SELECT value FROM world_meta WHERE key='start_room'").fetchone()
                 start_room = configured[0] if configured is not None else "atrium"
                 db.execute("INSERT INTO players VALUES (?,?,?)", (name, start_room, self._now()))
-                self._event(db, name, start_room, "join", {}, emissions=join_receipts)
-                self._verify_join_entry(db, join_receipts, name, start_room)
-                return f"Welcome, {name}.\n{self._look(db, start_room, name)}"
-            # Authenticated returning joins establish a new observation floor,
-            # preserving saved location and inventory but not prior-session
-            # room history. Writer guard has already validated this principal.
-            self._event(db, player["id"], player["room_id"], "join", {}, emissions=join_receipts)
-            self._verify_join_entry(db, join_receipts, player["id"], player["room_id"])
-            return f"Welcome back, {player['id']}.\n{self._look(db, player['room_id'], player['id'])}"
+                self._event(db, name, start_room, "join", {}, emissions=committed_entry)
+                self._verify_join_entry(db, committed_entry, name, start_room)
+                greeting = f"Welcome, {name}.\n{self._look(db, start_room, name)}"
+            else:
+                # Authenticated returning joins establish a new observation
+                # floor without losing the saved position or inventory.
+                self._event(db, player["id"], player["room_id"], "join", {},
+                            emissions=committed_entry)
+                self._verify_join_entry(
+                    db, committed_entry, player["id"], player["room_id"]
+                )
+                greeting = f"Welcome back, {player['id']}.\n{self._look(db, player['room_id'], player['id'])}"
+        # This point is reached only after the writer transaction committed.
+        if emissions is not None:
+            emissions.extend(committed_entry)
+        return greeting
 
     def _look(self, db: sqlite3.Connection, room_id: str, name: str) -> str:
         room = db.execute("SELECT name,description FROM rooms WHERE id=?", (room_id,)).fetchone()
