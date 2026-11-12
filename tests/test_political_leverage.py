@@ -379,5 +379,87 @@ class PoliticalLeverageTests(unittest.TestCase):
         self.assertEqual([], self.rows("SELECT item_id FROM political_offerings"))
 
 
+    def test_forged_future_offer_receipt_without_custody_denied(self):
+        """A hostile receipt trigger can seed a future false ACK."""
+        self.initialize()
+        self.command("Alice", "pledge north")
+        with closing(sqlite3.connect(self.path)) as db, db:
+            db.execute(
+                "CREATE TRIGGER forge_future_offer AFTER INSERT ON action_receipts "
+                "WHEN NEW.actor='Alice' AND NEW.action_id='seed' "
+                "BEGIN INSERT INTO action_receipts(actor,action_id,command,response) "
+                "VALUES('Alice','fabricated-offer','offer token to council', "
+                "'Alice offered Brass token to Northern League at Council Chamber (1 influence).'); END"
+            )
+        self.command("Alice", "say safe test", "seed")
+        with self.assertRaises(RuntimeError):
+            self.command("Alice", "offer token to council", "fabricated-offer")
+        self.assertEqual([], self.rows("SELECT item_id FROM political_offerings"))
+        self.assertEqual([], self.rows(
+            "SELECT id FROM events WHERE kind='political_offer'"
+        ))
+
+    def test_invalidated_past_offer_receipt_denied_on_replay(self):
+        self.initialize()
+        self.command("Alice", "pledge north")
+        self.command("Alice", "take token")
+        first = self.command("Alice", "offer token to council", "original-offer")
+        self.assertIn("offered Brass token", first)
+        with closing(sqlite3.connect(self.path)) as db, db:
+            db.execute(
+                "CREATE TRIGGER invalidate_past_offer AFTER INSERT ON action_receipts "
+                "WHEN NEW.action_id='damage' "
+                "BEGIN UPDATE events SET payload_json='{}' "
+                "WHERE kind='political_offer' AND actor='Alice'; END"
+            )
+        self.command("Alice", "say test damage", "damage")
+        with self.assertRaises(RuntimeError):
+            self.command("Alice", "offer token to council", "original-offer")
+
+    def test_old_offer_replay_still_verifies_after_new_offer_and_oath_break(self):
+        host = self.initialize()
+        self.create_item("seal")
+        host.authorize_resource("seal", points=1)
+        self.command("Alice", "pledge north")
+        self.command("Alice", "take token")
+        original = self.command("Alice", "offer token to council", "original")
+        self.command("Alice", "take seal")
+        self.command("Alice", "offer seal to council", "second")
+        self.command("Alice", "renounce", "break")
+        self.command("Alice", "pledge south", "switch")
+        self.assertEqual(
+            original, self.command("Alice", "offer token to council", "original")
+        )
+        self.assertEqual(2, self.rows(
+            "SELECT COUNT(*) FROM political_offerings"
+        )[0][0])
+
+    def test_forged_noncanonical_success_receipt_is_not_player_authority(self):
+        self.initialize()
+        self.command("Alice", "pledge north")
+        with closing(sqlite3.connect(self.path)) as db, db:
+            db.execute(
+                "CREATE TRIGGER forged_unstructured_ack AFTER INSERT ON action_receipts "
+                "WHEN NEW.actor='Alice' AND NEW.action_id='seed-two' "
+                "BEGIN INSERT INTO action_receipts(actor,action_id,command,response) "
+                "VALUES('Alice','fake-grant','offer token to council', "
+                "'You now govern the Council Chamber.'); END"
+            )
+        self.command("Alice", "say seed second receipt", "seed-two")
+        with self.assertRaises(RuntimeError):
+            self.command("Alice", "offer token to council", "fake-grant")
+        self.assertEqual([], self.rows("SELECT item_id FROM political_offerings"))
+
+    def test_normal_negative_offer_receipt_remains_idempotent(self):
+        self.initialize()
+        original = self.command("Alice", "offer token to council", "denied-once")
+        self.assertIn("must pledge", original)
+        self.command("Alice", "pledge north")
+        self.command("Alice", "take token")
+        self.assertEqual(original, self.command(
+            "Alice", "offer token to council", "denied-once"
+        ))
+        self.assertEqual([("Alice",)], self.rows("SELECT held_by FROM items WHERE id='token'"))
+
 if __name__ == "__main__":
     unittest.main()

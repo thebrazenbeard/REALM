@@ -57,7 +57,14 @@ Inspect with control to fetch the current host-derived result. After creating
 an action receipt, the writer performs a **final pre-COMMIT readback** of the
 spent item, offering, event, and matching receipt. This specifically detects
 suppressed receipt insertion, receipt-triggered event deletion, or resurrection
-of consumed items; it does not prove safety from privileged post-COMMIT writes.
+of consumed items. Successful-looking **historical** action-receipt replays
+also require the original spent item, scoring row, source event, and matching
+receipt to remain consistent. A past contribution is still verifiable after
+newer offers, movement, or an oath change; forged future receipts and
+noncanonical success strings are rejected. This check prevents the demonstrated
+false ACKs but cannot prove safety against privileged post-COMMIT writes,
+synthetic event/receipt forgery by a database administrator, or an untrusted
+SQLite operator that can rewrite the authoritative ledger itself.
 
 For an executable three-process demonstration (separate local HTTP player
 processes and host process, real rival resource offers, betrayal, restart and

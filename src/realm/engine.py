@@ -309,6 +309,25 @@ class Engine:
                                      (now is None or now.casefold() != arg.casefold()))):
                                 return ("Previous political command superseded; "
                                         "use allegiance to inspect current state.")
+                        if verb == "offer":
+                            from .political_leverage import (
+                                NONCOMMIT_OFFER_REPLIES, verify_finalized_offer,
+                            )
+                            if receipt["response"].startswith(f"{actor} offered "):
+                                # Every successful historical offer needs a
+                                # surviving item, event, score and exact receipt.
+                                # Past faction changes, moves or later offerings
+                                # do not invalidate the original real event.
+                                verify_finalized_offer(
+                                    db, actor, room_id, arg, receipt["response"],
+                                    action_id=action_id,
+                                    receipt_command=receipt_command,
+                                    historical_replay=True,
+                                )
+                            elif receipt["response"] not in NONCOMMIT_OFFER_REPLIES:
+                                raise RuntimeError(
+                                    "Political offer has an unrecognized receipt"
+                                )
                         return receipt["response"]
             # Preserve the existing four-argument interpreter seam for trusted
             # adapters and injected transaction/error probes. Only combat

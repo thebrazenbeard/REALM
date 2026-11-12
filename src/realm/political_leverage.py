@@ -19,6 +19,18 @@ from .political_oaths import (
 )
 
 DISABLED = "Political sites are not enabled."
+# A stored negative receipt may be replayed without granting any influence.
+# Any other noncanonical text is not an authoritative offer acknowledgment.
+NONCOMMIT_OFFER_REPLIES = frozenset({
+    DISABLED,
+    "Use 'offer <item_id> to <site_id>' at the contested site.",
+    "Unknown political site.",
+    "You must stand at the political site to contribute.",
+    "You must pledge to a faction before contributing.",
+    "You are not carrying that exact item.",
+    "This resource was already contributed.",
+    "The host has not designated that item for political influence.",
+})
 _SITE_TABLES = frozenset({
     "political_sites", "political_resources", "political_offerings",
 })
@@ -269,6 +281,7 @@ class WorldLeverage:
 def verify_finalized_offer(
     db: sqlite3.Connection, actor: str, room_id: str, arg: str,
     response: str, *, action_id: str | None, receipt_command: str,
+    historical_replay: bool = False,
 ) -> None:
     """Final pre-COMMIT readback *after* any action-receipt triggers execute.
 
@@ -296,7 +309,8 @@ def verify_finalized_offer(
         (item_id,),
     ).fetchone() is not None:
         raise RuntimeError("Spent political item returned to inventory")
-    if current_faction_id(db, actor) != offering["faction_id"]:
+    if (not historical_replay and
+            current_faction_id(db, actor) != offering["faction_id"]):
         raise RuntimeError("Political contributor's faction changed during transaction")
     site = _site(db, site_id, world)
     faction = db.execute(
@@ -305,7 +319,7 @@ def verify_finalized_offer(
     ).fetchone()
     if site is None or faction is None or faction["world_id"] != world:
         raise RuntimeError("Political offering references an invalid faction/site")
-    if site["room_id"] != room_id:
+    if not historical_replay and site["room_id"] != room_id:
         raise RuntimeError("Political site moved during contribution")
     expectation = (
         f"{actor} offered {offering['item_name']} to {faction['display_name']} "
@@ -313,12 +327,19 @@ def verify_finalized_offer(
     )
     if response != expectation:
         raise RuntimeError("Political response is inconsistent with committed support")
+    # A historical receipt may predate newer offers, moves, or allegiance
+    # changes. Match the exact spent item, not merely the actor's newest
+    # event. Invalid JSON cannot be interpreted as evidence of any offer.
     latest = db.execute(
         "SELECT actor,room_id,payload_json FROM main.events "
         "WHERE kind='political_offer' AND actor=? COLLATE NOCASE "
-        "ORDER BY id DESC LIMIT 1", (actor,),
+        "AND CASE WHEN json_valid(payload_json) "
+        "THEN json_extract(payload_json,'$.item_id') ELSE NULL END "
+        "=? COLLATE NOCASE ORDER BY id DESC LIMIT 1",
+        (actor, offering["item_id"]),
     ).fetchone()
-    if latest is None or latest["actor"] != actor or latest["room_id"] != room_id:
+    if (latest is None or latest["actor"] != actor
+            or latest["room_id"] != site["room_id"]):
         raise RuntimeError("No surviving local political event")
     try:
         payload = json.loads(latest["payload_json"])
