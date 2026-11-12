@@ -1,0 +1,108 @@
+"""REALM actor/room entry floor: real Engine and Gateway, disposable SQLite."""
+from pathlib import Path
+from tempfile import TemporaryDirectory
+import sqlite3
+import unittest
+
+from realm.engine import Engine
+from realm.gateway import Gateway
+
+
+class RoomEntryPrivacyTests(unittest.TestCase):
+    def setUp(self):
+        self.scratch = TemporaryDirectory(prefix="realm-issue187-")
+        self.addCleanup(self.scratch.cleanup)
+        self.db = Path(self.scratch.name) / "world.sqlite3"
+        self.host = Gateway(self.db, world_id="privacy-probe")
+        self.engine = self.host.engine
+
+    def test_new_entrant_cannot_read_prior_speech_from_history_or_feed(self):
+        self.host.join("Visitor")
+        self.host.command("Visitor", "say BEFORE RYLOK JOINED", None)
+        self.host.join("Rylok")
+        history = self.host.command("Rylok", "history 50", None)["text"]
+        events = self.host.feed("Rylok", 0)["events"]
+        self.assertNotIn("BEFORE RYLOK JOINED", history)
+        self.assertFalse(any("BEFORE RYLOK JOINED" in e["text"] for e in events))
+        self.host.command("Visitor", "say AFTER RYLOK JOINED", None)
+        self.assertIn("AFTER RYLOK JOINED", self.host.command("Rylok", "history 50", None)["text"])
+        self.assertTrue(any("AFTER RYLOK JOINED" in e["text"] for e in self.host.feed("Rylok", 0)["events"]))
+
+    def test_returning_actor_cannot_read_speech_from_before_reentry(self):
+        self.host.join("Visitor")
+        self.host.join("Rylok")
+        self.host.command("Rylok", "north", None)
+        self.host.command("Visitor", "say SECRET WHILE AWAY", None)
+        self.host.command("Rylok", "south", None)
+        self.assertNotIn("SECRET WHILE AWAY", self.host.command("Rylok", "listen", None)["text"])
+        self.assertFalse(any("SECRET WHILE AWAY" in x["text"] for x in self.host.feed("Rylok", 0)["events"]))
+        self.host.command("Visitor", "say NEW AFTER REENTRY", None)
+        self.assertIn("NEW AFTER REENTRY", self.host.command("Rylok", "history 50", None)["text"])
+
+    def test_move_entry_event_kept_for_current_room_feed(self):
+        self.host.join("Rylok")
+        self.host.command("Rylok", "north", None)
+        entries = self.host.feed("Rylok", 0)["events"]
+        self.assertTrue(any(e["actor"] == "Rylok" and e["kind"] == "move" for e in entries))
+        self.assertFalse(any(e["room"] != "corridor" for e in entries))
+
+    def test_missing_entry_ledger_fails_closed_without_secret_exposure(self):
+        self.host.join("Visitor")
+        self.host.command("Visitor", "say PREEXISTING SECRET", None)
+        with sqlite3.connect(self.db) as db:
+            db.execute(
+                "INSERT INTO players(id,room_id,created_at) VALUES(?,?,?)",
+                ("Legacy", "atrium", "2026-11-11T00:00:00+00:00"),
+            )
+        self.assertNotIn("PREEXISTING SECRET", self.host.command("Legacy", "history 50", None)["text"])
+        self.assertFalse(any("PREEXISTING SECRET" in e["text"] for e in self.host.feed("Legacy", 0)["events"]))
+
+
+    def test_http_authenticated_feed_enforces_same_entry_floor(self):
+        from threading import Thread
+        from urllib.request import Request, urlopen
+        from realm.gateway import GatewayServer
+        import json
+
+        visitor_token = self.host.credentials.provision("Visitor")
+        captain_token = self.host.credentials.provision("Rylok")
+        self.host.join("Visitor")
+        self.host.command("Visitor", "say PRIVATE BEFORE ENTRY", None)
+        self.host.join("Rylok")
+        server = GatewayServer(self.host, (), 0)
+        thread = Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            def read(token, cursor):
+                url = f"http://127.0.0.1:{server.server_port}/api/v1/feed?after={cursor}"
+                req = Request(url, headers={"Authorization": "Bearer " + token})
+                with urlopen(req, timeout=4) as response:
+                    return json.loads(response.read())
+            first = read(captain_token, 0)
+            self.assertFalse(any("PRIVATE BEFORE ENTRY" in e["text"] for e in first["events"]))
+            self.host.command("Visitor", "say PUBLIC AFTER ENTRY", None)
+            second = read(captain_token, 0)
+            self.assertTrue(any("PUBLIC AFTER ENTRY" in e["text"] for e in second["events"]))
+            self.assertFalse(any("PRIVATE BEFORE ENTRY" in e["text"] for e in second["events"]))
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(3)
+
+    def test_legacy_actor_can_resume_after_new_real_room_entry(self):
+        self.host.join("Visitor")
+        self.host.command("Visitor", "say OLD NOT VISIBLE", None)
+        with sqlite3.connect(self.db) as db:
+            db.execute(
+                "INSERT INTO players(id,room_id,created_at) VALUES(?,?,?)",
+                ("Legacy", "atrium", "2026-11-11T00:00:00+00:00"),
+            )
+        self.assertEqual([], self.host.feed("Legacy", 0)["events"])
+        self.host.command("Legacy", "north", None)
+        self.host.command("Legacy", "south", None)
+        self.assertNotIn("OLD NOT VISIBLE", self.host.command("Legacy", "history 50", None)["text"])
+        self.host.command("Visitor", "say POST ENTRY", None)
+        self.assertIn("POST ENTRY", self.host.command("Legacy", "history 50", None)["text"])
+
+if __name__ == "__main__":
+    unittest.main()

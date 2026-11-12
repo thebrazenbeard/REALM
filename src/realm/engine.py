@@ -161,6 +161,21 @@ class Engine:
             (self._now(), actor, room, kind, json.dumps(payload, sort_keys=True)),
         )
 
+    @staticmethod
+    def _room_entry_floor(db: sqlite3.Connection, actor: str, room_id: str) -> int | None:
+        """Earliest event visible in this actor's CURRENT room occupancy.
+
+        A latest join or move into the room establishes the lower bound. If
+        legacy/corrupt actor data has no matching entry, fail closed rather
+        than treating the first world event as publicly visible history.
+        """
+        row = db.execute(
+            "SELECT MAX(id) FROM events "
+            "WHERE actor=? COLLATE NOCASE AND room_id=? AND kind IN ('join','move')",
+            (actor, room_id),
+        ).fetchone()
+        return row[0]
+
     def join(self, name: str) -> str:
         if not _PLAYER_RE.fullmatch(name):
             raise ValueError("Player name must start with a letter, use only letters, digits, '_' or '-', and be <=24 characters")
@@ -298,9 +313,13 @@ class Engine:
                 if arg and (not arg.isdigit() or not 1 <= int(arg) <= 50):
                     return "Use 'history' or 'history N' (1–50)."
                 limit = int(arg) if arg else 10
+                floor = self._room_entry_floor(db, actor, room_id)
+                if floor is None:
+                    return "No recorded activity here yet."
                 events = db.execute(
-                    "SELECT actor,kind,payload_json FROM events WHERE room_id=? ORDER BY id DESC LIMIT ?",
-                    (room_id, limit),
+                    "SELECT actor,kind,payload_json FROM events "
+                    "WHERE room_id=? AND id>=? ORDER BY id DESC LIMIT ?",
+                    (room_id, floor, limit),
                 ).fetchall()
                 items = []
                 for event in reversed(events):

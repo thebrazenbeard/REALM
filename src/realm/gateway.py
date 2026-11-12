@@ -155,17 +155,20 @@ class Gateway:
             raise ValueError("Invalid player or cursor")
         db = self._read()
         try:
+            # One read snapshot for room, entry floor, and event rows.
+            db.execute("BEGIN")
             subject = db.execute("SELECT id,room_id FROM players WHERE id=?", (player,)).fetchone()
             if subject is None:
                 raise ValueError("Join this REALM before reading the feed")
-            # Only events occurring in the player's CURRENT room are returned.
-            # Host-trusted player name: the HTTP handler authenticates the
-            # principal before reaching this method.
+            # An authenticated actor can read only events since their latest
+            # entry into CURRENT room. An old 'after=0' cannot bypass this.
+            # With a missing legacy entry ledger, fail closed.
+            floor = self.engine._room_entry_floor(db, subject["id"], subject["room_id"])
             records = db.execute(
                 "SELECT id,occurred_at,actor,room_id,kind,payload_json FROM events "
-                "WHERE room_id=? AND id>? ORDER BY id LIMIT ?",
-                (subject["room_id"], after, MAX_FEED_EVENTS),
-            ).fetchall()
+                "WHERE room_id=? AND id>=? AND id>? ORDER BY id LIMIT ?",
+                (subject["room_id"], floor, after, MAX_FEED_EVENTS),
+            ).fetchall() if floor is not None else []
             events = []
             for row in records:
                 payload = json.loads(row["payload_json"])
@@ -405,4 +408,3 @@ def main(argv: list[str] | None = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
