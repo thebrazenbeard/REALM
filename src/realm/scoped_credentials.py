@@ -22,6 +22,7 @@ from pathlib import Path
 from typing import Callable
 
 from .engine import Engine, _PLAYER_RE
+from .principal_roles import is_reserved_npc
 
 
 _WORLD_ID = re.compile(r"^[A-Za-z][A-Za-z0-9_-]{0,63}$")
@@ -214,6 +215,8 @@ class ScopedCredentialStore:
         token = secrets.token_urlsafe(32)
         with closing(self.engine._connect()) as db, db:
             now, state = self._begin(db)
+            if is_reserved_npc(db, player_name):
+                raise ValueError("Reserved NPC cannot receive scoped player credentials")
             if db.execute(
                 "SELECT 1 FROM main.scoped_player_credentials WHERE world_id=? AND player_name=?",
                 (self.world_id, player_name),
@@ -252,7 +255,8 @@ class ScopedCredentialStore:
                 "FROM main.scoped_player_credentials WHERE world_id=? AND token_digest=?",
                 (self.world_id, self._digest(token)),
             ).fetchone()
-        if row is None or row[4] is not None or now < row[2]:
+            reserved = row is not None and is_reserved_npc(db, row[0])
+        if row is None or reserved or row[4] is not None or now < row[2]:
             return None
         if now >= row[3]:
             # An actual matching expired token is tombstoned ONCE. Forged and
@@ -298,7 +302,8 @@ class ScopedCredentialStore:
             "FROM main.scoped_player_credentials WHERE world_id=? AND token_digest=?",
             (self.world_id, self._digest(token)),
         ).fetchone()
-        if (row is None or row[4] is not None or not row[2] <= now < row[3]
+        if (row is None or is_reserved_npc(db, row[0]) or row[4] is not None
+                or not row[2] <= now < row[3]
                 or required_capability not in json.loads(row[1])):
             # Expiry tombstoning remains a separate host/store operation; a
             # denied writer check must never mutate this gameplay transaction.
@@ -325,6 +330,13 @@ class ScopedCredentialStore:
         next_token = secrets.token_urlsafe(32)
         with closing(self.engine._connect()) as db, db:
             now, state = self._begin(db)
+            actor_row = db.execute(
+                "SELECT player_name FROM main.scoped_player_credentials "
+                "WHERE world_id=? AND token_digest=?",
+                (self.world_id, self._digest(current_token)),
+            ).fetchone()
+            if actor_row is not None and is_reserved_npc(db, actor_row[0]):
+                raise ValueError("Reserved NPC cannot rotate scoped player credentials")
             updated = db.execute(
                 "UPDATE main.scoped_player_credentials SET token_digest=?,issued_utc=?,"
                 "expires_utc=?,issued_us=?,expires_us=?,generation=generation+1 "

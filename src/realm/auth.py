@@ -15,6 +15,7 @@ from contextlib import closing
 from datetime import datetime, timezone
 
 from .engine import Engine, _PLAYER_RE
+from .principal_roles import is_reserved_npc
 
 
 _CREDENTIAL_SCHEMA_SQL = """
@@ -51,6 +52,8 @@ class CredentialStore:
         token = self._new_token()
         with closing(self.engine._connect()) as db, db:
             db.execute("BEGIN IMMEDIATE")
+            if is_reserved_npc(db, player_name):
+                raise ValueError("Reserved NPC cannot receive player credentials")
             try:
                 db.execute(
                     "INSERT INTO player_credentials (player_name,token_digest,created_at) VALUES (?,?,?)",
@@ -67,6 +70,8 @@ class CredentialStore:
         token = self._new_token()
         with closing(self.engine._connect()) as db, db:
             db.execute("BEGIN IMMEDIATE")
+            if is_reserved_npc(db, player_name):
+                raise ValueError("Reserved NPC cannot rotate player credentials")
             updated = db.execute(
                 "UPDATE player_credentials SET token_digest=?,created_at=? WHERE player_name=?",
                 (self._digest(token), datetime.now(timezone.utc).isoformat(timespec="seconds"), player_name),
@@ -87,8 +92,11 @@ class CredentialStore:
         if not isinstance(token, str) or not 16 <= len(token) <= 255 or not token.isascii():
             return None
         with closing(self.engine._connect()) as db:
+            db.execute("BEGIN")
             result = db.execute(
-                "SELECT player_name FROM player_credentials WHERE token_digest=?",
+                "SELECT player_name FROM main.player_credentials WHERE token_digest=?",
                 (self._digest(token),),
             ).fetchone()
+            if result is not None and is_reserved_npc(db, result[0]):
+                return None
         return str(result[0]) if result else None
