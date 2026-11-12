@@ -33,20 +33,30 @@ generic worldpack importer exists; a canonical Driftspace worldpack does not.
 
 ## What exists now
 
-> **Release boundary:** This section describes the source on the default
-> `main` branch. [Draft PR #180](https://github.com/thebrazenbeard/REALM/pull/180)
-> combines further source-tested local PvP, emote, OOC, crew channels and
-> authenticated presence on a separate stacked development branch. It is
-> **not merged into `main`, installed, deployed or approved for public hosting**.
-> Do not confuse an open PR or passing prototype tests with a shipped feature.
+> **Source versus deployment:** This inventory describes capabilities in this
+> checkout's code. It is not evidence that a running world has been upgraded,
+> that players are authenticated beyond the documented local-host contract,
+> or that public hosting is safe. The PvP and channel integration was assembled
+> through [PR #180](https://github.com/thebrazenbeard/REALM/pull/180) and
+> passed source tests on Windows and Linux; installation, deployment, and
+> production multiplayer qualification are separate work.
 
-The current `main` branch supports:
+This source tree supports:
 
 - Separate persistent worlds: each SQLite file is a world, seeded with three deliberately **noncanonical demo rooms**. The loopback gateway persists its `world_id` binding and rejects an attempt to relabel an existing database (see `docs/GATEWAY_PROTOCOL.md` for legacy adoption).
 - Player names and persistent positions across restarts. Presence is their **last saved location**, not proof they are currently online.
 - Room descriptions and exits; movement; item take/drop/inventory (with transaction-level contention); player presence and shared room history.
 - Durable player speech, readable by others with `listen`/`history`.
+- Room-local `emote`, world OOC (`ooc`), and host-granted, membership-filtered
+  faction or crew conversation (`crewchat`); unrelated players do not receive
+  private crew messages.
 - Append-only application event records for joins, movement and speech.
+- **Draft-only optional political oaths and contested sites:** trusted-host
+  factions and public oath history; separately enabled resource-backed site
+  contests where actual inventory items are spent for durable faction support.
+  No faction-chat permissions or ruling powers are inherited
+  ([oath contract](docs/POLITICAL_OATHS.md),
+  [site contest contract](docs/POLITICAL_SITES.md)).
 - API-level optional action IDs for replay-safe mutation retries; duplicate IDs for different commands are rejected.
 - Local terminal clients using the same database path, with stdlib-only
   runtime dependencies. The CLI `--player` argument is a chosen name, **not**
@@ -64,28 +74,64 @@ The current `main` branch supports:
   commands, room feeds, and map queries derive the character from the token
   (see `docs/GATEWAY_PROTOCOL.md`).
 - A Pages-compatible static browser client under `docs/`, including a live map
-  display. GitHub Pages does not run the game server.
-- A separately gated loopback-only Telnet adapter (`TERMINAL.md`). Its local
-  token is not the HTTP player identity system.
+  display. Before authentication, the player must enter the exact expected
+  `world_id` supplied by their trusted host; the browser compares it with an
+  unauthenticated health response and refuses to send its bearer token on a
+  mismatch. This is a world-selection check, **not** cryptographic host
+  verification. GitHub Pages does not run the game server.
+- Source-tested host-installed, mutually opted-in local PvP (`pvp on`,
+  `pvp off`, `attack`) with writer-verified, credential-bound recent-activity
+  witnesses and a room-redacted PK herald. This is **not** qualified for
+  untrusted multiplayer hosting ([presence contract](docs/PRESENCE_WAVE28_INTEGRATION.md)).
+- A separately gated loopback-only Telnet adapter (`TERMINAL.md`). Legacy
+  shared-token/player-chosen-name mode remains for compatibility; an opt-in
+  host-provisioned player-credential mode enforces identity at the writer
+  transaction boundary. **Both are plaintext and local-only.**
+- A host-local per-player gateway request limiter and browser retries for
+  `429 Retry-After`, plus a bounded socket-worker pool and absolute POST body
+  deadline ([abuse controls](docs/GATEWAY_ABUSE_CONTROLS.md),
+  [worker bounds](docs/GATEWAY_SLOW_BODY.md)). Its scoped loopback HTTP server
+  also enforces an incomplete-header deadline.
+- An explicitly invoked, bounded local-model proposal bridge for NPCs, with
+  host-owned identities, allowed actions, and SQLite receipts
+  ([model transport](docs/NPC_LOCAL_MODEL_BRIDGE.md),
+  [turn execution](docs/NPC_TURNS.md)). Model weights and scheduling are not
+  included.
+- A host-authorized, privacy-scoped NPC scene snapshot builder for supplying
+  bounded context to a local model; this is not autonomous NPC behavior
+  (`src/realm/npc_scene.py`).
+- A read-only host preflight for SQLite/world-path and local-runtime suitability
+  ([host preflight](docs/HOST_PREFLIGHT.md)).
+- A direct world-clock callback guard that prevents accidental COMMIT,
+  ROLLBACK, implicit COMMIT, or ATTACH escaping the clock's receipt transaction
+  ([atomicity boundary](docs/CLOCK_CALLBACK_ATOMICITY.md)).
+- A **source-only, not yet displayed in-game** ship-title formatter that
+  derives the captain label from current persisted ship ownership and requires
+  a host-signed, short-lived proof for first-officer presentation
+  ([title policy](docs/TITLE_FLAGS.md)).
 
-**Not implemented or qualified:** public TLS hosting, rate limits, public
-account registration, expiring sessions, fog of war, AI/NPC co-player loops,
-automatic simulation ticks, inter-world portals, combat, moderation,
-distributed state, or the canonical Driftspace setting. Local CLI/Telnet names
-are not durable authenticated account identities. **Do not expose these
-development servers to the public internet.**
+**Not implemented or qualified:** public TLS hosting, full unauthenticated
+flood protection, cross-process rate quotas, public account registration,
+expiring login sessions, fog of war, autonomous AI/NPC co-player scheduling,
+inter-world portals, production-safe or balanced PvP, moderation,
+distributed state, or the canonical Driftspace setting. CLI names and legacy
+Telnet names are not durable authenticated account identities. **Do not expose
+these development servers to the public internet.**
 
-The model-free [`ResidentController`](docs/RESIDENT_PROPOSALS.md) now gives a
-host one validation boundary for future NPC **action proposals**, but does
-not generate actions or provide resident drives, memories, or autonomous ticks.
+The model-free [`ResidentController`](docs/RESIDENT_PROPOSALS.md) gives a
+host one validation boundary for NPC **action proposals**. The optional local
+bridge can now ask an already-running model endpoint for a proposed command,
+but does not provide weights, character drives, memories, autonomous ticks, or
+a deployed resident service.
 Small local NPC-model options, including Patrick's Hugging Face `character` and
 `npc` searches, are tracked as **research candidates** in
 [`docs/NPC_MODEL_CANDIDATES.md`](docs/NPC_MODEL_CANDIDATES.md) and the offline
 [`research/npc-model-candidates.v1.json`](research/npc-model-candidates.v1.json).
 No weights are bundled, installed or benchmarked by this registry.
 
-The browser uses HTTP polling, not push notifications. Presence still means
-saved room position, not reliable online/offline status.
+The browser uses HTTP polling, not push notifications. Ordinary player lists
+show saved room position, not a reliable online/offline roster. The separate
+host-controlled, short-lived witness serves only scoped local PvP eligibility.
 
 ## Play locally (Python 3.11+)
 
@@ -113,6 +159,17 @@ One-off smoke command:
 ```bash
 PYTHONPATH=src python -m realm --db data/demo.sqlite3 --player Patrick --once look
 ```
+
+Reproducible three-OS-process political contest (two independently authenticated
+players + one loopback host, disposable world, actual inventory expenditure,
+political betrayal and recovery after a server restart):
+
+```bash
+python examples/synthetic_political_rivalry.py
+```
+
+This is a synthetic integration demonstration, **not** a live hosted world or
+proof that a model can govern political actors. No worldpack is imported.
 
 Run tests without third-party packages:
 

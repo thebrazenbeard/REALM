@@ -16,9 +16,11 @@ residents; it does **not** make REALM an autonomous living world yet.
 3. The host supplies an independent, stable action ID for the logical action.
    `ResidentController.validate` checks printable text, length, and the exact
    host-allowed verb. Optional item verbs are denied by default.
-4. `ResidentController.commit` delegates to `Engine.act`, whose world graph,
-   player membership, transaction, and receipt checks still decide the actual
-   outcome. A rejected proposal does not mutate the world.
+4. `ResidentController.commit` validates the proposal and uses Engine's
+   world command interpreter inside one SQLite writer transaction, recording
+   idempotency under the host-only `@resident:<canonical actor>` receipt
+   principal. The ordinary player receipt namespace cannot impersonate a
+   host turn. A rejected proposal does not mutate the world.
 
 Minimal local demonstration (no inference):
 
@@ -43,6 +45,25 @@ HTTP route, accept model-defined identities, or give a model direct Engine,
 SQLite, file-system or host-admin capabilities. Existing local CLI methods are
 host-trusted and do not constitute remote player account authorization.
 
+Host action IDs must be 1–128 safe ASCII characters, starting with an
+alphanumeric character and followed only by ASCII letters, digits, `_`, `.`,
+`:`, or `-`. They must be unique for each logical action **across** direct
+`ResidentController.commit`, `LocalChatProposer.commit`, and `ResidentTurnHost`
+for that resident, including across process restarts. Their common host-owned
+receipt identity prevents accidental duplicate effects across host adapters;
+the current controller policy and any `writer_guard` are checked before replay.
+Read-only retries re-evaluate current room and inventory state rather than
+replaying a saved observation.
+
+Pre-upgrade resident receipts and ordinary player receipts used the same actor
+key. If an old actor-keyed receipt matches a new host action ID but no trusted
+host receipt exists, provenance is unknowable from that row alone. REALM now
+**fails closed** on that ID, preserves the legacy row unchanged, and requires
+owner review plus a governed new action ID. There is no implicit migration or
+destructive cleanup. A known or guessed action ID can therefore block a
+particular host action without forging a successful host replay; hosts should
+issue unpredictable IDs and handle collision quarantine explicitly.
+
 ### Non-goals and remaining qualification
 
 - Profiles, drives, long-term/semantic memory, event-grounded recollection,
@@ -54,6 +75,10 @@ host-trusted and do not constitute remote player account authorization.
   host-controlled parsing and tool permissions.
 - Engine's valid but failed gameplay command, such as `go up` with no exit,
   may still receive a replay receipt; it does not imply a successful action.
+- Host execution presently uses Engine's internal command interpreter, which
+  must be kept in parity if future outer `Engine.act` policies (such as opt-in
+  combat/death mutation guards) are added. The host adapter is not an
+  independent authorization or memory isolation boundary.
 - Host policy must further decide safety of conversation, privacy, rate
   limits, turn budgets, player consent, moderation, and whether a resident can
   interact with items or economy. No claims of safe public hosting follow.

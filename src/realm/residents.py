@@ -8,10 +8,14 @@ proposal cannot choose an actor or bypass the Engine's transactions.
 
 from __future__ import annotations
 
+import sqlite3
 from dataclasses import dataclass
-from typing import Mapping
+from typing import Callable, Mapping
 
 from .engine import Engine
+from .resident_receipts import (
+    HOST_ACTION_ID_RE, commit_resident_command, replay_resident_if_committed,
+)
 
 
 _ENGINE_VERBS = frozenset({
@@ -80,9 +84,29 @@ class ResidentController:
             raise ValueError("Resident speech must contain 1–280 characters")
         return parsed
 
-    def commit(self, proposal: Mapping[str, object], *, action_id: str) -> str:
-        """PROPOSE → host VALIDATE → Engine COMMIT with host-owned receipt ID."""
-        if not isinstance(action_id, str) or not 1 <= len(action_id) <= 128:
-            raise ValueError("Host action ID must contain 1–128 characters")
+    def commit(
+        self, proposal: Mapping[str, object], *, action_id: str,
+        writer_guard: Callable[[sqlite3.Connection], None] | None = None,
+    ) -> str:
+        """PROPOSE → host VALIDATE → atomic host-only receipt and Engine action."""
+        if not isinstance(action_id, str) or HOST_ACTION_ID_RE.fullmatch(action_id) is None:
+            raise ValueError("Host action ID must contain 1–128 safe ASCII characters")
+        if writer_guard is not None and not callable(writer_guard):
+            raise TypeError("Resident writer_guard must be callable")
         accepted = self.validate(proposal)
-        return self._engine.act(self._resident, accepted.command, action_id=action_id)
+        return commit_resident_command(
+            self._engine, self._resident, accepted.command, action_id, writer_guard,
+        )
+
+    def _replay_if_committed(
+        self, action_id: str,
+        writer_guard: Callable[[sqlite3.Connection], None] | None = None,
+    ) -> str | None:
+        """Private safe retry probe for a trusted model bridge, not new authority."""
+        if not isinstance(action_id, str) or HOST_ACTION_ID_RE.fullmatch(action_id) is None:
+            raise ValueError("Host action ID must contain 1–128 safe ASCII characters")
+        if writer_guard is not None and not callable(writer_guard):
+            raise TypeError("Resident writer_guard must be callable")
+        return replay_resident_if_committed(
+            self._engine, self._resident, action_id, self.validate, writer_guard,
+        )

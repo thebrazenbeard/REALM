@@ -1,0 +1,50 @@
+# No credentials or paid services; tests use disposable SQLite worlds and loopback sockets.
+name: REALM core regression
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: realm-core-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  local-first-regression:
+    name: ${{ matrix.os }} Python / browser / multiplayer
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    steps:
+      - name: Checkout exact commit
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Full Python integration suite
+        shell: bash
+        run: python -m unittest discover -s tests -q
+      - name: Browser and map suite
+        shell: bash
+        env:
+          REALM_PYTHON: python
+        run: node --test tests/browser/test-client.cjs tests/browser/test-map.cjs
+      - name: Three-process political contest and restart
+        shell: bash
+        run: python examples/synthetic_political_rivalry.py

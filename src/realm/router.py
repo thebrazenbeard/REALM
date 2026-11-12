@@ -7,6 +7,9 @@ Engine._perform; doing the latter would self-lock SQLite's writer.
 
 from __future__ import annotations
 
+import sqlite3
+from typing import Callable
+
 from .crafting import Crafting
 from .engine import Engine
 
@@ -16,11 +19,22 @@ class CommandRouter:
         self.engine = engine
         self.crafting = Crafting(engine.db_path)
 
-    def act(self, player: str, command: str, *, action_id: str | None = None) -> str:
-        result = self.crafting.perform(player, command, action_id=action_id)
+    def act(self, player: str, command: str, *, action_id: str | None = None,
+            writer_guard: Callable[[sqlite3.Connection], None] | None = None,
+            private_channels: bool = True) -> str:
+        result = self.crafting.perform(
+            player, command, action_id=action_id, writer_guard=writer_guard
+        )
         if result is not None:
             return result
-        return self.engine.act(player, command, action_id=action_id)
+        if private_channels:
+            return self.engine.act(
+                player, command, action_id=action_id, writer_guard=writer_guard,
+            )
+        return self.engine.act(
+            player, command, action_id=action_id, writer_guard=writer_guard,
+            private_channels=False,
+        )
 
     def seed_demo_crafting(self) -> None:
         """Explicit, noncanonical demo fixtures; safe to repeat without refilling.

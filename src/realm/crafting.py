@@ -13,10 +13,10 @@ from __future__ import annotations
 import json
 import re
 import sqlite3
-from contextlib import contextmanager
+from contextlib import closing, contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Mapping
+from typing import Callable, Mapping
 
 from .engine import Engine
 
@@ -151,7 +151,8 @@ class Crafting:
             )
             return True
 
-    def perform(self, actor: str, command: str, *, action_id: str | None = None) -> str | None:
+    def perform(self, actor: str, command: str, *, action_id: str | None = None,
+                writer_guard: Callable[[sqlite3.Connection], None] | None = None) -> str | None:
         """Run one recognized player command; return None for unrelated verbs.
 
         The host must authenticate ``actor`` before calling this method.  Local
@@ -165,24 +166,32 @@ class Crafting:
         verb, arg = verb.lower(), arg.strip()
         if verb not in _COMMANDS:
             return None
+        read_only = verb in {"resources", "recipes", "structures"} or (verb == "gather" and not arg)
         if action_id is not None and (not isinstance(action_id, str) or not 1 <= len(action_id) <= 128):
             raise ValueError("Action IDs must be nonempty strings up to 128 characters")
 
         with self._connect() as db:
             db.execute("BEGIN IMMEDIATE")
+            if writer_guard is not None:
+                writer_guard(db)
             player = db.execute("SELECT id,room_id FROM players WHERE id=? COLLATE NOCASE", (actor,)).fetchone()
             if player is None:
                 raise ValueError("Join this REALM before gathering or crafting")
             actor, room = player["id"], player["room_id"]
+            if not read_only:
+                from .combat import Combat
+                Combat.require_living_for_mutation(db, actor)
+            receipt = None
             if action_id is not None:
                 receipt = db.execute(
                     "SELECT command,response FROM action_receipts WHERE actor=? AND action_id=?",
                     (actor, action_id),
                 ).fetchone()
-                if receipt:
+                if receipt is not None:
                     if receipt["command"] != command:
                         raise ValueError("Action ID already used for a different command")
-                    return receipt["response"]
+                    if not read_only:
+                        return receipt["response"]
 
             if verb == "resources":
                 found = db.execute(
@@ -211,14 +220,17 @@ class Crafting:
             else:
                 response = self._make(db, actor, room, verb, arg)
 
-            if action_id is not None:
+            # Preserve IDs for conflict detection without keeping a stale
+            # inventory, location or authored-resource snapshot as a receipt.
+            if action_id is not None and receipt is None:
                 db.execute(
                     "INSERT INTO action_receipts (actor,action_id,command,response) VALUES (?,?,?,?)",
-                    (actor, action_id, command, response),
+                    (actor, action_id, command, "" if read_only else response),
                 )
             return response
 
-    def _gather(self, db: sqlite3.Connection, actor: str, room: str, arg: str) -> str:
+    def _gather(self, db: sqlite3.Connection, actor: str, room: str, arg: str,
+                *, emissions: list[tuple[int, str]] | None = None) -> str:
         if not arg:
             nodes = db.execute(
                 "SELECT material,remaining FROM gathering_nodes WHERE room_id=? ORDER BY material", (room,)
@@ -252,10 +264,13 @@ class Crafting:
             "INSERT INTO material_pouches VALUES (?,?,?) ON CONFLICT(actor,material) DO UPDATE SET quantity=quantity+excluded.quantity",
             (actor, material, amount),
         )
-        self._event(db, actor, room, "gather", {"material": material, "amount": amount})
+        self._event(db, actor, room, "gather", {"material": material, "amount": amount},
+                    emissions=emissions)
         return f"You gather {material} x{amount}."
 
-    def _make(self, db: sqlite3.Connection, actor: str, room: str, kind: str, arg: str) -> str:
+    def _make(self, db: sqlite3.Connection, actor: str, room: str, kind: str, arg: str,
+              *, emissions: list[tuple[int, str]] | None = None,
+              structures: list[tuple[int, str]] | None = None) -> str:
         if not arg:
             return f"{kind.capitalize()} what? Type 'recipes' for options."
         recipe = db.execute("SELECT * FROM craft_recipes WHERE id=? AND kind=?", (arg.lower(), kind)).fetchone()
@@ -290,17 +305,35 @@ class Crafting:
             )
             response = f"You craft {recipe['output']} x{recipe['output_count']}."
         else:
-            db.execute(
-                "INSERT INTO built_structures (room_id,recipe,owner,constructed_at) VALUES (?,?,?,?)",
-                (room, recipe["id"], actor, _now()),
-            )
+            sql = "INSERT INTO built_structures (room_id,recipe,owner,constructed_at) VALUES (?,?,?,?)"
+            values = (room, recipe["id"], actor, _now())
+            if structures is None:
+                db.execute(sql, values)
+            else:
+                # Preserve the outer emitter's original identity/time before
+                # any host-installed AFTER INSERT trigger can rewrite it.
+                with closing(db.execute(sql + " RETURNING id,constructed_at", values)) as cursor:
+                    original = cursor.fetchone()
+                if original is None:
+                    raise ValueError("Construction emitter did not return its row")
+                structures.append((original[0], original[1]))
             response = f"You build {recipe['output']} here."
-        self._event(db, actor, room, kind, {"recipe": recipe["id"], "output": recipe["output"]})
+        self._event(db, actor, room, kind, {"recipe": recipe["id"], "output": recipe["output"]},
+                    emissions=emissions)
         return response
 
     @staticmethod
-    def _event(db: sqlite3.Connection, actor: str, room: str, kind: str, payload: dict) -> None:
-        db.execute(
-            "INSERT INTO events (occurred_at,actor,room_id,kind,payload_json) VALUES (?,?,?,?,?)",
-            (_now(), actor, room, kind, json.dumps(payload, sort_keys=True)),
-        )
+    def _event(db: sqlite3.Connection, actor: str, room: str, kind: str,
+               payload: dict, *, emissions: list[tuple[int, str]] | None = None) -> None:
+        values = (_now(), actor, room, kind, json.dumps(payload, sort_keys=True))
+        sql = "INSERT INTO events (occurred_at,actor,room_id,kind,payload_json) VALUES (?,?,?,?,?)"
+        if emissions is None:
+            db.execute(sql, values)
+        else:
+            # The RETURNING tuple is the original outer insert, unaffected by
+            # AFTER INSERT triggers that can rewrite durable event timestamps.
+            with closing(db.execute(sql + " RETURNING id,occurred_at", values)) as cursor:
+                emitted = cursor.fetchone()
+            if emitted is None:
+                raise ValueError("Gather emitter did not return its inserted row")
+            emissions.append((emitted[0], emitted[1]))

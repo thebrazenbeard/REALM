@@ -69,13 +69,26 @@ class WorldpackTests(unittest.TestCase):
         self.assertEqual(first["sha256"], again["sha256"])
         self.assertIn("Small stone", Engine(self.db).act("Patrick", "inventory"))
 
-    def test_gateway_initialized_demo_must_import_first(self):
+    def test_pristine_gateway_may_import_same_worldpack_before_play(self):
         self.save()
-        Gateway(self.db, world_id="sample")
+        gateway = Gateway(self.db, world_id="sample")
+        self.assertFalse(import_worldpack(self.db, self.file)["unchanged"])
+        self.assertIn("Quiet Shore", gateway.join("Patrick")["text"])
+        # An already played world cannot be re-themed by another pack.
+        changed = example()
+        changed["rooms"][0]["description"] = "Not the same world."
+        self.save(changed)
+        with self.assertRaisesRegex(WorldpackError, "different worldpack"):
+            import_worldpack(self.db, self.file)
+        self.assertIn("Quiet Shore", Gateway(self.db, world_id="sample").room("Patrick")["text"])
+
+    def test_explicit_geography_schema_still_blocks_first_import(self):
+        self.save()
+        gateway = Gateway(self.db, world_id="sample")
+        gateway.geography  # Host has explicitly installed optional geography.
         with self.assertRaisesRegex(WorldpackError, "custom SQL schema"):
             import_worldpack(self.db, self.file)
-        # Engine/gameplay state has not been replaced by the failed import.
-        self.assertIn("DEMO WORLD", Gateway(self.db, world_id="sample").join("Patrick")["text"])
+        self.assertIn("DEMO WORLD", gateway.join("Patrick")["text"])
 
     def test_pristine_gateway_mismatched_world_id_cannot_import(self):
         self.save()

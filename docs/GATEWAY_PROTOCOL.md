@@ -84,11 +84,47 @@ For browser requests, Origin must exactly match one explicitly configured
 | Request | Body/query | Response |
 | --- | --- | --- |
 | `GET /api/v1/health` | none | `{ "ok": true, "world_id": "demo" }` |
-| `POST /api/v1/join` | `{"player":"Patrick"}` | `{"ok":true,"text":"Welcome ...","cursor":1}` |
-| `POST /api/v1/command` | `{"player":"Patrick","command":"look","action_id":"optional-unique-id"}` | `{"ok":true,"text":"...","cursor":1}` |
+| `POST /api/v1/join` | `{"player":"Patrick"}` | `{"ok":true,"text":"Welcome ...","cursor":1,"room_entry_cursor":1}` |
+| `POST /api/v1/command` | `{"player":"Patrick","command":"look","action_id":"optional-unique-id"}` | `{"ok":true,"text":"...","cursor":1,"room_entry_cursor":1}` |
 | `GET /api/v1/room?player=Patrick` | query | `{"ok":true,"text":"...","cursor":1}` |
+| `GET /api/v1/scene?player=Patrick` | query | Authenticated saved-room facts: `room`, `exits`, `items`, `occupants`, `presence_semantics`, `truncated`, `cursor` |
 | `GET /api/v1/feed?player=Patrick&after=1` | query | `{"ok":true,"events":[...],"cursor":2}` |
 | `GET /api/v1/map?player=Patrick` | query; optional authored geography | `{"ok":true,"space":{...},"origin":{...},"width":3,"height":2,"tiles":[...],"markers":[...],"player":{...},"legend":[...]}` |
+
+The room_entry_cursor returned by join and command (including scoped
+player-bound HTTP paths) identifies host-recorded room arrival, not the
+overall world event head. A join response uses the exact event ID emitted
+inside **that join's own committed writer transaction**, even if a second
+session for the same character rejoins before response assembly. The join
+writer reads back its exact event, canonical empty payload, latest
+entry position and actor room before COMMIT; tested in-transaction
+suppression, deletion/replacement and extra-entry triggers roll back.
+Caller-visible receipt IDs are populated only after a successful commit.
+This does not protect against a privileged database administrator changing
+events after commit. A command
+reports the latest verified current-room entry at its response read.
+A new actor's join,
+returning authenticated join, or movement generates an entry event. A
+different player's message can arrive after that entry but before the global
+cursor is sampled; starting a feed at the later global cursor would silently
+drop that legitimate message. Poll /api/v1/feed with after=room_entry_cursor
+to capture subsequent room activity. The global cursor is still returned
+for compatibility and is numerically at least room_entry_cursor whenever
+the latter is a valid integer. This hint is **not** a permission token:
+every feed request separately enforces actor credentials, current room,
+latest trusted join/move/leave evidence and channel permissions. Missing
+historical entry proof yields null and the authoritative feed fails closed.
+Older gateway versions omit this field. Clients should fall back to the
+global cursor only when the entry field is absent, not malformed. The
+static browser validates both. This is not a guarantee of complete history
+or a contract for competing same-actor sessions.
+
+The optional `/scene` endpoint reads the authenticated player's room, exits,
+visible items, and actors' saved room positions in one SQLite read snapshot.
+Each collection is capped at 50 entries with a `truncated` flag. The
+`presence_semantics` value is `saved_position_only`: an occupant is not proof
+of a connected human, an NPC classification, an AI agent, or an available
+`talk` action. Unknown inhabitants are never invented by this endpoint.
 
 The map endpoint reads the joined player's **actual persisted room** from
 `players.room_id` and picks the closest authored geography layer containing
@@ -107,6 +143,66 @@ an authoring API, not an automatic galaxy generator or public worldpack
 loader. Ship departure/arrival state is persisted and advanced by explicit
 host ticks; no always-running simulation is implied.
 
+### Opt-in scoped ship-owner history (source-only)
+
+An explicitly scoped gateway can also serve:
+
+`GET /api/v1/ship/events?ship_id=vesta&after=0`
+
+This read-only route requires an **active scoped** bearer already carrying the
+existing `ship:depart` capability, a joined principal, and exact persisted
+`geo_ships.owner` equality for that ship in the gateway's bound world. It does
+not issue credentials, grant ship access to crew, use a legacy unscoped bearer,
+or expose a fleet list. Unknown and other-owned ships are both HTTP 403; missing,
+expired or revoked scoped pilot credentials are HTTP 401. Invalid, repeated,
+foreign-world-selector or future-cursor query parameters are HTTP 400.
+
+The bounded response has `{ok,world_id,ship_id,events,cursor}`; each event is
+`{id,at,ship_id,actor,kind,payload}` sourced from persistent `geo_ship_events`,
+ordered by increasing database ID, at most 100 per page. `at` is a UTC epoch
+second from the ship ledger. Repeating an earlier cursor may redeliver events;
+clients deduplicate by `(world_id,ship_id,id)` and persist the last consumed ID.
+This is **owner-only history**, not the room feed, an authorized crew timeline,
+live ship telemetry, or a perpetual world ticker. Ship arrival still needs an
+explicit host UTC tick. The provisional loopback transport remains unsuitable
+for public network exposure.
+
+`WorldClock.tick` additionally compares the complete persisted ship, ship-event
+and receipt ledgers before and after its trusted UTC callbacks, including idle
+and unrelated audit-only ticks. Only exact scheduled, in-transaction ship
+arrivals and bound host ship departures may add ledger effects; SQLite trigger
+injections that add, delete, or rewrite other ship history abort that tick.
+This is **clock-transaction custody**, not a proof that all rows returned by
+the GET were originally legitimate: independent gateway departure transactions,
+direct host `Geography` writes, out-of-band privileged SQLite modifications,
+and whole-file database rollback are outside this tick's authorization boundary.
+Owner history is a persisted observation surface, not a cryptographic
+attestation or assurance that arbitrary raw event payloads are secret-free.
+
+The scoped, authenticated `POST /api/v1/ship/depart` writer also checks **its
+own transaction's** complete ship-state/event/receipt delta before commit,
+including exact one-time replay, registered owner, route, and scheduled UTC
+arrival. A same-writer privileged trigger that forges an extra departure,
+changes another ship's history or removes a receipt rejects and rolls back the
+entire POST; unrelated permitted room `say` events still proceed. This is not
+global tamper-proofing: an explicitly caller-owned transaction may continue
+to write after `depart_in_transaction` returns, standalone host Geography
+methods and out-of-band privileged SQL do not use this guard, and a later
+whole-file rollback still lacks an external witness.
+
+The scoped departure writer separately snapshots **world/credential/clock
+authority** before authorization: all `world_meta` rows, scheduler queue and
+UTC watermark, roster attestations, player identity/credential tables, and
+scoped credential guard/capability rows. The only permitted queue change is
+the departure's exact new pending `ship_arrival` (or no change on replay).
+Privileged installed triggers cannot silently rebind `world_id`, grant another
+player a capability, revoke a credential, rewrite an earlier clock receipt or
+add an ungranted second deadline while returning successful HTTP departure;
+these mutations reject and roll back the request. The separate room event
+ledger still allows unrelated `say` records. This is an authenticated ship
+writer postcondition, not a universal attestation of every gameplay table or
+of privileged external database activity after commit.
+
 Each event is `{id,kind,actor,text,room,at}`. Movement creates a `leave` event
 in the source room and a `move` (arrival) event in the destination in one
 transaction. The feed is **polling**, not
@@ -114,6 +210,41 @@ server push. It is filtered to the player's current room, returns up to 100
 events per request, and advances its cursor only for returned events.
 The join response supplies a starting cursor to avoid displaying a room's
 entire previous history as new activity.
+
+The `give <item> to <player>` gameplay command transfers one item held by the
+authenticated sender to a different player whose **saved room position** is
+the sender's current room. This is transactional with its `give` event in the
+room history and polling feed. Item IDs work directly; duplicate item display
+names require an unambiguous ID. The recipient must already have joined this
+world, but need **not** have an active HTTP or Telnet connection: the persisted
+room position is not an online-presence signal. Neither this command nor the
+scene occupants list claims that a player is currently connected. Items
+cannot be given to oneself, to an unknown or different-room player, or by a
+sender who does not possess them.
+
+Keyed gameplay commands retain mutation idempotency: replaying the same
+`action_id` cannot take, give, gather, craft, or say twice. Read-only commands,
+including `look`, `examine`, `inventory`, `who`, `history`, `resources`,
+`recipes`, `structures`, and bare `gather`, are evaluated against current
+authorized state on each retry. An old observation receipt cannot grant
+access to an item another actor now holds or to speech from before arrival.
+`examine <item>` (alias `x <item>` or `look at <item>`) only reveals items
+in the caller's room or inventory and writes no world event.
+New keyed read receipts retain the actor, ID and original command with an
+empty `response` sentinel; observations are returned fresh without persisting
+their contents or rewriting the receipt on replay. Existing receipts created
+by older builds may still contain nonblank observation responses. Those rows
+persist until a **separately authorized migration**; this change performs no
+automatic destructive database rewrite or receipt cleanup.
+
+`CommandRouter.act` owns the shared Engine/Crafting action-ID namespace for
+interactive commands. It dispatches recognized crafting verbs before Engine,
+which otherwise treats those verbs as unknown. Calling `Engine.act` and
+`Crafting.perform` directly with the **same** actor, command, and action ID
+across handlers is unsupported: a low-level caller can replay the other
+handler's receipt instead of its own command result. Embeddings should route
+interactive player commands through `CommandRouter` consistently; this is an
+internal API boundary, not an observed HTTP/Telnet/CLI authorization bypass.
 
 Credentials are bound to one character name, but are long-lived bearer
 capabilities rather than expiring sessions with account recovery. Anyone who

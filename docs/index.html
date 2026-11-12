@@ -44,6 +44,10 @@
         <label for="host-url">REALM host URL
           <input id="host-url" type="url" inputmode="url" autocomplete="url" spellcheck="false" placeholder="https://your-realm-host.example" required>
         </label>
+        <label for="expected-world-id">Expected world ID <span class="hint">(from your trusted host)</span>
+          <input id="expected-world-id" type="text" maxlength="64" autocomplete="off" spellcheck="false" placeholder="your-world-id" pattern="[A-Za-z][A-Za-z0-9_-]{0,63}" aria-describedby="world-id-help" required>
+          <span class="hint" id="world-id-help">Must match the host's world before any access token is sent. This check does not verify the host's identity.</span>
+        </label>
         <label for="player-name">Character name
           <input id="player-name" type="text" minlength="1" maxlength="24" autocomplete="off" spellcheck="false" placeholder="Explorer" pattern="[A-Za-z][A-Za-z0-9_-]{0,23}" required>
         </label>
@@ -94,6 +98,20 @@
             <button type="button" data-command="listen" disabled>listen</button>
             <button type="button" data-command="help" disabled>help</button>
           </div>
+          <details class="command-guide">
+            <summary>Command reference — chat, roleplay &amp; PvP</summary>
+            <div class="command-guide-body">
+              <p>Examples only. Commands run after you connect to an authorized host; available features depend on that world. Type <code>help</code> for its full list.</p>
+              <ul class="command-guide-list">
+                <li><code>emote waves</code><span>Describe an action to characters in your current room.</span></li>
+                <li><code>ooc hello</code><span>Out-of-character chat across the current world.</span></li>
+                <li><code>crewchat hello</code><span>Private group chat; requires host-granted membership.</span></li>
+                <li><code>pvp status</code><span>Check your PvP opt-in and health state.</span></li>
+                <li><code>pvp on</code><span>Opt in to host-enabled PvP. Use <code>pvp off</code> to opt out.</span></li>
+                <li><code>attack Player</code><span>Only for same-room, opted-in players when host rules and presence checks allow combat.</span></li>
+              </ul>
+            </div>
+          </details>
         </form>
       </section>
 

@@ -1,0 +1,357 @@
+"""Cross-PR regression parity from source PR #189 exact f8c0d7b.
+
+Retains six original source tests; replaces private station character name
+with a generic newcomer. Test evidence is not a code merge or reviewer approval.
+"""
+"""REALM actor/room entry floor: real Engine and Gateway, disposable SQLite."""
+from pathlib import Path
+import sys
+from contextlib import closing
+from tempfile import TemporaryDirectory
+import sqlite3
+import unittest
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+
+from realm.engine import Engine
+from realm.gateway import Gateway
+
+
+class RoomEntryPrivacyTests(unittest.TestCase):
+    def setUp(self):
+        self.scratch = TemporaryDirectory(prefix="realm-issue187-")
+        self.addCleanup(self.scratch.cleanup)
+        self.db = Path(self.scratch.name) / "world.sqlite3"
+        self.host = Gateway(self.db, world_id="privacy-probe")
+        self.engine = self.host.engine
+
+    def test_new_entrant_cannot_read_prior_speech_from_history_or_feed(self):
+        self.host.join("Visitor")
+        self.host.command("Visitor", "say BEFORE NEWCOMER JOINED", None)
+        self.host.join("Newcomer")
+        history = self.host.command("Newcomer", "history 50", None)["text"]
+        events = self.host.feed("Newcomer", 0)["events"]
+        self.assertNotIn("BEFORE NEWCOMER JOINED", history)
+        self.assertFalse(any("BEFORE NEWCOMER JOINED" in e["text"] for e in events))
+        self.host.command("Visitor", "say AFTER NEWCOMER JOINED", None)
+        self.assertIn("AFTER NEWCOMER JOINED", self.host.command("Newcomer", "history 50", None)["text"])
+        self.assertTrue(any("AFTER NEWCOMER JOINED" in e["text"] for e in self.host.feed("Newcomer", 0)["events"]))
+
+    def test_returning_actor_cannot_read_speech_from_before_reentry(self):
+        self.host.join("Visitor")
+        self.host.join("Newcomer")
+        self.host.command("Newcomer", "north", None)
+        self.host.command("Visitor", "say SECRET WHILE AWAY", None)
+        self.host.command("Newcomer", "south", None)
+        self.assertNotIn("SECRET WHILE AWAY", self.host.command("Newcomer", "listen", None)["text"])
+        self.assertFalse(any("SECRET WHILE AWAY" in x["text"] for x in self.host.feed("Newcomer", 0)["events"]))
+        self.host.command("Visitor", "say NEW AFTER REENTRY", None)
+        self.assertIn("NEW AFTER REENTRY", self.host.command("Newcomer", "history 50", None)["text"])
+
+    def test_move_entry_event_kept_for_current_room_feed(self):
+        self.host.join("Newcomer")
+        self.host.command("Newcomer", "north", None)
+        entries = self.host.feed("Newcomer", 0)["events"]
+        self.assertTrue(any(e["actor"] == "Newcomer" and e["kind"] == "move" for e in entries))
+        self.assertFalse(any(e["room"] != "corridor" for e in entries))
+
+    def test_missing_entry_ledger_fails_closed_without_secret_exposure(self):
+        self.host.join("Visitor")
+        self.host.command("Visitor", "say PREEXISTING SECRET", None)
+        with closing(sqlite3.connect(self.db)) as db, db:
+            db.execute(
+                "INSERT INTO players(id,room_id,created_at) VALUES(?,?,?)",
+                ("Legacy", "atrium", "2026-11-11T00:00:00+00:00"),
+            )
+        # Integrated PR #188 is stronger than source PR #189: a missing
+        # trusted entry event raises rather than returning an empty success.
+        with self.assertRaisesRegex(ValueError, "No provable current-room arrival"):
+            self.host.command("Legacy", "history 50", None)
+        with self.assertRaisesRegex(ValueError, "No provable current-room arrival"):
+            self.host.feed("Legacy", 0)
+
+
+    def test_http_authenticated_feed_enforces_same_entry_floor(self):
+        from threading import Thread
+        from urllib.request import Request, urlopen
+        from realm.gateway import GatewayServer
+        import json
+
+        visitor_token = self.host.credentials.provision("Visitor")
+        captain_token = self.host.credentials.provision("Newcomer")
+        self.host.join("Visitor")
+        self.host.command("Visitor", "say PRIVATE BEFORE ENTRY", None)
+        self.host.join("Newcomer")
+        server = GatewayServer(self.host, (), 0)
+        thread = Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            def read(token, cursor):
+                url = f"http://127.0.0.1:{server.server_port}/api/v1/feed?after={cursor}"
+                req = Request(url, headers={"Authorization": "Bearer " + token})
+                with urlopen(req, timeout=4) as response:
+                    return json.loads(response.read())
+            first = read(captain_token, 0)
+            self.assertFalse(any("PRIVATE BEFORE ENTRY" in e["text"] for e in first["events"]))
+            self.host.command("Visitor", "say PUBLIC AFTER ENTRY", None)
+            second = read(captain_token, 0)
+            self.assertTrue(any("PUBLIC AFTER ENTRY" in e["text"] for e in second["events"]))
+            self.assertFalse(any("PRIVATE BEFORE ENTRY" in e["text"] for e in second["events"]))
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(3)
+
+    def test_legacy_actor_can_resume_after_new_real_room_entry(self):
+        self.host.join("Visitor")
+        self.host.command("Visitor", "say OLD NOT VISIBLE", None)
+        with closing(sqlite3.connect(self.db)) as db, db:
+            db.execute(
+                "INSERT INTO players(id,room_id,created_at) VALUES(?,?,?)",
+                ("Legacy", "atrium", "2026-11-11T00:00:00+00:00"),
+            )
+        with self.assertRaisesRegex(ValueError, "No provable current-room arrival"):
+            self.host.feed("Legacy", 0)
+        self.host.command("Legacy", "north", None)
+        self.host.command("Legacy", "south", None)
+        self.assertNotIn("OLD NOT VISIBLE", self.host.command("Legacy", "history 50", None)["text"])
+        self.host.command("Visitor", "say POST ENTRY", None)
+        self.assertIn("POST ENTRY", self.host.command("Legacy", "history 50", None)["text"])
+
+    def test_returning_login_cannot_read_messages_from_prior_session(self):
+        self.host.join("Visitor")
+        self.host.join("Newcomer")
+        self.host.command("Visitor", "say SECRET BEFORE RETURN", None)
+        returned = self.host.join("Newcomer")
+        self.assertIn("Welcome back, Newcomer.", returned["text"])
+        self.assertNotIn("SECRET BEFORE RETURN", self.host.command(
+            "Newcomer", "history 50", None,
+        )["text"])
+        self.assertFalse(any("SECRET BEFORE RETURN" in e["text"]
+                             for e in self.host.feed("Newcomer", 0)["events"]))
+        self.host.command("Visitor", "say POST RETURN", None)
+        self.assertIn("POST RETURN", self.host.command(
+            "Newcomer", "history 50", None,
+        )["text"])
+
+    def test_returning_login_preserves_room_position_and_owned_inventory(self):
+        self.host.join("Newcomer")
+        self.host.command("Newcomer", "take token", None)
+        self.host.command("Newcomer", "north", None)
+        returned = self.host.join("Newcomer")
+        self.assertIn("Welcome back, Newcomer.", returned["text"])
+        self.assertIn("The Corridor", self.host.command(
+            "Newcomer", "look", None,
+        )["text"])
+        self.assertIn("Brass token", self.host.command(
+            "Newcomer", "inventory", None,
+        )["text"])
+        self.assertTrue(any(
+            e["actor"] == "Newcomer" and e["kind"] == "join"
+            for e in self.host.feed("Newcomer", 0)["events"]
+        ))
+
+
+    def test_join_entry_cursor_preserves_message_interleaved_before_global_cursor(self):
+        from unittest.mock import patch
+        self.host.join("Visitor")
+        original_cursor = self.host.cursor
+
+        def speak_before_global_cursor():
+            self.engine.act("Visitor", "say MESSAGE AFTER ENTRY BEFORE CURSOR")
+            return original_cursor()
+
+        with patch.object(self.host, "cursor", side_effect=speak_before_global_cursor):
+            result = self.host.join("Newcomer")
+        self.assertIsInstance(result["room_entry_cursor"], int)
+        self.assertLess(result["room_entry_cursor"], result["cursor"])
+        feed = self.host.feed("Newcomer", result["room_entry_cursor"])["events"]
+        self.assertTrue(any("MESSAGE AFTER ENTRY BEFORE CURSOR" in x["text"]
+                            for x in feed))
+
+    def test_move_entry_cursor_preserves_message_interleaved_before_global_cursor(self):
+        from unittest.mock import patch
+        self.host.join("Visitor")
+        self.host.command("Visitor", "north", None)
+        self.host.join("Newcomer")
+        original_cursor = self.host.cursor
+
+        def speak_before_global_cursor():
+            self.engine.act("Visitor", "say CORRIDOR MESSAGE BEFORE CURSOR")
+            return original_cursor()
+
+        with patch.object(self.host, "cursor", side_effect=speak_before_global_cursor):
+            moved = self.host.command("Newcomer", "north", None)
+        self.assertIsInstance(moved["room_entry_cursor"], int)
+        self.assertLess(moved["room_entry_cursor"], moved["cursor"])
+        self.assertTrue(any(
+            "CORRIDOR MESSAGE BEFORE CURSOR" in e["text"]
+            for e in self.host.feed("Newcomer", moved["room_entry_cursor"])["events"]
+        ))
+
+    def test_scoped_remote_join_and_command_include_entry_cursor(self):
+        from realm.gateway import Gateway
+        scoped = Gateway(self.db, world_id="privacy-probe",
+                         scoped_credentials=True)
+        scoped.join("Newcomer")
+        token = scoped.scoped_credentials.provision(
+            "Newcomer",
+            capabilities=("world:join", "command:write", "feed:read"),
+        )
+        result = scoped.join_remote("Newcomer", token)
+        self.assertIsInstance(result["room_entry_cursor"], int)
+        self.assertLessEqual(result["room_entry_cursor"], result["cursor"])
+        moved = scoped.command_remote("Newcomer", "north", "cursor-move", token)
+        self.assertIsInstance(moved["room_entry_cursor"], int)
+        self.assertGreater(moved["room_entry_cursor"],
+                           result["room_entry_cursor"])
+        self.assertLessEqual(moved["room_entry_cursor"], moved["cursor"])
+
+    def test_authenticated_http_join_and_move_publish_entry_cursor(self):
+        import json
+        from threading import Thread
+        from urllib.request import Request, urlopen
+        from realm.gateway import GatewayServer
+
+        token = self.host.credentials.provision("Newcomer")
+        server = GatewayServer(self.host, (), 0)
+        thread = Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            def send(path, payload):
+                req = Request(
+                    f"http://127.0.0.1:{server.server_port}{path}",
+                    data=json.dumps(payload).encode("utf-8"),
+                    headers={
+                        "Authorization": "Bearer " + token,
+                        "Content-Type": "application/json",
+                    },
+                    method="POST",
+                )
+                with urlopen(req, timeout=4) as response:
+                    return json.load(response)
+
+            joined = send("/api/v1/join", {"player": "Newcomer"})
+            self.assertIsInstance(joined["room_entry_cursor"], int)
+            self.assertLessEqual(joined["room_entry_cursor"], joined["cursor"])
+            moved = send("/api/v1/command", {
+                "player": "Newcomer", "command": "north",
+            })
+            self.assertIsInstance(moved["room_entry_cursor"], int)
+            self.assertGreater(moved["room_entry_cursor"], joined["room_entry_cursor"])
+            self.assertLessEqual(moved["room_entry_cursor"], moved["cursor"])
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(4)
+            self.assertFalse(thread.is_alive())
+
+
+    def test_actor_rejoin_between_cursor_reads_cannot_emit_future_room_floor(self):
+        from unittest.mock import patch
+        self.host.join("Newcomer")
+        original_head = self.host.cursor
+
+        def global_head_before_competing_rejoin():
+            head = original_head()
+            # Another authenticated session refreshes the same player entry
+            # after the head sample but before the room-entry proof.
+            self.engine.join("Newcomer")
+            return head
+
+        with patch.object(self.host, "cursor", side_effect=global_head_before_competing_rejoin):
+            result = self.host.join("Newcomer")
+        self.assertIsInstance(result["room_entry_cursor"], int)
+        self.assertLessEqual(result["room_entry_cursor"], result["cursor"],
+                             "Browser must never receive a future room floor")
+        with closing(sqlite3.connect(self.db)) as db:
+            joins = [row[0] for row in db.execute(
+                "SELECT id FROM events WHERE actor='Newcomer' AND kind='join' ORDER BY id"
+            )]
+        self.assertEqual(3, len(joins))
+        self.assertEqual(joins[-2], result["room_entry_cursor"],
+                         "Join result must represent its own entry, not a later session")
+
+
+
+    def test_suppressed_join_event_cannot_acknowledge_new_player(self):
+        with closing(sqlite3.connect(self.db)) as db, db:
+            db.execute(
+                "CREATE TRIGGER ignore_join_event BEFORE INSERT ON events "
+                "WHEN NEW.kind='join' AND NEW.actor='Newcomer' "
+                "BEGIN SELECT RAISE(IGNORE); END"
+            )
+        with self.assertRaises((RuntimeError, ValueError)):
+            self.host.join("Newcomer")
+        with closing(sqlite3.connect(self.db)) as db:
+            self.assertIsNone(db.execute(
+                "SELECT id FROM players WHERE id='Newcomer'"
+            ).fetchone())
+
+    def test_deleted_join_event_rolls_back_rejoin_and_keeps_old_floor(self):
+        self.host.join("Newcomer")
+        with closing(sqlite3.connect(self.db)) as db:
+            before = db.execute(
+                "SELECT COUNT(*) FROM events WHERE actor='Newcomer' AND kind='join'"
+            ).fetchone()[0]
+        with closing(sqlite3.connect(self.db)) as db, db:
+            db.execute(
+                "CREATE TRIGGER delete_join_event AFTER INSERT ON events "
+                "WHEN NEW.kind='join' AND NEW.actor='Newcomer' "
+                "BEGIN DELETE FROM events WHERE id=NEW.id; END"
+            )
+        with self.assertRaises(RuntimeError):
+            self.host.join("Newcomer")
+        with closing(sqlite3.connect(self.db)) as db:
+            after = db.execute(
+                "SELECT COUNT(*) FROM events WHERE actor='Newcomer' AND kind='join'"
+            ).fetchone()[0]
+        self.assertEqual(before, after)
+
+
+    def test_replaced_join_event_with_forged_payload_fails_transaction(self):
+        with closing(sqlite3.connect(self.db)) as db, db:
+            db.execute(
+                "CREATE TRIGGER replace_join AFTER INSERT ON events "
+                "WHEN NEW.kind='join' AND NEW.actor='Newcomer' "
+                "BEGIN DELETE FROM events WHERE id=NEW.id; "
+                "INSERT INTO events(id,occurred_at,actor,room_id,kind,payload_json) "
+                "VALUES(NEW.id,NEW.occurred_at,NEW.actor,NEW.room_id,NEW.kind,"
+                "'{\\\"forged\\\":true}'); END"
+            )
+        with self.assertRaises(RuntimeError):
+            self.host.join("Newcomer")
+        with closing(sqlite3.connect(self.db)) as db:
+            self.assertEqual(0, db.execute(
+                "SELECT COUNT(*) FROM players WHERE id='Newcomer'"
+            ).fetchone()[0])
+
+    def test_trigger_inserting_extra_room_entry_cannot_shift_visibility_floor(self):
+        with closing(sqlite3.connect(self.db)) as db, db:
+            db.execute(
+                "CREATE TRIGGER duplicate_join AFTER INSERT ON events "
+                "WHEN NEW.kind='join' AND NEW.actor='Newcomer' "
+                "BEGIN INSERT INTO events(occurred_at,actor,room_id,kind,payload_json) "
+                "VALUES(NEW.occurred_at,NEW.actor,NEW.room_id,'join','{}'); END"
+            )
+        with self.assertRaises(RuntimeError):
+            self.host.join("Newcomer")
+        with closing(sqlite3.connect(self.db)) as db:
+            self.assertEqual(0, db.execute(
+                "SELECT COUNT(*) FROM events WHERE actor='Newcomer'"
+            ).fetchone()[0])
+
+    def test_failed_join_never_leaks_an_uncommitted_emission_to_caller(self):
+        with closing(sqlite3.connect(self.db)) as db, db:
+            db.execute(
+                "CREATE TRIGGER erase_join AFTER INSERT ON events "
+                "WHEN NEW.kind='join' AND NEW.actor='Newcomer' "
+                "BEGIN DELETE FROM events WHERE id=NEW.id; END"
+            )
+        receipts = []
+        with self.assertRaises(RuntimeError):
+            self.engine.join("Newcomer", emissions=receipts)
+        self.assertEqual([], receipts)
+
+if __name__ == "__main__":
+    unittest.main()

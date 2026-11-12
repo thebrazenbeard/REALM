@@ -175,6 +175,49 @@ class GatewayTests(unittest.TestCase):
         ]
         self.assertEqual(1, len(matching))
 
+    def test_give_is_authenticated_atomic_and_auditable_over_http(self):
+        _, joined = self.send("/api/v1/join", {"player": "Patrick"})
+        self.send("/api/v1/join", {"player": "Vera"})
+        self.send("/api/v1/command", {"player": "Patrick", "command": "take token"})
+        action = {"player": "Patrick", "command": "give token to Vera", "action_id": "give-once"}
+        status, moved = self.send("/api/v1/command", action)
+        self.assertEqual(200, status)
+        self.assertEqual("You give Brass token to Vera.", moved["text"])
+        self.assertEqual((200, moved), self.send("/api/v1/command", action))
+        _, receiver = self.send("/api/v1/command", {"player": "Vera", "command": "inventory"})
+        self.assertEqual("You carry: Brass token", receiver["text"])
+        _, sender = self.send("/api/v1/command", {"player": "Patrick", "command": "inventory"})
+        self.assertEqual("You carry: nothing", sender["text"])
+        query = parse.urlencode({"player": "Patrick", "after": joined["cursor"]})
+        _, events = self.send(f"/api/v1/feed?{query}")
+        gifts = [event for event in events["events"] if event["kind"] == "give"]
+        self.assertEqual(1, len(gifts))
+        self.assertEqual("Patrick gave token to Vera.", gifts[0]["text"])
+        status, denied = self.send("/api/v1/command", {"player": "Patrick", "command": "give token to Vera"},
+                                   token_player="Vera")
+        self.assertEqual(403, status)
+        self.assertFalse(denied["ok"])
+
+    def test_give_does_not_expose_other_room_feed_or_recipient_presence(self):
+        self.send("/api/v1/join", {"player": "Patrick"})
+        self.send("/api/v1/join", {"player": "Vera"})
+        self.send("/api/v1/command", {"player": "Patrick", "command": "take token"})
+        self.send("/api/v1/command", {"player": "Vera", "command": "north"})
+        status, blocked = self.send("/api/v1/command", {
+            "player": "Patrick", "command": "give token to Vera"
+        })
+        self.assertEqual(200, status)
+        self.assertEqual("Recipient is not in this room.", blocked["text"])
+        self.send("/api/v1/command", {"player": "Vera", "command": "south"})
+        _, delivered = self.send("/api/v1/command", {"player": "Patrick", "command": "give token to Vera"})
+        self.assertIn("You give", delivered["text"])
+        # The API knows the latest saved room; it never asserts a live session.
+        _, scene = self.send("/api/v1/scene?player=Patrick")
+        self.assertEqual("saved_position_only", scene["presence_semantics"])
+        self.send("/api/v1/command", {"player": "Vera", "command": "north"})
+        _, feed = self.send("/api/v1/feed?player=Vera&after=0")
+        self.assertFalse(any(event["kind"] == "give" for event in feed["events"]))
+
     def test_feed_player_scope_and_invalid_inputs(self):
         self.send("/api/v1/join", {"player": "Patrick"})
         self.send("/api/v1/join", {"player": "Vera"})
@@ -264,6 +307,76 @@ class GatewayTests(unittest.TestCase):
         self.assertEqual(401, raised.exception.code)
         raised.exception.close()
 
+
+    def test_scene_is_auth_scoped_and_only_reports_persisted_room_facts(self):
+        status, payload = self.send("/api/v1/scene?player=Patrick", token=False)
+        self.assertEqual(401, status)
+        self.assertFalse(payload["ok"])
+        self.send("/api/v1/join", {"player": "Patrick"})
+        self.send("/api/v1/join", {"player": "Vera"})
+        status, payload = self.send("/api/v1/scene?player=Vera", token_player="Patrick")
+        self.assertEqual(403, status)
+        status, scene = self.send("/api/v1/scene?player=Patrick")
+        self.assertEqual(200, status)
+        self.assertEqual("atrium", scene["room"]["id"])
+        self.assertEqual("The Atrium", scene["room"]["name"])
+        self.assertEqual(["north"], scene["exits"])
+        self.assertEqual([{"id": "token", "name": "Brass token"}], scene["items"])
+        # Positions are durable saved locations, not online-presence telemetry.
+        self.assertEqual([{"name": "Vera"}], scene["occupants"])
+        self.assertEqual("saved_position_only", scene["presence_semantics"])
+        # A textual appearance or a model proposal cannot turn into a
+        # fabricated interaction/action or a first-class NPC.
+        self.assertNotIn("npcs", scene)
+        self.assertNotIn("actions", scene)
+        self.send("/api/v1/command", {"player": "Vera", "command": "north"})
+        _, moved = self.send("/api/v1/scene?player=Vera")
+        self.assertEqual("corridor", moved["room"]["id"])
+        self.assertEqual(["east", "south"], moved["exits"])
+        self.assertEqual([], moved["occupants"])
+        _, unchanged = self.send("/api/v1/scene?player=Patrick")
+        self.assertEqual([], unchanged["occupants"])
+
+    def test_scene_rejects_unjoined_identity_and_bounds_large_room(self):
+        status, payload = self.send("/api/v1/scene?player=Patrick")
+        self.assertEqual(400, status)
+        self.assertIn("Join", payload["error"])
+        self.send("/api/v1/join", {"player": "Patrick"})
+        with closing(sqlite3.connect(self.db)) as db, db:
+            db.executemany(
+                "INSERT INTO items (id,name,description,room_id) VALUES (?,?,?,?)",
+                [(f"extra-{idx}", f"Extra item {idx}", "Visible fixture", "atrium")
+                 for idx in range(60)],
+            )
+        status, scene = self.send("/api/v1/scene?player=Patrick")
+        self.assertEqual(200, status)
+        self.assertEqual(50, len(scene["items"]))
+        self.assertTrue(scene["truncated"]["items"])
+        self.assertFalse(scene["truncated"]["occupants"])
+
+    def test_scene_does_not_infer_npc_type_or_talk_action_from_engine_actor(self):
+        self.send("/api/v1/join", {"player": "Patrick"})
+        # ResidentController hosts can pre-join actors through Engine.join;
+        # the underlying table does not encode human-versus-NPC status.
+        self.gateway.engine.join("ResidentFixture")
+        status, scene = self.send("/api/v1/scene?player=Patrick")
+        self.assertEqual(200, status)
+        self.assertEqual([{"name": "ResidentFixture"}], scene["occupants"])
+        self.assertNotIn("npcs", scene)
+        self.assertNotIn("actions", scene)
+
+    def test_feed_deleted_return_arrival_denies_old_join_floor(self):
+        self.send("/api/v1/join", {"player": "Patrick"})
+        self.send("/api/v1/join", {"player": "Vera"})
+        self.send("/api/v1/command", {"player": "Patrick", "command": "north"})
+        self.send("/api/v1/command", {"player": "Vera", "command": "say Private while Patrick was away"})
+        self.send("/api/v1/command", {"player": "Patrick", "command": "south"})
+        with closing(sqlite3.connect(self.db)) as db, db:
+            db.execute("DELETE FROM events WHERE id=(SELECT MAX(id) FROM events "
+                       "WHERE actor='Patrick' AND kind='move' AND room_id='atrium')")
+        status, denied = self.send("/api/v1/feed?player=Patrick&after=0")
+        self.assertEqual(400, status)
+        self.assertIn("No provable current-room arrival", denied["error"])
 
 if __name__ == "__main__":
     unittest.main()
