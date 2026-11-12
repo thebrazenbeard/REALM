@@ -99,7 +99,6 @@ class TwoIndependentProcessForegroundTests(unittest.TestCase):
             )
             clock = WorldClock(db_path)
             clock.enable()
-            clock.schedule("clock-once", due_at=NOW, kind="host_say", payload={})
             http = GatewayServer(gateway, (), port=0)
             telnet = LocalTelnetServer(Engine(db_path), "local-only-two-process", port=0)
             stop = threading.Event()
@@ -138,14 +137,33 @@ class TwoIndependentProcessForegroundTests(unittest.TestCase):
                         time.sleep(.01)
                 else:
                     self.fail("Foreground HTTP listener did not start")
-                for source, args in (
-                    (HTTP_CLIENT, [str(http.server_port), token]),
-                    (TELNET_CLIENT, [str(telnet.server_address[1])]),
-                ):
-                    processes.append(subprocess.Popen(
-                        [sys.executable, "-c", source, *args],
-                        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-                    ))
+                # A returning authenticated join is a *new* observation
+                # floor. Deliver the clock and Telnet messages only AFTER
+                # that join, otherwise correct privacy filtering hides
+                # events that predate the new session.
+                processes.append(subprocess.Popen(
+                    [sys.executable, "-c", HTTP_CLIENT, str(http.server_port), token],
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                ))
+                floor_deadline = time.monotonic() + 4
+                while time.monotonic() < floor_deadline:
+                    with closing(sqlite3.connect(db_path)) as db:
+                        joins = db.execute(
+                            "SELECT COUNT(*) FROM events "
+                            "WHERE actor='Captain' AND kind='join'"
+                        ).fetchone()[0]
+                    if joins >= 2:
+                        break
+                    if processes[0].poll() is not None:
+                        self.fail("HTTP client exited before its authenticated rejoin")
+                    time.sleep(.01)
+                else:
+                    self.fail("No new authenticated join event before host activity")
+                clock.schedule("clock-once", due_at=NOW, kind="host_say", payload={})
+                processes.append(subprocess.Popen(
+                    [sys.executable, "-c", TELNET_CLIENT, str(telnet.server_address[1])],
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                ))
                 self.assertEqual(3, len({os.getpid(), *(p.pid for p in processes)}))
                 results = []
                 for child in processes:
