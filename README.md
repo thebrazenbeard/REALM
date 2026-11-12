@@ -160,6 +160,17 @@ One-off smoke command:
 PYTHONPATH=src python -m realm --db data/demo.sqlite3 --player Patrick --once look
 ```
 
+Reproducible three-OS-process political contest (two independently authenticated
+players + one loopback host, disposable world, actual inventory expenditure,
+political betrayal and recovery after a server restart):
+
+```bash
+python examples/synthetic_political_rivalry.py
+```
+
+This is a synthetic integration demonstration, **not** a live hosted world or
+proof that a model can govern political actors. No worldpack is imported.
+
 Run tests without third-party packages:
 
 ```bash

@@ -329,6 +329,16 @@ class Engine:
                     "INSERT INTO action_receipts (actor,action_id,command,response) VALUES (?,?,?,?)",
                     (actor, action_id, receipt_command, "" if read_only else response),
                 )
+            # Installed SQLite triggers can mutate political state after the
+            # action receipt insertion, after _perform's immediate readback.
+            # Recheck source/effect custody as the final SQL inside this writer.
+            # Rejected offers do not carry new effect assertions.
+            if verb == "offer" and response.startswith(f"{actor} offered "):
+                from .political_leverage import verify_finalized_offer
+                verify_finalized_offer(
+                    db, actor, room_id, arg, response,
+                    action_id=action_id, receipt_command=receipt_command,
+                )
             return response
 
     @staticmethod

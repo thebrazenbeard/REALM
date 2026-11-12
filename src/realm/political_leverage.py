@@ -266,6 +266,83 @@ class WorldLeverage:
                     )
 
 
+def verify_finalized_offer(
+    db: sqlite3.Connection, actor: str, room_id: str, arg: str,
+    response: str, *, action_id: str | None, receipt_command: str,
+) -> None:
+    """Final pre-COMMIT readback *after* any action-receipt triggers execute.
+
+    This hardens two concrete false-ACK mechanisms: a receipt-triggered event
+    deletion, and a receipt-triggered resurrection of spent inventory.
+    Privileged post-commit database mutation remains outside this boundary.
+    """
+    matched = _OFFER.fullmatch(arg.strip())
+    if matched is None:
+        raise RuntimeError("Committed political offer is not parseable")
+    item_id, site_id = matched.groups()
+    world = _world(db)
+    offering = db.execute(
+        "SELECT world_id,actor,faction_id,site_id,item_id,item_name,points "
+        "FROM main.political_offerings WHERE item_id=? COLLATE NOCASE",
+        (item_id,),
+    ).fetchone()
+    if (offering is None or offering["world_id"] != world
+            or offering["actor"].casefold() != actor.casefold()
+            or offering["site_id"].casefold() != site_id.casefold()
+            or not 1 <= offering["points"] <= 5):
+        raise RuntimeError("Offered item has no matching committed political custody")
+    if db.execute(
+        "SELECT 1 FROM main.items WHERE id=? COLLATE NOCASE",
+        (item_id,),
+    ).fetchone() is not None:
+        raise RuntimeError("Spent political item returned to inventory")
+    if current_faction_id(db, actor) != offering["faction_id"]:
+        raise RuntimeError("Political contributor's faction changed during transaction")
+    site = _site(db, site_id, world)
+    faction = db.execute(
+        "SELECT display_name,world_id FROM main.political_factions "
+        "WHERE id=? COLLATE NOCASE", (offering["faction_id"],),
+    ).fetchone()
+    if site is None or faction is None or faction["world_id"] != world:
+        raise RuntimeError("Political offering references an invalid faction/site")
+    if site["room_id"] != room_id:
+        raise RuntimeError("Political site moved during contribution")
+    expectation = (
+        f"{actor} offered {offering['item_name']} to {faction['display_name']} "
+        f"at {site['display_name']} ({offering['points']} influence)."
+    )
+    if response != expectation:
+        raise RuntimeError("Political response is inconsistent with committed support")
+    latest = db.execute(
+        "SELECT actor,room_id,payload_json FROM main.events "
+        "WHERE kind='political_offer' AND actor=? COLLATE NOCASE "
+        "ORDER BY id DESC LIMIT 1", (actor,),
+    ).fetchone()
+    if latest is None or latest["actor"] != actor or latest["room_id"] != room_id:
+        raise RuntimeError("No surviving local political event")
+    try:
+        payload = json.loads(latest["payload_json"])
+    except (ValueError, TypeError) as exc:
+        raise RuntimeError("Political event payload was corrupted") from exc
+    if (payload.get("item_id") != offering["item_id"]
+            or payload.get("site_id") != offering["site_id"]
+            or payload.get("faction_id") != offering["faction_id"]
+            or payload.get("points") != offering["points"]
+            or payload.get("item") != offering["item_name"]
+            or payload.get("site") != site["display_name"]
+            or payload.get("faction") != faction["display_name"]):
+        raise RuntimeError("Political event has changed after its initial readback")
+    if action_id is not None:
+        receipt = db.execute(
+            "SELECT command,response FROM main.action_receipts "
+            "WHERE actor=? COLLATE NOCASE AND action_id=?",
+            (actor, action_id),
+        ).fetchone()
+        if (receipt is None or receipt["command"] != receipt_command
+                or receipt["response"] != response):
+            raise RuntimeError("Political action receipt was not durably recorded")
+
+
 def perform(db: sqlite3.Connection, actor: str, room_id: str,
             verb: str, arg: str, event_writer) -> str:
     """Called exclusively inside Engine.act's actor-bound writer transaction."""

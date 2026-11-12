@@ -322,5 +322,62 @@ class PoliticalLeverageTests(unittest.TestCase):
         self.assertEqual([], self.rows("SELECT item_id FROM political_offerings"))
 
 
+    def test_receipt_after_insert_event_tamper_cannot_claim_success(self):
+        self.initialize()
+        self.command("Alice", "pledge north")
+        self.command("Alice", "take token")
+        with closing(sqlite3.connect(self.path)) as db, db:
+            db.execute(
+                "CREATE TRIGGER suppress_after_receipt AFTER INSERT ON action_receipts "
+                "WHEN NEW.command='offer token to council' "
+                "BEGIN DELETE FROM events WHERE kind='political_offer' "
+                "AND actor=NEW.actor; END"
+            )
+        with self.assertRaises(RuntimeError):
+            self.command("Alice", "offer token to council", "tamper-event")
+        self.assertEqual([("Alice",)], self.rows(
+            "SELECT held_by FROM items WHERE id='token'"
+        ))
+        self.assertEqual([], self.rows("SELECT item_id FROM political_offerings"))
+        self.assertEqual([], self.rows(
+            "SELECT action_id FROM action_receipts WHERE action_id='tamper-event'"
+        ))
+
+    def test_receipt_after_insert_item_resurrection_cannot_acknowledge_double_custody(self):
+        self.initialize()
+        self.command("Alice", "pledge north")
+        self.command("Alice", "take token")
+        with closing(sqlite3.connect(self.path)) as db, db:
+            db.execute(
+                "CREATE TRIGGER resurrect_after_receipt AFTER INSERT ON action_receipts "
+                "WHEN NEW.command='offer token to council' "
+                "BEGIN INSERT INTO items(id,name,description,room_id) "
+                "VALUES('token','Brass token','Forged extra copy','atrium'); END"
+            )
+        with self.assertRaises(RuntimeError):
+            self.command("Alice", "offer token to council", "tamper-item")
+        self.assertEqual([("Alice",)], self.rows(
+            "SELECT held_by FROM items WHERE id='token'"
+        ))
+        self.assertEqual([], self.rows("SELECT item_id FROM political_offerings"))
+
+    def test_ignored_action_receipt_cannot_acknowledge_offered_item(self):
+        self.initialize()
+        self.command("Alice", "pledge north")
+        self.command("Alice", "take token")
+        with closing(sqlite3.connect(self.path)) as db, db:
+            db.execute(
+                "CREATE TRIGGER ignore_receipt BEFORE INSERT ON action_receipts "
+                "WHEN NEW.command='offer token to council' "
+                "BEGIN SELECT RAISE(IGNORE); END"
+            )
+        with self.assertRaises(RuntimeError):
+            self.command("Alice", "offer token to council", "ignored-receipt")
+        self.assertEqual([("Alice",)], self.rows(
+            "SELECT held_by FROM items WHERE id='token'"
+        ))
+        self.assertEqual([], self.rows("SELECT item_id FROM political_offerings"))
+
+
 if __name__ == "__main__":
     unittest.main()

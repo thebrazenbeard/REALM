@@ -53,7 +53,17 @@ that same ID. A replayed action ID never grants new influence.
 
 The offer reply attests only the historical contribution. It deliberately
 does not claim present control, since rivals can change control later.
-Inspect with control to fetch the current host-derived result.
+Inspect with control to fetch the current host-derived result. After creating
+an action receipt, the writer performs a **final pre-COMMIT readback** of the
+spent item, offering, event, and matching receipt. This specifically detects
+suppressed receipt insertion, receipt-triggered event deletion, or resurrection
+of consumed items; it does not prove safety from privileged post-COMMIT writes.
+
+For an executable three-process demonstration (separate local HTTP player
+processes and host process, real rival resource offers, betrayal, restart and
+cross-actor denial), run `py -3 examples/synthetic_political_rivalry.py` from
+the repository root. The script uses only a temporary world and loopback
+sockets, closes every client, and deletes its world after verification.
 
 ## Authority and fairness limits
 
