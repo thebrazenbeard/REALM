@@ -50,6 +50,33 @@ class RoomEntryPrivacyTests(unittest.TestCase):
         self.assertTrue(any(e["actor"] == "Rylok" and e["kind"] == "move" for e in entries))
         self.assertFalse(any(e["room"] != "corridor" for e in entries))
 
+    def test_inconsistent_player_room_and_latest_entry_fails_closed(self):
+        """A missing host entry event must not resurrect an older room's history."""
+        self.host.join("Visitor")
+        self.host.join("Rylok")
+        self.host.command("Rylok", "north", None)
+        self.host.command("Visitor", "say PRIVATE WHILE RYLOK WAS AWAY", None)
+        # Simulate a future plugin or administrator changing only the player
+        # location without a host-recorded move back to the original room.
+        with closing(sqlite3.connect(self.db)) as db, db:
+            db.execute("UPDATE players SET room_id='atrium' WHERE id='Rylok'")
+        self.assertNotIn(
+            "PRIVATE WHILE RYLOK WAS AWAY",
+            self.host.command("Rylok", "history 50", None)["text"],
+        )
+        self.assertFalse(any(
+            "PRIVATE WHILE RYLOK WAS AWAY" in event["text"]
+            for event in self.host.feed("Rylok", 0)["events"]
+        ))
+        # A genuine subsequent departure and re-entry should restore access
+        # to future room events, but never to the earlier secret.
+        self.host.command("Rylok", "north", None)
+        self.host.command("Rylok", "south", None)
+        self.host.command("Visitor", "say AFTER TRUSTED REENTRY", None)
+        history = self.host.command("Rylok", "history 50", None)["text"]
+        self.assertIn("AFTER TRUSTED REENTRY", history)
+        self.assertNotIn("PRIVATE WHILE RYLOK WAS AWAY", history)
+
     def test_missing_entry_ledger_fails_closed_without_secret_exposure(self):
         self.host.join("Visitor")
         self.host.command("Visitor", "say PREEXISTING SECRET", None)

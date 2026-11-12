@@ -163,18 +163,19 @@ class Engine:
 
     @staticmethod
     def _room_entry_floor(db: sqlite3.Connection, actor: str, room_id: str) -> int | None:
-        """Earliest event visible in this actor's CURRENT room occupancy.
+        """Latest trusted entry event if it agrees with the actor's current room.
 
-        A latest join or move into the room establishes the lower bound. If
-        legacy/corrupt actor data has no matching entry, fail closed rather
-        than treating the first world event as publicly visible history.
+        An older join/move into this room does not establish occupancy when
+        a later entry event places the actor elsewhere. This catches stale
+        player rows changed without a matching host-recorded room entry.
+        Legacy actors without a trustworthy entry event fail closed.
         """
         row = db.execute(
-            "SELECT MAX(id) FROM events "
-            "WHERE actor=? COLLATE NOCASE AND room_id=? AND kind IN ('join','move')",
-            (actor, room_id),
+            "SELECT id,room_id FROM events WHERE actor=? COLLATE NOCASE "
+            "AND kind IN ('join','move') ORDER BY id DESC LIMIT 1",
+            (actor,),
         ).fetchone()
-        return row[0]
+        return row["id"] if row is not None and row["room_id"] == room_id else None
 
     def join(self, name: str) -> str:
         if not _PLAYER_RE.fullmatch(name):
