@@ -80,6 +80,84 @@ class RoomEntryPrivacyTests(unittest.TestCase):
             for e in self.host.feed("Rylok", 0)["events"]
         ))
 
+    def test_join_reports_room_entry_cursor_even_if_speech_interleaves(self):
+        from unittest.mock import patch
+
+        self.host.join("Visitor")
+        original_cursor = self.host.cursor
+
+        def speech_while_sampling_cursor():
+            self.engine.act("Visitor", "say BETWEEN JOIN AND CURSOR")
+            return original_cursor()
+
+        with patch.object(self.host, "cursor", side_effect=speech_while_sampling_cursor):
+            joined = self.host.join("Rylok")
+        self.assertIn("room_entry_cursor", joined)
+        self.assertLess(joined["room_entry_cursor"], joined["cursor"])
+        self.assertTrue(any(
+            "BETWEEN JOIN AND CURSOR" in event["text"]
+            for event in self.host.feed("Rylok", joined["room_entry_cursor"])["events"]
+        ), "Post-entry speech must remain visible with the room-entry cursor")
+
+    def test_move_reports_room_entry_cursor_even_if_speech_interleaves(self):
+        from unittest.mock import patch
+
+        self.host.join("Visitor")
+        self.host.command("Visitor", "north", None)
+        self.host.join("Rylok")
+        original_cursor = self.host.cursor
+
+        def speech_while_sampling_cursor():
+            self.engine.act("Visitor", "say BETWEEN MOVE AND CURSOR")
+            return original_cursor()
+
+        with patch.object(self.host, "cursor", side_effect=speech_while_sampling_cursor):
+            moved = self.host.command("Rylok", "north", None)
+        self.assertIn("The Corridor", moved["text"])
+        self.assertIn("room_entry_cursor", moved)
+        self.assertLess(moved["room_entry_cursor"], moved["cursor"])
+        self.assertTrue(any(
+            "BETWEEN MOVE AND CURSOR" in event["text"]
+            for event in self.host.feed("Rylok", moved["room_entry_cursor"])["events"]
+        ))
+
+    def test_authenticated_http_join_and_move_publish_room_entry_cursor(self):
+        from threading import Thread
+        from urllib.request import Request, urlopen
+        from realm.gateway import GatewayServer
+        import json
+
+        token = self.host.credentials.provision("Rylok")
+        server = GatewayServer(self.host, (), 0)
+        thread = Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            def post(path, body):
+                req = Request(
+                    f"http://127.0.0.1:{server.server_port}{path}",
+                    data=json.dumps(body).encode("utf-8"),
+                    headers={
+                        "Authorization": "Bearer " + token,
+                        "Content-Type": "application/json",
+                    },
+                    method="POST",
+                )
+                with urlopen(req, timeout=4) as response:
+                    return json.loads(response.read())
+
+            joined = post("/api/v1/join", {"player": "Rylok"})
+            self.assertIsInstance(joined["room_entry_cursor"], int)
+            self.assertLessEqual(joined["room_entry_cursor"], joined["cursor"])
+            moved = post("/api/v1/command", {"player": "Rylok", "command": "north"})
+            self.assertIn("The Corridor", moved["text"])
+            self.assertIsInstance(moved["room_entry_cursor"], int)
+            self.assertGreater(moved["room_entry_cursor"], joined["room_entry_cursor"])
+            self.assertLessEqual(moved["room_entry_cursor"], moved["cursor"])
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(3)
+
     def test_inconsistent_player_room_and_latest_entry_fails_closed(self):
         """A missing host entry event must not resurrect an older room's history."""
         self.host.join("Visitor")

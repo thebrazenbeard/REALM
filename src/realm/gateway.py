@@ -111,12 +111,35 @@ class Gateway:
         finally:
             db.close()
 
+    def _room_entry_cursor(self, player: str) -> int | None:
+        """Host-recorded current-room entry, independent of global feed traffic.
+
+        This is a client synchronization hint, not an authorization check:
+        feed() separately enforces the actor/room entry floor on every read.
+        """
+        db = self._read()
+        try:
+            db.execute("BEGIN")
+            subject = db.execute(
+                "SELECT id,room_id FROM players WHERE id=?", (player,)
+            ).fetchone()
+            if subject is None:
+                return None
+            return self.engine._room_entry_floor(
+                db, subject["id"], subject["room_id"]
+            )
+        finally:
+            db.close()
+
     def join(self, player: str) -> dict:
         if not isinstance(player, str):
             raise ValueError("Player must be a string")
         # The underlying join() validates syntax and preserves the current world.
         text = self.engine.join(player)
-        return {"ok": True, "text": text, "cursor": self.cursor()}
+        return {
+            "ok": True, "text": text, "cursor": self.cursor(),
+            "room_entry_cursor": self._room_entry_cursor(player),
+        }
 
     def command(self, player: str, command: str, action_id: str | None) -> dict:
         if not isinstance(player, str) or not isinstance(command, str):
@@ -124,7 +147,10 @@ class Gateway:
         if len(command) > 512:
             raise ValueError("Command is too long")
         text = self.router.act(player, command, action_id=action_id)
-        return {"ok": True, "text": text, "cursor": self.cursor()}
+        return {
+            "ok": True, "text": text, "cursor": self.cursor(),
+            "room_entry_cursor": self._room_entry_cursor(player),
+        }
 
     def room(self, player: str) -> dict:
         if not isinstance(player, str):
