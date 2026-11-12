@@ -56,7 +56,10 @@ On PowerShell, set `$env:PYTHONPATH='src'` before launching the module.
 - **Telnet is plaintext**, including the connection token. Do not expose this
   port via tunnels, port forwarding, reverse proxies, or public interfaces.
 - In **legacy mode**, the shared token gates local server access, **not player identity**. Anyone who
-  knows it can choose an existing player's name *after that player disconnects*.
+  knows it can choose an unreserved existing player's name *after that player disconnects*.
+  A character explicitly reserved by the trusted host as an NPC is denied
+  by both legacy shared-token and player-bound Telnet, at join and on further
+  commands; this is not a general player-identity guarantee.
   An active local socket now exclusively reserves its case-insensitive name;
   that reservation is released on `quit`, EOF, timeout, or socket error. This
   is **not** durable account ownership or authenticated player identity.

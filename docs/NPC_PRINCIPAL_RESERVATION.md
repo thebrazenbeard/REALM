@@ -30,9 +30,14 @@ table is installed only by an explicit reservation on that SQLite world.
 
 When active for a name, both normal and scoped player-credential stores
 reject new bearer provisioning or rotation and deny already-issued tokens.
-Legacy and scoped command writer guards re-check the reservation inside
+Legacy and scoped HTTP writer guards re-check the reservation inside
 the same world transaction, so a delayed POST cannot commit with a
-re-reserved principal. Existing unrelated human players remain unchanged.
+re-reserved principal. Both Telnet variants also deny reserved names:
+player-bound credentials fail admission, and the legacy shared-token
+compatibility mode rejects a reserved name at join and on subsequent
+commands, including writer-time revalidation. The shared-token mode still
+does **not** authenticate player names and remains loopback-only.
+Existing unrelated human players remain unchanged.
 Case-insensitive aliases resolve to the same reserved principal. Host-only
 `ResidentController` actions still obey the standard Engine rules and
 single-action receipts.

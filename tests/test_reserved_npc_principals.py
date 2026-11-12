@@ -207,6 +207,38 @@ class ReservedNPCPrincipalTests(unittest.TestCase):
             thread.join(3)
             self.assertFalse(thread.is_alive())
 
+    def test_reserved_world_binding_cannot_be_relabelled_through_gateway(self):
+        reserve_npc(self.legacy.engine, "Moss")
+        with self.assertRaisesRegex(ValueError, "already bound"):
+            Gateway(self.root / "legacy.sqlite3", world_id="different")
+        with closing(self.legacy.engine._connect()) as db:
+            self.assertTrue(is_reserved_npc(db, "Moss"))
+
+    def test_reservation_vs_token_rotation_race_blocks_any_new_bearer(self):
+        for gate, store, prefix in (
+            (self.legacy, self.legacy.credentials, "Legacy"),
+            (self.scoped, self.scoped.scoped_credentials, "Scoped"),
+        ):
+            for index in range(3):
+                actor = f"{prefix}Rotate{index}"
+                gate.join(actor)
+                old = store.provision(actor)
+                def rotate():
+                    if gate is self.legacy:
+                        return store.rotate(actor)
+                    return store.rotate(old)
+                with ThreadPoolExecutor(max_workers=2) as pool:
+                    rotating = pool.submit(rotate)
+                    reserving = pool.submit(reserve_npc, gate.engine, actor)
+                    self.assertTrue(reserving.result())
+                    try:
+                        new_token = rotating.result()
+                    except ValueError:
+                        new_token = None
+                self.assertIsNone(store.authenticate(old))
+                if new_token:
+                    self.assertIsNone(store.authenticate(new_token))
+
     @staticmethod
     def _telnet_receive(conn: socket.socket, marker: bytes) -> bytes:
         data = bytearray()
@@ -258,6 +290,57 @@ class ReservedNPCPrincipalTests(unittest.TestCase):
                 denial = self._telnet_receive(conn, b"Access revoked")
                 self.assertIn(b"Access revoked", denial)
             self.assertNotIn("TELNET UNAUTHORIZED AFTER RESERVATION",
+                             self.legacy.command("Moss", "history", None)["text"])
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(3)
+            self.assertFalse(thread.is_alive())
+
+
+    def test_shared_token_telnet_cannot_select_reserved_npc_name(self):
+        reserve_npc(self.legacy.engine, "Moss")
+        server = LocalTelnetServer(self.legacy.engine, "local-shared-secret", port=0)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            with socket.create_connection(server.server_address, timeout=3) as conn:
+                conn.settimeout(3)
+                self._telnet_receive(conn, b"Token: ")
+                conn.sendall(b"local-shared-secret\r\n")
+                self._telnet_receive(conn, b"Name: ")
+                conn.sendall(b"mOsS\r\n")
+                answer = self._telnet_receive(conn, b"Access revoked")
+                self.assertIn(b"Access revoked", answer)
+            with closing(self.legacy.engine._connect()) as db:
+                count = db.execute(
+                    "SELECT COUNT(*) FROM main.events WHERE actor=? AND kind='join'",
+                    ("Moss",),
+                ).fetchone()[0]
+                self.assertEqual(1, count)
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(3)
+            self.assertFalse(thread.is_alive())
+
+    def test_shared_token_telnet_active_name_revoked_after_reservation(self):
+        server = LocalTelnetServer(self.legacy.engine, "local-shared-secret", port=0)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            with socket.create_connection(server.server_address, timeout=3) as conn:
+                conn.settimeout(3)
+                self._telnet_receive(conn, b"Token: ")
+                conn.sendall(b"local-shared-secret\r\n")
+                self._telnet_receive(conn, b"Name: ")
+                conn.sendall(b"Moss\r\n")
+                self._telnet_receive(conn, b"REALM> ")
+                reserve_npc(self.legacy.engine, "Moss")
+                conn.sendall(b"say SHARED TOKEN IMPERSONATION\r\n")
+                answer = self._telnet_receive(conn, b"Access revoked")
+                self.assertIn(b"Access revoked", answer)
+            self.assertNotIn("SHARED TOKEN IMPERSONATION",
                              self.legacy.command("Moss", "history", None)["text"])
         finally:
             server.shutdown()
