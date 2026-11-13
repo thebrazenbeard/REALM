@@ -46,7 +46,7 @@ class PartialLineRevocationTest(unittest.TestCase):
                     for _ in range(10):
                         try:
                             c.sendall(b"x")
-                        except (BrokenPipeError, ConnectionResetError):
+                        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
                             # A revoked socket may close before next write.
                             break
                         time.sleep(0.25)
