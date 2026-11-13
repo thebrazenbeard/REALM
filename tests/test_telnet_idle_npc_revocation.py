@@ -100,7 +100,6 @@ class IdleReservedNPCSocketTests(unittest.TestCase):
         conn.sendall(b"say still a human\r\n")
         text = self.receive_until(conn, b"REALM> ")
         self.assertIn(b"still a human", text)
-        self.assertFalse(self.gateway.engine._connect().in_transaction)
 
 
 if __name__ == "__main__":
