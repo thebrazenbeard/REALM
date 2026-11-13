@@ -93,6 +93,14 @@ class IdleReservedNPCSocketTests(unittest.TestCase):
         conn = self.launch(player_credentials=True)
         self.assert_idle_revoked(conn)
 
+    def test_unreserved_shared_token_socket_remains_usable_after_poll_interval(self):
+        conn = self.launch(player_credentials=False)
+        time.sleep(1.3)
+        self.assertTrue(self.server.is_name_active("Moss"))
+        conn.sendall(b"say still a shared-token human\\r\\n")
+        text = self.receive_until(conn, b"REALM> ")
+        self.assertIn(b"still a shared-token human", text)
+
     def test_unreserved_player_socket_remains_usable_after_poll_interval(self):
         conn = self.launch(player_credentials=True)
         time.sleep(1.3)
