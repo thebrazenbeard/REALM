@@ -97,7 +97,7 @@ class IdleReservedNPCSocketTests(unittest.TestCase):
         conn = self.launch(player_credentials=False)
         time.sleep(1.3)
         self.assertTrue(self.server.is_name_active("Moss"))
-        conn.sendall(b"say still a shared-token human\\r\\n")
+        conn.sendall(b"say still a shared-token human\r\n")
         text = self.receive_until(conn, b"REALM> ")
         self.assertIn(b"still a shared-token human", text)
 
