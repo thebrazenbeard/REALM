@@ -292,6 +292,21 @@ class LocalTelnetHandler(socketserver.BaseRequestHandler):
 
     def _line(self) -> str | None:
         while True:
+            # A connected client can trickle incomplete input indefinitely
+            # and avoid the recv timeout used by the idle revocation check.
+            # Poll the same host reservation under sustained input too,
+            # throttled to at most one role-store lookup per second per socket.
+            claimed = getattr(self, "_claimed_name", None)
+            if claimed is not None:
+                now = time.monotonic()
+                if now - getattr(self, "_last_reservation_check", 0.0) >= 1.0:
+                    self._last_reservation_check = now
+                    try:
+                        if self.server.is_reserved_name(claimed):
+                            self._send("Access revoked.\n")
+                            return None
+                    except sqlite3.Error:
+                        return None
             for i, byte in enumerate(self._pending):
                 if byte in (10, 13):
                     if i > MAX_LINE_BYTES:
