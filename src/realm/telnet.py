@@ -328,18 +328,10 @@ class LocalTelnetHandler(socketserver.BaseRequestHandler):
             try:
                 chunk = self.request.recv(1024)
             except socket.timeout:
-                # Host reservation must eject an admitted idle session, even
-                # when no command arrives to exercise its writer guard.
+                # NPC role revalidation occurs at the start of the next
+                # _line loop iteration, subject to the shared one-second
+                # rate limit. Do not double-query the role store here.
                 claimed = getattr(self, "_claimed_name", None)
-                if claimed is not None:
-                    try:
-                        if self.server.is_reserved_name(claimed):
-                            self._send("Access revoked.\n")
-                            return None
-                    except sqlite3.Error:
-                        # When the role ledger is unavailable, do not retain
-                        # a potentially unauthorized socket.
-                        return None
                 lease = getattr(self, "_presence_lease", None)
                 if lease is None:
                     # Preserve the former 90-second receive-idle cutoff; the
