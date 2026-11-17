@@ -489,7 +489,16 @@ class Gateway:
     def room(self, player: str) -> dict:
         if not isinstance(player, str):
             raise ValueError("Player must be a string")
-        return {"ok": True, "text": self.engine.act(player, "look"), "cursor": self.cursor()}
+        # The engine's classic look and our cursor use separate reads.
+        # Bracket them with provable arrival queries; an intervening move
+        # or same-room rejoin invalidates the source room context. This
+        # does not lock a player across the eventual network write.
+        before = self._room_entry_cursor(player)
+        text = self.engine.act(player, "look")
+        cursor = self.cursor()
+        after = self._room_entry_cursor(player)
+        return {"ok": True, "text": text, "cursor": cursor,
+                "room_entry_cursor": before if before == after else None}
 
     def scene(self, player: str) -> dict:
         """Read current room facts; saved position does not imply online presence.
@@ -523,8 +532,16 @@ class Gateway:
                 (room_id, subject["id"], MAX_SCENE_ENTRIES + 1),
             ).fetchall()
             cursor = int(db.execute("SELECT COALESCE(MAX(id),0) FROM events").fetchone()[0])
+            try:
+                entry = self.engine._room_entry_floor(db, subject["id"], room_id)
+            except ValueError:
+                # A malformed/legacy arrival is not a current-room grant.
+                # Trusted host scene reads retain their historical shape,
+                # while the HTTP transport refuses an unprovable response.
+                entry = None
             return {
                 "ok": True,
+                "room_entry_cursor": entry,
                 "room": {key: room[key] for key in ("id", "name", "description")},
                 "exits": [r["direction"] for r in exits[:MAX_SCENE_ENTRIES]],
                 "items": [{"id": r["id"], "name": r["name"]} for r in items[:MAX_SCENE_ENTRIES]],
@@ -1286,8 +1303,14 @@ class GatewayHandler(BaseHTTPRequestHandler):
             # previous room's withheld feed after changing its location.
             # The comparison is a near-send freshness gate, not a durable
             # per-session lock or an atomic fence across network writes.
-            if self.server.gateway._room_entry_cursor(principal) != result.get("room_entry_cursor"):
-                self._send(409, {"ok": False, "error": "Room arrival changed; retry feed"})
+        if path in {"/api/v1/feed", "/api/v1/room", "/api/v1/scene"}:
+            # Source result and current provable arrival must agree. A room
+            # view captured by an older same-bearer client is no longer
+            # eligible to be delivered after a move or rejoin.
+            original = result.get("room_entry_cursor")
+            if (type(original) is not int
+                    or self.server.gateway._room_entry_cursor(principal) != original):
+                self._send(409, {"ok": False, "error": "Room arrival changed; retry read"})
                 return
         self._send(200, result)
 

@@ -201,6 +201,16 @@ class FeedWaitHandler(GatewayHandler):
                     if channel_revision != self.server.gateway.channel_access_revision(principal):
                         self._send(409, {"ok": False, "error": "Channel membership changed; retry"})
                         return
+                    # Presence registration can itself wait for a SQLite
+                    # writer. A second same-bearer connection may move or
+                    # rejoin after the earlier audience checks. Do not send
+                    # the previously built room event bytes after arrival
+                    # has changed, including for wait_ms=0.
+                    source_entry = result.get("room_entry_cursor")
+                    if (type(source_entry) is not int
+                            or self.server.gateway._room_entry_cursor(principal) != source_entry):
+                        self._send(409, {"ok": False, "error": "Room arrival changed; retry feed"})
+                        return
                     self._send(200, result)
                     return
                 remaining = deadline - time.monotonic()
