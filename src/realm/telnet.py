@@ -292,6 +292,21 @@ class LocalTelnetHandler(socketserver.BaseRequestHandler):
 
     def _line(self) -> str | None:
         while True:
+            # A connected client can trickle incomplete input indefinitely
+            # and avoid the recv timeout used by the idle revocation check.
+            # Poll the same host reservation under sustained input too,
+            # throttled to at most one role-store lookup per second per socket.
+            claimed = getattr(self, "_claimed_name", None)
+            if claimed is not None:
+                now = time.monotonic()
+                if now - getattr(self, "_last_reservation_check", 0.0) >= 1.0:
+                    self._last_reservation_check = now
+                    try:
+                        if self.server.is_reserved_name(claimed):
+                            self._send("Access revoked.\n")
+                            return None
+                    except sqlite3.Error:
+                        return None
             for i, byte in enumerate(self._pending):
                 if byte in (10, 13):
                     if i > MAX_LINE_BYTES:
@@ -313,18 +328,10 @@ class LocalTelnetHandler(socketserver.BaseRequestHandler):
             try:
                 chunk = self.request.recv(1024)
             except socket.timeout:
-                # Host reservation must eject an admitted idle session, even
-                # when no command arrives to exercise its writer guard.
+                # NPC role revalidation occurs at the start of the next
+                # _line loop iteration, subject to the shared one-second
+                # rate limit. Do not double-query the role store here.
                 claimed = getattr(self, "_claimed_name", None)
-                if claimed is not None:
-                    try:
-                        if self.server.is_reserved_name(claimed):
-                            self._send("Access revoked.\n")
-                            return None
-                    except sqlite3.Error:
-                        # When the role ledger is unavailable, do not retain
-                        # a potentially unauthorized socket.
-                        return None
                 lease = getattr(self, "_presence_lease", None)
                 if lease is None:
                     # Preserve the former 90-second receive-idle cutoff; the
