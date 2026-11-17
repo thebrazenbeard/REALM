@@ -38,6 +38,20 @@ compatibility mode rejects a reserved name at join and on subsequent
 commands, including writer-time revalidation. The shared-token mode still
 does **not** authenticate player names and remains loopback-only.
 Existing unrelated human players remain unchanged.
+
+Admitted Telnet connections now check host NPC reservation during bounded
+receive-idle intervals without requiring the player to type another command.
+Non-presence sockets poll at one-second recv timeouts but retain the previous
+90-second network-input idle lifetime measured from completed admission.
+Player-bound presence sockets retain their independently configured heartbeat.
+The name claim and any presence lease are released during ordinary handler
+cleanup after revocation. A transient SQLite role-read error closes the
+socket rather than assuming the principal is still authorized. This is not
+a zero-latency revocation guarantee; writer-transaction checks remain the
+actual barrier against game actions after reservation commits. These idle
+checks do not authenticate legacy shared-token names or qualify public
+multiplayer hosting.
+
 Case-insensitive aliases resolve to the same reserved principal. Host-only
 `ResidentController` actions still obey the standard Engine rules and
 single-action receipts.
