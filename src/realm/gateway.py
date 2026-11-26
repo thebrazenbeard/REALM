@@ -696,6 +696,10 @@ class Gateway:
                 # changed trusted-host membership/role epoch, including a
                 # 200 response with zero new events after revocation.
                 "channel_revision": channel_revision,
+                # Same-actor clients may move a player between this snapshot
+                # and HTTP send. Return the exact provable arrival epoch so
+                # the transport can deny stale old-room feed bytes.
+                "room_entry_cursor": entry["id"],
             }
         finally:
             db.close()
@@ -1276,6 +1280,15 @@ class GatewayHandler(BaseHTTPRequestHandler):
                     channel_revision != self.server.gateway.channel_access_revision(principal)):
                 self._send(409, {"ok": False, "error": "Channel membership changed; retry"})
                 return
+            # Room events were read from an earlier SQLite snapshot. Another
+            # authenticated connection with the same principal can move and
+            # rejoin before this response is written; it must not receive the
+            # previous room's withheld feed after changing its location.
+            # The comparison is a near-send freshness gate, not a durable
+            # per-session lock or an atomic fence across network writes.
+            if self.server.gateway._room_entry_cursor(principal) != result.get("room_entry_cursor"):
+                self._send(409, {"ok": False, "error": "Room arrival changed; retry feed"})
+                return
         self._send(200, result)
 
     def do_POST(self) -> None:  # noqa: N802
@@ -1576,4 +1589,3 @@ def main(argv: list[str] | None = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
