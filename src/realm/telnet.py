@@ -16,6 +16,7 @@ import socket
 import socketserver
 import sqlite3
 import threading
+import time
 from contextlib import closing
 from pathlib import Path
 from typing import Callable
@@ -279,6 +280,7 @@ class LocalTelnetHandler(socketserver.BaseRequestHandler):
         self._filter = _TelnetFilter()
         self._pending = bytearray()
         self._skip_lf = False
+        self._last_input_monotonic = time.monotonic()
         # Color is opt-in per socket; no world or account preference is written.
         self._ansi_enabled = False
 
@@ -311,8 +313,25 @@ class LocalTelnetHandler(socketserver.BaseRequestHandler):
             try:
                 chunk = self.request.recv(1024)
             except socket.timeout:
+                # Host reservation must eject an admitted idle session, even
+                # when no command arrives to exercise its writer guard.
+                claimed = getattr(self, "_claimed_name", None)
+                if claimed is not None:
+                    try:
+                        if self.server.is_reserved_name(claimed):
+                            self._send("Access revoked.\n")
+                            return None
+                    except sqlite3.Error:
+                        # When the role ledger is unavailable, do not retain
+                        # a potentially unauthorized socket.
+                        return None
                 lease = getattr(self, "_presence_lease", None)
                 if lease is None:
+                    # Preserve the former 90-second receive-idle cutoff; the
+                    # shorter receive timeout is only a role-check heartbeat.
+                    if (claimed is not None and time.monotonic() -
+                            self._last_input_monotonic < SOCKET_TIMEOUT):
+                        continue
                     return None
                 try:
                     # A verified, still-owned server socket is sufficient to
@@ -324,6 +343,7 @@ class LocalTelnetHandler(socketserver.BaseRequestHandler):
                 continue
             if not chunk:
                 return None
+            self._last_input_monotonic = time.monotonic()
             body, reply = self._filter.feed(chunk)
             if reply:
                 self.request.sendall(reply)
@@ -385,6 +405,9 @@ class LocalTelnetHandler(socketserver.BaseRequestHandler):
             self._send("That player name is already connected to this local server.\n")
             return
         self._claimed_name = name
+        # The idle lifetime starts at admission, not at connection setup.
+        # A slow but successful token exchange must not spend play time.
+        self._last_input_monotonic = time.monotonic()
         if self.server.player_credentials and self.server.presence_witness is not None:
             try:
                 self._presence_lease = self.server.admit_bound_presence(name, presented)
@@ -396,6 +419,10 @@ class LocalTelnetHandler(socketserver.BaseRequestHandler):
             # checks the actual still-open socket and current credential.
             interval = min(2.0, max(0.2, self.server.presence_witness.idle_seconds / 3))
             self.request.settimeout(interval)
+        else:
+            # Local-only, bounded watch for NPC reservation while the client
+            # is idle; normal humans stay connected for the old idle window.
+            self.request.settimeout(1.0)
         self._send(f"\n{greeting}\nREALM> ")
         while True:
             command = self._line()
